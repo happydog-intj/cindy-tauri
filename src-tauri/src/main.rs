@@ -38,6 +38,18 @@ fn write_smoke(ok: bool, detail: &str) {
     }
 }
 
+// Windows 上 Tauri 返回的路径可能带 \\?\ 前缀，Node 的 realpath 不接受，传给子进程前去掉。
+fn strip_verbatim(p: PathBuf) -> PathBuf {
+    let s = p.to_string_lossy().into_owned();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(rest.to_string())
+    } else {
+        p
+    }
+}
+
 // 开发模式用系统 node（或 CINDY_NODE 指定），发布模式用随包的 cindy-node。
 fn runtime_paths(app: &AppHandle) -> (PathBuf, PathBuf) {
     if cfg!(debug_assertions) {
@@ -57,7 +69,7 @@ fn runtime_paths(app: &AppHandle) -> (PathBuf, PathBuf) {
             .resource_dir()
             .map(|d| d.join("sidecar/sidecar.cjs"))
             .unwrap_or_default();
-        (exe_dir.join(name), script)
+        (strip_verbatim(exe_dir.join(name)), strip_verbatim(script))
     }
 }
 
