@@ -55,6 +55,9 @@ jobs:
       # 真实 renderer：只跑 vite renderer 构建，不碰 Electron 主进程。
       - name: Build cindy renderer
         working-directory: .cache/cindy/apps/desktop
+        # 与 cindy 自己的 CI 一致，renderer 打包需要较大的堆。
+        env:
+          NODE_OPTIONS: --max-old-space-size=6144
         run: npx vite build --config vite.renderer.config.ts
 
       # sidecar 复用 cindy desktop shared/ 下的纯函数模块。
