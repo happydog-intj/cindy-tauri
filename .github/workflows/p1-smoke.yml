@@ -6,6 +6,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+env:
+  # 与本地验证用的 cindy 版本一致；cindy-headless 0.4.3。
+  CINDY_REF: 628f32170e046cdb5869ac58ccac7b201c748495
+
 jobs:
   smoke:
     strategy:
@@ -34,6 +38,26 @@ jobs:
       - name: Build sidecar bundle
         run: npm run sidecar:build
 
+      # cindy-headless：按固定 commit 检出，只装它自己的依赖，跳过 postinstall（会拉 Electron 和 agent 二进制）。
+      - uses: actions/checkout@v4
+        with:
+          repository: makecindy/cindy
+          ref: ${{ env.CINDY_REF }}
+          path: .cache/cindy
+
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: .cache/cindy/package.json
+
+      - name: Build cindy-headless
+        working-directory: .cache/cindy
+        run: |
+          pnpm install --filter cindy-headless... --ignore-scripts
+          pnpm --filter cindy-headless build
+
+      - name: Bundle cindy-headless into sidecar
+        run: npm run headless:fetch -- .cache/cindy
+
       - name: Fetch Node runtime for sidecar
         run: npm run node:fetch -- ${{ matrix.triple }}
 
@@ -47,6 +71,13 @@ jobs:
       - name: Smoke test (Windows)
         if: runner.os == 'Windows'
         run: node scripts/smoke.mjs "src-tauri/target/release/cindy-tauri.exe"
+
+      - name: Report bundle sizes
+        if: always()
+        shell: bash
+        run: |
+          find src-tauri/target/release/bundle -maxdepth 2 -type f \( -name '*.exe' -o -name '*.dmg' \) -exec ls -l {} \;
+          du -sh src-tauri/target/release/bundle/* || true
 
       - name: Upload bundles
         if: always()

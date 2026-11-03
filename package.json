@@ -6,6 +6,7 @@
   "scripts": {
     "sidecar:build": "node sidecar/build.mjs",
     "node:fetch": "node scripts/fetch-node.mjs",
+    "headless:fetch": "node scripts/fetch-headless.mjs",
     "tauri": "tauri"
   },
   "devDependencies": {

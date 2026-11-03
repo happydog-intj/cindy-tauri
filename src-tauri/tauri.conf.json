@@ -15,6 +15,9 @@
     "targets": "all",
     "icon": ["icons/icon.png"],
     "externalBin": ["binaries/cindy-node"],
-    "resources": { "../sidecar/dist/sidecar.cjs": "sidecar/sidecar.cjs" }
+    "resources": {
+      "../sidecar/dist/sidecar.cjs": "sidecar/sidecar.cjs",
+      "../sidecar/dist/headless/": "sidecar/headless/"
+    }
   }
 }
