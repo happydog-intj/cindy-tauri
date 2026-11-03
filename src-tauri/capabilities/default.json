@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "P1 空壳的默认权限",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

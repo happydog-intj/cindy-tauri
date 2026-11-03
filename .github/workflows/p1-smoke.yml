@@ -1,0 +1,57 @@
+name: p1-smoke
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            triple: aarch64-apple-darwin
+            bundles: app
+          - os: windows-latest
+            triple: x86_64-pc-windows-msvc
+            bundles: nsis
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install JS dependencies
+        run: npm ci
+
+      - name: Build sidecar bundle
+        run: npm run sidecar:build
+
+      - name: Fetch Node runtime for sidecar
+        run: npm run node:fetch -- ${{ matrix.triple }}
+
+      - name: Build app
+        run: npx tauri build --bundles ${{ matrix.bundles }}
+
+      - name: Smoke test (macOS)
+        if: runner.os == 'macOS'
+        run: node scripts/smoke.mjs "src-tauri/target/release/bundle/macos/Cindy Tauri.app/Contents/MacOS/cindy-tauri"
+
+      - name: Smoke test (Windows)
+        if: runner.os == 'Windows'
+        run: node scripts/smoke.mjs "src-tauri/target/release/cindy-tauri.exe"
+
+      - name: Upload bundles
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cindy-tauri-${{ matrix.triple }}
+          path: src-tauri/target/release/bundle/
+          if-no-files-found: ignore

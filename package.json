@@ -1,0 +1,15 @@
+{
+  "name": "cindy-tauri",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "sidecar:build": "node sidecar/build.mjs",
+    "node:fetch": "node scripts/fetch-node.mjs",
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0",
+    "esbuild": "^0.25.0"
+  }
+}
