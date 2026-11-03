@@ -85,6 +85,12 @@ export function registerBootStubs({ dataDir, agentManifestDir }) {
   // 真实 DB 在会话链路里接入；这里只放行 LocalDbGate。
   registerInvoke('local-db:ensure-ready', async () => ({ ready: true }));
   registerSync('accessibility-support:get-sync', () => true);
+  // 语音输入未迁移：报告麦克风不可用，renderer 会跳过预热。
+  registerSync('voice-input:get-microphone-permission-cached', () => ({
+    ok: false,
+    status: 'unknown',
+    error: 'voice input is not available in the Tauri build yet',
+  }));
 
   // 布局存档：<dataDir>/layout.v1.json，读写都过 desktop 的 coerceLayout 校验。
   const layoutFile = path.join(dataDir, 'layout.v1.json');
