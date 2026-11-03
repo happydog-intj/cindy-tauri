@@ -20,6 +20,9 @@ await mkdir(dest, { recursive: true });
 // source map 有 12MB，不随包。
 await cp(cli, path.join(dest, 'cli.cjs'));
 await cp(path.join(src, 'profiles'), path.join(dest, 'profiles'), { recursive: true });
+// Agent 按需下载的版本锁定（url + sha256）。
+await mkdir(path.join(dest, 'agents'), { recursive: true });
+await cp(path.join(cindyDir, 'tools', 'pi', 'latest.json'), path.join(dest, 'agents', 'pi.json'));
 
 const { size } = await stat(path.join(dest, 'cli.cjs'));
 console.log(`cindy-headless copied to ${dest} (cli.cjs ${(size / 1024 / 1024).toFixed(1)} MB)`);

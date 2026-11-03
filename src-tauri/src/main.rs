@@ -17,7 +17,8 @@ type SidecarHandle = Result<Arc<sidecar::Sidecar>, String>;
 
 struct SidecarState(SidecarHandle);
 
-const SMOKE_TIMEOUT: Duration = Duration::from_secs(60);
+// 冒烟包含 Pi 按需下载（30–45MB）和一次真实模型调用。
+const SMOKE_TIMEOUT: Duration = Duration::from_secs(600);
 
 fn smoke_out() -> Option<String> {
     if std::env::var("CINDY_TAURI_SMOKE").as_deref() != Ok("1") {
@@ -74,8 +75,15 @@ fn runtime_paths(app: &AppHandle) -> (PathBuf, PathBuf) {
 }
 
 #[tauri::command]
-fn smoke_info() -> Option<String> {
-    smoke_out()
+fn smoke_info() -> Option<serde_json::Value> {
+    smoke_out().map(|out| {
+        serde_json::json!({
+            "out": out,
+            // 可选：冒烟时跑一次真实任务。未设置则只验证到 agent 下载。
+            "modelBaseUrl": std::env::var("CINDY_TAURI_SMOKE_MODEL_BASE_URL").ok(),
+            "modelId": std::env::var("CINDY_TAURI_SMOKE_MODEL_ID").ok(),
+        })
+    })
 }
 
 #[tauri::command]
@@ -96,7 +104,13 @@ fn main() {
     tauri::Builder::default()
         .setup(|app| {
             let (node, script) = runtime_paths(app.handle());
-            let handle = sidecar::Sidecar::spawn(&node, &script)
+            let data_dir = strip_verbatim(
+                app.path()
+                    .app_data_dir()
+                    .unwrap_or_else(|_| std::env::temp_dir().join("cindy-tauri")),
+            );
+            let _ = std::fs::create_dir_all(&data_dir);
+            let handle = sidecar::Sidecar::spawn(&node, &script, &data_dir)
                 .map(Arc::new)
                 .map_err(|e| format!("spawn sidecar failed ({}): {e}", node.display()));
             if let Err(e) = &handle {

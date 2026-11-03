@@ -19,7 +19,7 @@ const child = spawn(exe, [], {
   stdio: 'inherit',
 });
 
-const deadline = Date.now() + 90_000;
+const deadline = Date.now() + 660_000;
 while (!existsSync(out) && Date.now() < deadline) {
   await new Promise((r) => setTimeout(r, 1000));
 }

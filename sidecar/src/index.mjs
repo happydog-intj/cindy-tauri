@@ -3,24 +3,42 @@
 // 响应：{"id": 1, "result": {...}} 或 {"id": 1, "error": "..."}
 import readline from 'node:readline';
 import { execFile } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import { copyFile, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { agentStatus, installAgent } from './agents.mjs';
 
-// 打包后的布局：sidecar.cjs 旁边是 headless/cli.cjs 和 headless/profiles/。
+// 打包后的布局：sidecar.cjs 旁边是 headless/cli.cjs、headless/profiles/ 和 headless/agents/。
 const headlessDir = path.join(__dirname, 'headless');
 const headlessCli = path.join(headlessDir, 'cli.cjs');
+const agentManifestDir = path.join(headlessDir, 'agents');
+
+// Tauri 通过环境变量传入应用数据目录；未设置时（直接跑 sidecar）用当前目录下的 .cindy-data。
+const dataDir = path.resolve(process.env.CINDY_TAURI_DATA_DIR ?? '.cindy-data');
+
+// P2 验证阶段：headless.run 会在无沙箱、无审批的情况下执行 agent 命令，
+// 只在冒烟或开发模式下开放，工作目录固定在数据目录下新建的临时文件夹。
+const runEnabled = process.env.CINDY_TAURI_SMOKE === '1' || process.env.CINDY_TAURI_DEV === '1';
+
+// 子进程环境：去掉可能泄露或覆盖路由的网关变量，只用 profile 里的自定义模型地址。
+function headlessEnv(extra = {}) {
+  const env = { ...process.env, ...extra };
+  for (const k of ['CINDY_HEADLESS_API_KEY', 'ANTHROPIC_API_KEY', 'CINDY_HEADLESS_BASE_URL', 'ANTHROPIC_BASE_URL', 'CINDY_CODEX_API_KEY', 'CINDY_HEADLESS_CONFIG_FILE']) delete env[k];
+  return env;
+}
 
 // 用当前 Node（随包的 cindy-node）以子进程运行 cindy-headless CLI，返回解析后的 JSON。
-function runHeadless(args, timeoutMs = 60_000) {
+function runHeadless(args, { timeoutMs = 60_000, env, cwd, allowFailure = false } = {}) {
   if (!existsSync(headlessCli)) throw new Error(`cindy-headless not bundled: ${headlessCli}`);
   return new Promise((resolve, reject) => {
     execFile(
       process.execPath,
       ['--no-warnings', headlessCli, ...args],
-      { timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024, windowsHide: true },
+      { timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024, windowsHide: true, env: env ?? headlessEnv(), cwd },
       (err, stdout, stderr) => {
-        if (err) {
-          reject(new Error(`cindy-headless ${args[0]} failed: ${(stderr || stdout || err.message).trim().slice(0, 2000)}`));
+        // run 在 infra-* 状态下退出码为 1，但 stdout 仍是完整的结果 JSON。
+        if (err && !(allowFailure && stdout.trim())) {
+          reject(new Error(`cindy-headless ${args[0]} failed: ${(stderr || stdout || err.message).trim().slice(-2000)}`));
           return;
         }
         try {
@@ -42,12 +60,98 @@ function bundledProfile(rel) {
   return full;
 }
 
+// 模型配置校验：baseUrl 只允许 HTTPS 或本机 HTTP（与 cindy-headless 的规则一致），不接受内嵌凭据。
+function validateModel(model) {
+  if (!model || typeof model !== 'object') throw new Error('params.model is required');
+  const { baseUrl, id } = model;
+  if (typeof id !== 'string' || !/^[A-Za-z0-9._:/-]{1,128}$/.test(id)) throw new Error('params.model.id is invalid');
+  let url;
+  try { url = new URL(baseUrl); } catch { throw new Error('params.model.baseUrl is invalid'); }
+  const loopback = ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname);
+  if (url.username || url.password || !(url.protocol === 'https:' || (url.protocol === 'http:' && loopback))) {
+    throw new Error('params.model.baseUrl must be HTTPS or loopback HTTP without credentials');
+  }
+  const contextWindow = Number.isInteger(model.contextWindow) && model.contextWindow > 0 ? model.contextWindow : 128000;
+  const maxTokens = Number.isInteger(model.maxTokens) && model.maxTokens > 0 ? model.maxTokens : 8192;
+  return { baseUrl: url.href.replace(/\/+$/, ''), id, contextWindow, maxTokens, reasoning: model.reasoning === true };
+}
+
+// 以随包的 cindy-production-pi BYOM 模板为基础，生成桌面端 profile。
+// 桌面上没有容器，containerSandbox=false；临时工作目录不是 git 仓库，关闭 Pi 项目 skill 扫描。
+async function writeDesktopProfile(dir, piBinary, model) {
+  const templateDir = path.join(headlessDir, 'profiles', 'cindy-production-pi');
+  const p = JSON.parse(await readFile(path.join(templateDir, 'profile.byom.example.json'), 'utf8'));
+  delete p.parentProfile;
+  delete p.changedDimensions;
+  p.id = 'cindy-tauri-desktop-pi';
+  p.agentBinaryPath = piBinary;
+  p.supportedModelIds = [model.id];
+  p.model = { provider: 'desktop-byom', requestedId: model.id, routeId: 'desktop-byom', contextLimit: model.contextWindow, maxOutputTokens: model.maxTokens };
+  p.nativeProviders = [{
+    id: 'desktop-byom',
+    name: 'Desktop OpenAI-compatible provider',
+    baseUrl: model.baseUrl,
+    api: 'openai-completions',
+    models: [{ id: model.id, contextWindow: model.contextWindow, maxTokens: model.maxTokens, reasoning: model.reasoning, input: ['text'] }],
+  }];
+  p.containerSandbox = false;
+  p.piProjectSkills = { enabled: false, roots: [] };
+  await copyFile(path.join(templateDir, 'prompt.md'), path.join(dir, 'prompt.md'));
+  const file = path.join(dir, 'profile.json');
+  await writeFile(file, JSON.stringify(p, null, 2));
+  return file;
+}
+
+async function headlessRun(params) {
+  if (!runEnabled) throw new Error('headless.run is only enabled in smoke or dev mode during P2');
+  if (typeof params.task !== 'string' || !params.task.trim() || params.task.length > 16000) throw new Error('params.task is required (max 16000 chars)');
+  const model = validateModel(params.model);
+  const timeoutMs = Math.min(Math.max(Number(params.timeoutMs) || 180_000, 10_000), 600_000);
+  const { binary } = await installAgent('pi', { manifestDir: agentManifestDir, dataDir });
+  await mkdir(path.join(dataDir, 'runs'), { recursive: true });
+  const runDir = await mkdtemp(path.join(dataDir, 'runs', 'run-'));
+  const workDir = path.join(runDir, 'workspace');
+  const outDir = path.join(runDir, 'output');
+  await mkdir(workDir);
+  await mkdir(outDir);
+  const profile = await writeDesktopProfile(runDir, binary, model);
+  const result = await runHeadless(
+    ['run', '--profile', profile, '--task', params.task, '--working-dir', workDir, '--output-dir', outDir, '--timeout-ms', String(timeoutMs)],
+    { timeoutMs: timeoutMs + 30_000, env: headlessEnv({ CINDY_HEADLESS_ALLOW_UNSANDBOXED_BYPASS: '1' }), cwd: runDir, allowFailure: true },
+  );
+  return {
+    status: result.status,
+    durationMs: result.durationMs,
+    error: result.error ?? null,
+    finalText: readFinalText(path.join(outDir, 'trace.jsonl')),
+    runDir,
+    workDir,
+  };
+}
+
+// 从 trace.jsonl 里取最后一条最终文本。
+function readFinalText(traceFile) {
+  if (!existsSync(traceFile)) return null;
+  let text = null;
+  for (const line of readFileSync(traceFile, 'utf8').split('\n')) {
+    if (!line.includes('"type":"text"')) continue;
+    try {
+      const ev = JSON.parse(line);
+      if (ev.data?.isFinal) text = ev.data.text;
+    } catch { /* 忽略损坏行 */ }
+  }
+  return text;
+}
+
 const handlers = {
   ping: () => ({ pong: true, at: new Date().toISOString() }),
   info: () => ({ node: process.version, platform: process.platform, arch: process.arch, pid: process.pid }),
   echo: (params) => params,
   'headless.version': () => runHeadless(['version']),
   'headless.capabilities': (params) => runHeadless(['capabilities', '--profile', bundledProfile(params.profile)]),
+  'agent.status': (params) => agentStatus(params.kind ?? 'pi', { manifestDir: agentManifestDir, dataDir }),
+  'agent.install': (params) => installAgent(params.kind ?? 'pi', { manifestDir: agentManifestDir, dataDir }),
+  'headless.run': headlessRun,
 };
 
 function reply(msg) {

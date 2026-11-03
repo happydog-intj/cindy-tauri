@@ -19,13 +19,20 @@ pub struct Sidecar {
 }
 
 impl Sidecar {
-    pub fn spawn(node: &Path, script: &Path) -> std::io::Result<Self> {
-        let mut child = Command::new(node)
-            .arg(script)
+    pub fn spawn(node: &Path, script: &Path, data_dir: &Path) -> std::io::Result<Self> {
+        let mut cmd = Command::new(node);
+        cmd.arg(script)
+            .env("CINDY_TAURI_DATA_DIR", data_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()?;
+            .stderr(Stdio::inherit());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // CREATE_NO_WINDOW：不为 sidecar 弹出控制台窗口。
+            cmd.creation_flags(0x0800_0000);
+        }
+        let mut child = cmd.spawn()?;
         let stdin = child.stdin.take().ok_or_else(|| std::io::Error::other("no stdin"))?;
         let stdout = child.stdout.take().ok_or_else(|| std::io::Error::other("no stdout"))?;
         Ok(Self {
