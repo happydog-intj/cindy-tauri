@@ -2,11 +2,20 @@
 // 请求：{"id": 1, "method": "ping", "params": {}}
 // 响应：{"id": 1, "result": {...}} 或 {"id": 1, "error": "..."}
 import readline from 'node:readline';
+import { format } from 'node:util';
+
 import { execFile } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { copyFile, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { agentStatus, installAgent } from './agents.mjs';
+import { ipcMethods, setPush } from './ipc.mjs';
+import { registerBootStubs } from './boot-stubs.mjs';
+
+// stdout 只用于 JSON 协议，其他模块的 console.log/info 改写到 stderr。
+for (const k of ['log', 'info', 'debug']) {
+  console[k] = (...a) => process.stderr.write(format(...a) + '\n');
+}
 
 // 打包后的布局：sidecar.cjs 旁边是 headless/cli.cjs、headless/profiles/ 和 headless/agents/。
 const headlessDir = path.join(__dirname, 'headless');
@@ -152,11 +161,16 @@ const handlers = {
   'agent.status': (params) => agentStatus(params.kind ?? 'pi', { manifestDir: agentManifestDir, dataDir }),
   'agent.install': (params) => installAgent(params.kind ?? 'pi', { manifestDir: agentManifestDir, dataDir }),
   'headless.run': headlessRun,
+  ...ipcMethods,
 };
 
 function reply(msg) {
   process.stdout.write(JSON.stringify(msg) + '\n');
 }
+
+// 没有 id 的推送消息，Rust 侧转发为 Tauri 事件 "cindy:ipc"。
+setPush((push) => reply({ push }));
+registerBootStubs({ dataDir, agentManifestDir });
 
 const rl = readline.createInterface({ input: process.stdin });
 const pending = new Set();

@@ -1,31 +1,38 @@
-// 管理 Node sidecar 子进程：按行发送 JSON 请求，读取一行 JSON 响应。
-// P1 为串行调用（一次只处理一个请求），后续再做并发与超时。
+// 管理 Node sidecar 子进程，stdin/stdout 按行收发 JSON。
+// - 请求：{"id":1,"method":"...","params":{...}}
+// - 响应：{"id":1,"result":...} 或 {"id":1,"error":"..."}
+// - 推送：{"push":{...}}（无 id，交给 on_push，例如转发成 renderer 事件）
+// 读线程按 id 分发响应，多个请求可以同时在途，长任务不再阻塞其他调用。
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::thread;
 
-struct Io {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
-}
+type Reply = Result<Value, String>;
+type Pending = Arc<Mutex<HashMap<u64, mpsc::Sender<Reply>>>>;
 
 pub struct Sidecar {
-    io: Mutex<Io>,
+    child: Mutex<Child>,
+    stdin: Mutex<ChildStdin>,
+    pending: Pending,
     next_id: AtomicU64,
 }
 
 impl Sidecar {
-    pub fn spawn(node: &Path, script: &Path, data_dir: &Path) -> std::io::Result<Self> {
+    pub fn spawn<F>(node: &Path, script: &Path, env: &[(&str, String)], on_push: F) -> std::io::Result<Self>
+    where
+        F: Fn(Value) + Send + 'static,
+    {
         let mut cmd = Command::new(node);
-        cmd.arg(script)
-            .env("CINDY_TAURI_DATA_DIR", data_dir)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+        cmd.arg(script).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -35,41 +42,64 @@ impl Sidecar {
         let mut child = cmd.spawn()?;
         let stdin = child.stdin.take().ok_or_else(|| std::io::Error::other("no stdin"))?;
         let stdout = child.stdout.take().ok_or_else(|| std::io::Error::other("no stdout"))?;
-        Ok(Self {
-            io: Mutex::new(Io { child, stdin, stdout: BufReader::new(stdout) }),
-            next_id: AtomicU64::new(1),
-        })
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+
+        let reader_pending = pending.clone();
+        thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                let Ok(msg) = serde_json::from_str::<Value>(line.trim()) else {
+                    eprintln!("[sidecar] bad json line: {}", line.chars().take(200).collect::<String>());
+                    continue;
+                };
+                if let Some(push) = msg.get("push") {
+                    on_push(push.clone());
+                    continue;
+                }
+                let Some(id) = msg.get("id").and_then(Value::as_u64) else { continue };
+                let tx = reader_pending.lock().ok().and_then(|mut p| p.remove(&id));
+                if let Some(tx) = tx {
+                    let reply = match msg.get("error") {
+                        Some(err) => Err(err.as_str().map(str::to_owned).unwrap_or_else(|| err.to_string())),
+                        None => Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
+                    };
+                    let _ = tx.send(reply);
+                }
+            }
+            // sidecar 退出：让所有在途请求立即失败。
+            if let Ok(mut p) = reader_pending.lock() {
+                for (_, tx) in p.drain() {
+                    let _ = tx.send(Err("sidecar exited".into()));
+                }
+            }
+        });
+
+        Ok(Self { child: Mutex::new(child), stdin: Mutex::new(stdin), pending, next_id: AtomicU64::new(1) })
     }
 
-    pub fn call(&self, method: &str, params: Value) -> Result<Value, String> {
+    pub fn call(&self, method: &str, params: Value) -> Reply {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let request = json!({ "id": id, "method": method, "params": params });
-
-        let mut io = self.io.lock().map_err(|_| "sidecar lock poisoned".to_string())?;
-        writeln!(io.stdin, "{request}").map_err(|e| format!("write failed: {e}"))?;
-        io.stdin.flush().map_err(|e| format!("flush failed: {e}"))?;
-
-        let mut line = String::new();
-        let n = io.stdout.read_line(&mut line).map_err(|e| format!("read failed: {e}"))?;
-        if n == 0 {
-            return Err("sidecar closed stdout".into());
+        let (tx, rx) = mpsc::channel();
+        self.pending.lock().map_err(|_| "sidecar lock poisoned")?.insert(id, tx);
+        let line = json!({ "id": id, "method": method, "params": params }).to_string();
+        let written = self.stdin.lock().map_err(|_| "sidecar lock poisoned".to_string()).and_then(|mut w| {
+            writeln!(w, "{line}").and_then(|_| w.flush()).map_err(|e| format!("write failed: {e}"))
+        });
+        if let Err(e) = written {
+            if let Ok(mut p) = self.pending.lock() {
+                p.remove(&id);
+            }
+            return Err(e);
         }
-        let response: Value = serde_json::from_str(line.trim()).map_err(|e| format!("bad json: {e}"))?;
-        if response.get("id") != Some(&json!(id)) {
-            return Err(format!("id mismatch: {response}"));
-        }
-        if let Some(err) = response.get("error") {
-            return Err(err.to_string());
-        }
-        Ok(response.get("result").cloned().unwrap_or(Value::Null))
+        rx.recv().map_err(|_| "sidecar closed".to_string())?
     }
 }
 
 impl Drop for Sidecar {
     fn drop(&mut self) {
-        if let Ok(mut io) = self.io.lock() {
-            let _ = io.child.kill();
-            let _ = io.child.wait();
+        if let Ok(mut c) = self.child.lock() {
+            let _ = c.kill();
+            let _ = c.wait();
         }
     }
 }

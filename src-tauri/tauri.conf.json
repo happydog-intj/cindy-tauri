@@ -3,18 +3,25 @@
   "productName": "Cindy Tauri",
   "version": "0.0.1",
   "identifier": "com.cindy.tauri.p1",
-  "build": { "frontendDist": "../ui" },
+  "build": {
+    "frontendDist": "../dist/frontend"
+  },
   "app": {
     "withGlobalTauri": true,
-    "windows": [
-      { "label": "main", "title": "Cindy Tauri P1", "width": 1100, "height": 760 }
-    ]
+    "windows": [],
+    "security": {
+      "csp": null
+    }
   },
   "bundle": {
     "active": true,
     "targets": "all",
-    "icon": ["icons/icon.png"],
-    "externalBin": ["binaries/cindy-node"],
+    "icon": [
+      "icons/icon.png"
+    ],
+    "externalBin": [
+      "binaries/cindy-node"
+    ],
     "resources": {
       "../sidecar/dist/sidecar.cjs": "sidecar/sidecar.cjs",
       "../sidecar/dist/headless/": "sidecar/headless/"

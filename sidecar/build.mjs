@@ -4,7 +4,10 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
+// 直接复用 cindy desktop 的纯函数模块（shared/ 下无 electron 依赖的部分）。
+const cindyDir = path.resolve(process.env.CINDY_DIR ?? path.join(here, '..', '..', 'cindy'));
 await build({
+  alias: { '@cindy-desktop-shared': path.join(cindyDir, 'apps', 'desktop', 'src', 'shared') },
   entryPoints: [path.join(here, 'src/index.mjs')],
   bundle: true,
   platform: 'node',

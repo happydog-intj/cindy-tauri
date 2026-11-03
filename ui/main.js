@@ -63,7 +63,9 @@ async function main() {
   }
   try {
     const detail = await smoke(info);
-    await invoke('smoke_finish', { ok: true, detail });
+    // 第一阶段通过后加载真实 renderer，由 preload 里的冒烟钩子写最终结果。
+    sessionStorage.setItem('cindySmokePhase1', detail);
+    location.replace('/index.html');
   } catch (err) {
     await invoke('smoke_finish', { ok: false, detail: String(err) });
   }

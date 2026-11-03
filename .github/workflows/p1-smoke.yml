@@ -35,9 +35,6 @@ jobs:
       - name: Install JS dependencies
         run: npm ci
 
-      - name: Build sidecar bundle
-        run: npm run sidecar:build
-
       # cindy-headless：按固定 commit 检出，只装它自己的依赖，跳过 postinstall（会拉 Electron 和 agent 二进制）。
       - uses: actions/checkout@v4
         with:
@@ -52,8 +49,22 @@ jobs:
       - name: Build cindy-headless
         working-directory: .cache/cindy
         run: |
-          pnpm install --filter cindy-headless... --ignore-scripts
+          pnpm install --filter cindy-headless... --filter "desktop..." --ignore-scripts
           pnpm --filter cindy-headless build
+
+      # 真实 renderer：只跑 vite renderer 构建，不碰 Electron 主进程。
+      - name: Build cindy renderer
+        working-directory: .cache/cindy/apps/desktop
+        run: npx vite build --config vite.renderer.config.ts
+
+      # sidecar 复用 cindy desktop shared/ 下的纯函数模块。
+      - name: Build sidecar bundle
+        env:
+          CINDY_DIR: .cache/cindy
+        run: npm run sidecar:build
+
+      - name: Build frontend (renderer + preload shim)
+        run: node scripts/build-frontend.mjs .cache/cindy
 
       - name: Bundle cindy-headless into sidecar
         run: npm run headless:fetch -- .cache/cindy

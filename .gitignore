@@ -5,3 +5,5 @@ src-tauri/binaries/
 src-tauri/gen/
 sidecar/dist/
 .DS_Store
+dist/
+src-tauri/preload/
