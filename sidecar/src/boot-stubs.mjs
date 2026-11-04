@@ -5,7 +5,8 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { agentStatus } from './agents.mjs';
 import { coerceLayout } from '@cindy-desktop-shared/layoutTree';
-import { registerInvoke, registerSync } from './ipc.mjs';
+import { hostLocalProjectKeysOnly, parseSyncedProjectOrderMode } from '@cindy/maker-shared/project-order-sync';
+import { emitToRenderer, registerInvoke, registerSync } from './ipc.mjs';
 
 // desktop main/profile/profileRegistryModel.ts 的 LOCAL_PROFILE_DATA_OWNER_ID。
 const LOCAL_DATA_OWNER_ID = 'local-v1';
@@ -112,6 +113,32 @@ export function registerBootStubs({ dataDir, agentManifestDir }) {
     const layout = coerceLayout(null).layout;
     writeFileSync(layoutFile, JSON.stringify(layout));
     return { layout, persisted: true };
+  });
+
+  // 侧栏项目排序：desktop main/projectOrderStore.ts 的单 owner 版，存 <dataDir>/project-order.v1.json。
+  const orderFile = path.join(dataDir, 'project-order.v1.json');
+  const ownerStamp = { dataOwnerId: LOCAL_DATA_OWNER_ID, ownerGeneration: 1 };
+  const normalizeOrder = (raw) => {
+    const v = raw && typeof raw === 'object' ? raw : {};
+    return {
+      manualProjectOrder: hostLocalProjectKeysOnly(v.manualProjectOrder).filter((k) => k.length <= 4096),
+      projectOrder: parseSyncedProjectOrderMode(v.projectOrder),
+    };
+  };
+  const orderSnapshot = () => {
+    let saved = null;
+    try { saved = JSON.parse(readFileSync(orderFile, 'utf8')); } catch { /* 未自定义 */ }
+    return { authoritative: saved !== null, available: true, ...normalizeOrder(saved), ownerStamp };
+  };
+  registerInvoke('sidebar-settings:get-project-order', async () => orderSnapshot());
+  registerInvoke('sidebar-settings:apply-project-order', async (req) => {
+    if (!req || typeof req !== 'object' || req.dataOwnerId !== ownerStamp.dataOwnerId || req.ownerGeneration !== ownerStamp.ownerGeneration) {
+      throw new Error('[PRECONDITION_FAILED] active account changed during project order mutation');
+    }
+    writeFileSync(orderFile, JSON.stringify(normalizeOrder(req)));
+    const snapshot = orderSnapshot();
+    emitToRenderer('sidebar-settings:project-order-changed', snapshot, ownerStamp);
+    return snapshot;
   });
 
   return { deviceId: id, exists: existsSync(dataDir) };

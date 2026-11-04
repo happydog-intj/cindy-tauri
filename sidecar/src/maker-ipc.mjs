@@ -112,6 +112,12 @@ export function registerMakerIpc({ dataDir, db, models, agentManifestDir, host: 
     pending.delete(requestId);
     clearTimeout(entry.timer);
     entry.resolve(decision);
+    // persist.mjs：ask_user / plan_review 的 pending 行回写最终状态（permission 不建行，返回 null）。
+    try {
+      db.persistInteractionResolved?.(entry.sessionId, requestId, decision);
+    } catch (err) {
+      process.stderr.write(`[maker-ipc] persist interaction resolved failed: ${err?.message ?? err}\n`);
+    }
     const resolvedAs = decision?.behavior === 'deny' || decision?.dismissed ? 'deny' : 'allow';
     const carryDecision = reason === 'resolved' && (entry.kind === 'ask_user_question' || entry.kind === 'plan_review');
     emitToRenderer('maker:interaction-dismissed', {
@@ -140,7 +146,13 @@ export function registerMakerIpc({ dataDir, db, models, agentManifestDir, host: 
         entry.timer.unref?.();
       }
       signal?.addEventListener('abort', () => settleInteraction(req.requestId, defaultDecision(req.kind, 'session_aborted'), 'session_aborted'), { once: true });
-      emitToRenderer('maker:interaction-request', { sessionId: session.id, request: req, persistId: undefined });
+      let persistId;
+      try {
+        persistId = db.persistInteractionRequest?.(session.id, req) ?? undefined;
+      } catch (err) {
+        process.stderr.write(`[maker-ipc] persist interaction request failed: ${err?.message ?? err}\n`);
+      }
+      emitToRenderer('maker:interaction-request', { sessionId: session.id, request: req, persistId });
     }));
   }
 
@@ -300,10 +312,23 @@ export function registerMakerIpc({ dataDir, db, models, agentManifestDir, host: 
   }
 
   // ── 通道 ────────────────────────────────────────────────────────────────
+  function unsupportedCapabilities() {
+    const no = { supported: false, reason: 'not-implemented', message: 'Only Pi is available in the Tauri build' };
+    return {
+      switchModel: no, availableModels: [], hasFastMode: false, effort: no, effortLevels: [], reasoningDisplay: ['off'],
+      permissionModes: [], setPermissionModeMidSession: no, planMode: no,
+      multimodal: { text: no, image: no, file: no },
+      fork: no, rewind: no, abort: no, sameTurnSteer: no, memory: { supported: no }, extraDirs: no,
+      supportsSessionAgentSwitch: false, supportsModelWindowSwitchGuard: false,
+    };
+  }
   registerInvoke('maker:list-available-agents', async () => maker.listAvailableAgents());
 
   registerInvoke('maker:get-capabilities', async (agentKind) => {
-    if (agentKind !== 'pi') fail('NOT_IMPLEMENTED', `agentKind ${String(agentKind)} is not supported`);
+    // renderer 的 loadLocalCapabilitiesSnapshot 并行查 claude-code/codex/pi，任一抛错整份快照作废
+    // （模型选择器显示 "Model Details Unavailable"）。Tauri 版只注册 Pi，其余引擎返回全不支持的合法能力。
+    if (agentKind === 'claude-code' || agentKind === 'codex') return unsupportedCapabilities();
+    if (agentKind !== 'pi') fail('INVALID_PARAMS', `unknown agentKind ${String(agentKind)}`);
     // desktop register.ts GET_CAPABILITIES：agent 能力 + host 级标志位；可选模型取自已连接的自定义 provider。
     const caps = maker.getCapabilities('pi');
     const fromProviders = typeof models?.getPiModelDescriptors === 'function' ? models.getPiModelDescriptors() : [];

@@ -302,6 +302,7 @@ export function openLocalDb({ dataDir, ownerId }) {
       store.emitRow(sid, msg);
       return msg.clientId;
     },
+    persistInteractionRequest: (sid, req) => persister.persistInteractionRequest(sid, req),
     persistInteractionResolved: (sid, requestId, decision) => persister.persistInteractionResolved(sid, requestId, decision),
     _internal: { createSessionRow, updateSession, listMessages, historyView, workDetails, getMessageRow, store },
     close() { sql.close(); },
