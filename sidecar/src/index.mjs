@@ -11,6 +11,9 @@ import path from 'node:path';
 import { agentStatus, installAgent } from './agents.mjs';
 import { ipcMethods, setPush } from './ipc.mjs';
 import { registerBootStubs } from './boot-stubs.mjs';
+import { openLocalDb, registerLocalDbIpc } from './local-db/index.mjs';
+import * as models from './model-config.mjs';
+import { registerMakerIpc } from './maker-ipc.mjs';
 
 // stdout 只用于 JSON 协议，其他模块的 console.log/info 改写到 stderr。
 for (const k of ['log', 'info', 'debug']) {
@@ -172,6 +175,13 @@ function reply(msg) {
 setPush((push) => reply({ push }));
 registerBootStubs({ dataDir, agentManifestDir });
 
+// §9.5 会话链路：本地库（会话列表 / 历史）→ 模型配置 → maker 会话。注册顺序靠后者覆盖 boot stub。
+const LOCAL_OWNER_ID = 'local-v1';
+const db = openLocalDb({ dataDir, ownerId: LOCAL_OWNER_ID });
+models.registerProviderIpc({ dataDir });
+const makerIpc = registerMakerIpc({ dataDir, db, models, agentManifestDir });
+registerLocalDbIpc(db, { isRunning: (sid) => makerIpc.isTurnRunning?.(sid) ?? false });
+
 const rl = readline.createInterface({ input: process.stdin });
 const pending = new Set();
 
@@ -204,5 +214,7 @@ async function handleLine(line) {
 // stdin 关闭后等待未完成的请求回复完再退出。
 rl.on('close', async () => {
   await Promise.allSettled([...pending]);
+  await Promise.resolve(makerIpc.shutdown?.()).catch(() => undefined);
+  try { db.close(); } catch { /* 已关闭 */ }
   process.exit(0);
 });

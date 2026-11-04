@@ -91,12 +91,23 @@ fn node_arch() -> &'static str {
     }
 }
 
+// 会话冒烟阶段：run（建会话、发消息、审批）或 verify（重启后检查会话列表）。只在冒烟模式下生效。
+fn session_smoke_phase() -> Option<String> {
+    smoke_out()?;
+    match std::env::var("CINDY_TAURI_SESSION_SMOKE").as_deref() {
+        Ok(p @ ("run" | "verify")) => Some(p.to_string()),
+        _ => None,
+    }
+}
+
 fn boot_script() -> String {
     let boot = json!({
         "platform": node_platform(),
         "arch": node_arch(),
         "argv": [],
         "smoke": smoke_out().is_some(),
+        "sessionSmoke": session_smoke_phase().is_some(),
+        "sessionSmokePhase": session_smoke_phase(),
     });
     format!("Object.defineProperty(window, '__CINDY_BOOT__', {{ value: Object.freeze({boot}), configurable: false }});")
 }
@@ -125,15 +136,59 @@ async fn sidecar_call(state: State<'_, SidecarState>, method: String, params: Va
 
 // payload 是 shared/ipc-codec.mjs 编码后的参数数组，原样交给 sidecar，返回同样编码的结果。
 #[tauri::command]
-async fn ipc_invoke(state: State<'_, SidecarState>, channel: String, payload: String) -> Result<Value, String> {
+async fn ipc_invoke(
+    window: tauri::WebviewWindow,
+    state: State<'_, SidecarState>,
+    channel: String,
+    payload: String,
+) -> Result<Value, String> {
+    if channel == "get-fullscreen-state" {
+        let full = window.is_fullscreen().unwrap_or(false);
+        // 与 shared/ipc-codec.mjs 的编码一致：普通 JSON 值原样序列化。
+        return Ok(Value::String(serde_json::to_string(&full).unwrap()));
+    }
     let sc = sidecar(&state)?;
     tauri::async_runtime::spawn_blocking(move || sc.call("ipc.invoke", json!({ "channel": channel, "payload": payload })))
         .await
         .map_err(|e| e.to_string())?
 }
 
+// 窗口控制类 channel 在 Rust 里原生处理（对齐 desktop bootstrap-electron.ts 的 ipcMain.on 实现）。
+fn handle_window_send(window: &tauri::WebviewWindow, channel: &str) -> bool {
+    let result = match channel {
+        "window-minimize" => window.minimize(),
+        "window-maximize" => {
+            if window.is_maximized().unwrap_or(false) { window.unmaximize() } else { window.maximize() }
+        }
+        "window-exit-fullscreen" => window.set_fullscreen(false),
+        // 自定义 X 按钮：主窗口 = 退出 app（Windows 先关窗，与 desktop 一致）。
+        "window-close" => {
+            if window.label() == "main" && !cfg!(windows) {
+                window.app_handle().exit(0);
+                Ok(())
+            } else {
+                window.close()
+            }
+        }
+        "window-close-self" => window.close(),
+        _ => return false,
+    };
+    if let Err(e) = result {
+        eprintln!("[window] {channel} failed: {e}");
+    }
+    true
+}
+
 #[tauri::command]
-async fn ipc_send(state: State<'_, SidecarState>, channel: String, payload: String) -> Result<(), String> {
+async fn ipc_send(
+    window: tauri::WebviewWindow,
+    state: State<'_, SidecarState>,
+    channel: String,
+    payload: String,
+) -> Result<(), String> {
+    if handle_window_send(&window, &channel) {
+        return Ok(());
+    }
     let sc = sidecar(&state)?;
     tauri::async_runtime::spawn_blocking(move || sc.call("ipc.send", json!({ "channel": channel, "payload": payload })))
         .await
@@ -205,7 +260,19 @@ fn create_main_window(app: &AppHandle) -> tauri::Result<()> {
         .traffic_light_position(tauri::LogicalPosition::new(12.0, 16.0));
     #[cfg(not(target_os = "macos"))]
     let builder = builder.decorations(false);
-    builder.build()?;
+    let window = builder.build()?;
+    // 全屏切换推送 fullscreen-change（desktop mainWindowFullscreenStartup.ts 的行为）。
+    let watched = window.clone();
+    let last = std::sync::atomic::AtomicBool::new(window.is_fullscreen().unwrap_or(false));
+    window.on_window_event(move |event| {
+        if let tauri::WindowEvent::Resized(_) = event {
+            let now = watched.is_fullscreen().unwrap_or(false);
+            if last.swap(now, std::sync::atomic::Ordering::Relaxed) != now {
+                let payload = serde_json::to_string(&[now]).unwrap();
+                let _ = watched.emit_to("main", "cindy:ipc", json!({ "channel": "fullscreen-change", "payload": payload }));
+            }
+        }
+    });
     Ok(())
 }
 
@@ -219,9 +286,11 @@ fn main() {
         })
         .setup(|app| {
             let (node, script) = runtime_paths(app.handle());
-            let data_dir = strip_verbatim(
-                app.path().app_data_dir().unwrap_or_else(|_| std::env::temp_dir().join("cindy-tauri")),
-            );
+            // CINDY_TAURI_DATA_DIR 覆盖数据目录（冒烟和开发用临时目录）。
+            let data_dir = strip_verbatim(match std::env::var_os("CINDY_TAURI_DATA_DIR") {
+                Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+                _ => app.path().app_data_dir().unwrap_or_else(|_| std::env::temp_dir().join("cindy-tauri")),
+            });
             let _ = std::fs::create_dir_all(&data_dir);
             let env = [
                 ("CINDY_TAURI_DATA_DIR", data_dir.to_string_lossy().into_owned()),

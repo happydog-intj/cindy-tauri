@@ -88,6 +88,28 @@ jobs:
         if: runner.os == 'Windows'
         run: node scripts/smoke.mjs "src-tauri/target/release/cindy-tauri.exe"
 
+      # 会话冒烟：mock 模型（scripts/mock-openai.mjs）+ 同一数据目录启动两次（run / verify），
+      # 覆盖新建会话、流式回复、Ask 模式批准工具调用、重启后会话列表仍在。
+      - name: Session smoke test (macOS)
+        if: runner.os == 'macOS'
+        env:
+          CINDY_TAURI_SMOKE_LOG_DIR: ${{ runner.temp }}/session-smoke-logs
+        run: node scripts/smoke.mjs "src-tauri/target/release/bundle/macos/Cindy Tauri.app/Contents/MacOS/cindy-tauri" --session
+
+      - name: Session smoke test (Windows)
+        if: runner.os == 'Windows'
+        env:
+          CINDY_TAURI_SMOKE_LOG_DIR: ${{ runner.temp }}/session-smoke-logs
+        run: node scripts/smoke.mjs "src-tauri/target/release/cindy-tauri.exe" --session
+
+      - name: Upload session smoke logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: session-smoke-logs-${{ matrix.triple }}
+          path: ${{ runner.temp }}/session-smoke-logs/
+          if-no-files-found: ignore
+
       - name: Report bundle sizes
         if: always()
         shell: bash

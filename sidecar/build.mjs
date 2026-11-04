@@ -14,5 +14,18 @@ await build({
   format: 'cjs',
   target: 'node22',
   outfile: path.join(here, 'dist/sidecar.cjs'),
+  // maker-core 及其依赖从 cindy 的 node_modules 解析。
+  nodePaths: [
+    path.join(cindyDir, 'apps', 'cindy-headless', 'node_modules'),
+    path.join(cindyDir, 'apps', 'desktop', 'node_modules'),
+    path.join(cindyDir, 'node_modules'),
+  ],
+  // maker-core 内置的 Pi 扩展源码 / prompt 以 .md 文本形式 import。
+  loader: { '.md': 'text' },
+  // CJS 里没有 import.meta.url，用 banner 里的 __u 顶替。
+  define: { 'import.meta.url': '__u' },
+  banner: { js: 'const __u=require("node:url").pathToFileURL(__filename).href;' },
+  // 原生模块不打包：sidecar 只用 node:sqlite。
+  external: ['better-sqlite3', 'sharp'],
   logLevel: 'info',
 });
