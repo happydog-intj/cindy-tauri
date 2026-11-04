@@ -7,6 +7,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod browser;
+mod desktop_import;
 mod native;
 mod secrets;
 mod sidecar;
@@ -373,6 +374,8 @@ fn main() {
             let env = [
                 ("CINDY_TAURI_DATA_DIR", data_dir.to_string_lossy().into_owned()),
                 ("CINDY_TAURI_APP_VERSION", app.package_info().version.to_string()),
+                // 首次启动询问是否从桌面版导入；冒烟不问。
+                ("CINDY_TAURI_DESKTOP_IMPORT_PROMPT", if smoke_out().is_some() { "0" } else { "1" }.to_string()),
             ];
             let emitter = app.handle().clone();
             let native_app = app.handle().clone();

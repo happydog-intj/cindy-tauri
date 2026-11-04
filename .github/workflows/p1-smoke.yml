@@ -83,11 +83,19 @@ jobs:
       - name: Browser panel e2e
         run: node scripts/browser-e2e.mjs
 
+      - name: Desktop import e2e
+        run: node scripts/desktop-import-e2e.mjs
+
       - name: Fetch Node runtime for sidecar
         run: npm run node:fetch -- ${{ matrix.triple }}
 
       - name: Build app
         run: npx tauri build --bundles ${{ matrix.bundles }}
+
+      # 桌面版导入的 DPAPI 解包只能在 Windows 上验证。
+      - name: Rust unit tests (Windows DPAPI)
+        if: runner.os == 'Windows'
+        run: cargo test --release --manifest-path src-tauri/Cargo.toml desktop_import
 
       # CI 没有本机模型地址，只验证到 Pi 按需下载；真实任务在本地设置
       # CINDY_TAURI_SMOKE_MODEL_BASE_URL / CINDY_TAURI_SMOKE_MODEL_ID 后运行。

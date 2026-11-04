@@ -408,6 +408,8 @@ fn run<R: Runtime>(app: &AppHandle<R>, method: &str, params: &Value) -> Result<V
         "open.url" => open_url(app, params),
         "open.path" => open_path(app, params),
         "reveal" => reveal(app, params),
+        // 从桌面版导入：取 Electron safeStorage 密钥材料（macOS 可能弹钥匙串授权框）。
+        "desktopImport.safeStorageKey" => crate::desktop_import::safe_storage_key(params),
         other => Err(format!("[NOT_IMPLEMENTED] native method {other}")),
     }
 }

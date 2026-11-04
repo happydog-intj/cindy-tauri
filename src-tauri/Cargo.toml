@@ -25,6 +25,8 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 
 [target.'cfg(windows)'.dependencies]
 windows-core = "0.62"
+# 从桌面版导入时用 DPAPI 解开 Electron safeStorage 的 AES key。
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
 
 [profile.release]
 codegen-units = 1

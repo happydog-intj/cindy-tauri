@@ -431,6 +431,37 @@ async function createProvider(input, keys, options) {
   });
 }
 
+/**
+ * 从 desktop 版导入一个 provider（desktop-import.mjs 调用）。配置走与 create 相同的校验；
+ * 已有同 id 的 provider 不覆盖，返回 'exists'；apiKey 为 null 时只导入配置（之后在设置页补 key）。
+ * 返回 'imported' | 'exists'；配置不受支持时抛 IPC 错误，由调用方记为跳过。
+ */
+export function hasCustomProvider(id) {
+  return store.providers.some((p) => p.id === id);
+}
+
+export async function importProvider(input, apiKey) {
+  if (input && typeof input === 'object' && RESERVED_IDS.has(input.id)) {
+    throw ipcError('INVALID_PARAMS', `id '${input.id}' is reserved`);
+  }
+  const config = sanitizeConfig(input);
+  const key = typeof apiKey === 'string' && apiKey.trim() && apiKey.length <= MAX_KEY_CHARS ? apiKey.trim() : null;
+  return serialized(async () => {
+    if (store.providers.some((p) => p.id === config.id)) return 'exists';
+    const rollback = key && usesApiKey(config) ? await applyKeyMutation(config.id, key) : null;
+    store.providers.push(config);
+    try {
+      await persist();
+    } catch (err) {
+      store.providers = store.providers.filter((p) => p !== config);
+      await rollback?.();
+      throw err;
+    }
+    changed();
+    return 'imported';
+  });
+}
+
 async function updateProvider(input, keys, options) {
   assertOptions(options);
   const piKey = parsePiKey(keys);

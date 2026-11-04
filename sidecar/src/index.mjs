@@ -20,6 +20,7 @@ import { registerDesktopShellIpc } from './desktop-shell.mjs';
 import { registerSettingsIpc } from './settings-ipc.mjs';
 import { registerBrowserPanelIpc } from './browser-panel.mjs';
 import { registerCaptureDegradedIpc } from './capture-degraded.mjs';
+import { registerDesktopImportIpc } from './desktop-import.mjs';
 
 // stdout 只用于 JSON 协议，其他模块的 console.log/info 改写到 stderr。
 for (const k of ['log', 'info', 'debug']) {
@@ -201,6 +202,8 @@ const shell = registerDesktopShellIpc({ dataDir, db, anySessionInTurn: () => mak
 Object.assign(rustOnly, shell.nativeMethods);
 registerBrowserPanelIpc({ dataDir });
 registerCaptureDegradedIpc();
+// P4：从 Cindy 桌面版导入任务 / 模型服务（首次启动询问一次）。
+registerDesktopImportIpc({ dataDir, db, models });
 
 const rl = readline.createInterface({ input: process.stdin });
 const pending = new Set();
