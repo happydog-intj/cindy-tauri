@@ -17,6 +17,7 @@ import { registerMakerIpc } from './maker-ipc.mjs';
 import { initSecretStore, registerSecretIpc, secretMethods } from './secret-store.mjs';
 import { handleNativeReply, setNativeWriter } from './native.mjs';
 import { registerDesktopShellIpc } from './desktop-shell.mjs';
+import { registerSettingsIpc } from './settings-ipc.mjs';
 
 // stdout 只用于 JSON 协议，其他模块的 console.log/info 改写到 stderr。
 for (const k of ['log', 'info', 'debug']) {
@@ -184,6 +185,7 @@ function reply(msg) {
 setPush((push) => reply({ push }));
 setNativeWriter((msg) => reply(msg));
 registerBootStubs({ dataDir, agentManifestDir });
+registerSettingsIpc({ dataDir, piStatus: () => agentStatus('pi', { manifestDir: agentManifestDir, dataDir }) });
 
 // §9.5 会话链路：本地库（会话列表 / 历史）→ 模型配置 → maker 会话。注册顺序靠后者覆盖 boot stub。
 const LOCAL_OWNER_ID = 'local-v1';

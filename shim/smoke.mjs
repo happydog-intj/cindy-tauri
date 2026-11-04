@@ -31,6 +31,11 @@ export function installRendererSmoke() {
     // 未实现通道的 rejection 是预期内的（数量见 ipc.missing），其余错误都算失败。
     const unexpected = errors.filter((e) => !e.includes('[NOT_IMPLEMENTED]'));
     let ok = rendered && unexpected.length === 0 && fatal.length === 0 && !stats?.error;
+    let settingsTour;
+    if (boot.settingsSmoke && ok) {
+      settingsTour = await runSettingsTour(invoke, errors);
+      ok = ok && settingsTour.ok;
+    }
     let sessionSmoke;
     if (boot.sessionSmoke) {
       if (ok) {
@@ -48,6 +53,7 @@ export function installRendererSmoke() {
       fatalRendererErrors: fatal.slice(0, 10),
       ipc: stats,
       ...(sessionSmoke ? { sessionSmoke } : {}),
+      ...(settingsTour ? { settingsTour } : {}),
     });
     await invoke('smoke_finish', { ok, detail });
   };
@@ -70,6 +76,58 @@ export function installRendererSmoke() {
       void finish(size > 0, { elements: size, ms: elapsed, text });
     }
   }, 500);
+}
+
+// ---------- 设置页巡检 ----------
+// 依次打开设置页各分区，记录每个分区新出现的未实现通道、渲染层错误日志和错误边界文案。
+// 未实现通道只记录不算失败；出现错误边界或非 NOT_IMPLEMENTED 的页面错误算失败。
+const SETTINGS_TABS = ['general', 'appearance', 'personalization', 'providers', 'billing', 'usage', 'voice-input', 'im-bot',
+  'shortcuts', 'agent-island', 'import', 'remote-control', 'shared-tasks', 'ghosts', 'builtin-tools', 'computer-use',
+  'storage', 'help', 'about'];
+const ERROR_BOUNDARY_TEXT = /界面出错了|This view failed to render/;
+
+async function waitStable(ms = 1500, max = 8000) {
+  const t0 = Date.now();
+  let last = -1;
+  let since = Date.now();
+  while (Date.now() - t0 < max) {
+    const n = document.getElementById('root')?.getElementsByTagName('*').length ?? 0;
+    if (n !== last) { last = n; since = Date.now(); }
+    if (Date.now() - since >= ms) return n;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  return last;
+}
+
+async function runSettingsTour(invoke, errors) {
+  const tabs = [];
+  let ok = true;
+  const stats = async () => invoke('sidecar_call', { method: 'ipc.stats', params: {} }).catch(() => null);
+  let before = await stats();
+  for (const tab of SETTINGS_TABS) {
+    const errCount = errors.length;
+    const logCount = before?.rendererErrors?.length ?? 0;
+    location.hash = `#/settings?tab=${tab}`;
+    const elements = await waitStable();
+    const after = await stats();
+    const missing = {};
+    for (const kind of ['invoke', 'send', 'sendSync']) {
+      for (const [ch, n] of Object.entries(after?.missing?.[kind] ?? {})) {
+        if (n > (before?.missing?.[kind]?.[ch] ?? 0)) missing[ch] = kind;
+      }
+    }
+    const pageErrors = errors.slice(errCount).filter((e) => !e.includes('[NOT_IMPLEMENTED]'));
+    const logs = (after?.rendererErrors ?? []).slice(logCount).map((e) => `${e.scope}: ${e.msg}`.slice(0, 200));
+    const text = document.getElementById('root')?.innerText ?? '';
+    const boundary = ERROR_BOUNDARY_TEXT.test(text);
+    const tabOk = !boundary && pageErrors.length === 0 && elements > 0;
+    ok = ok && tabOk;
+    tabs.push({ tab, ok: tabOk, elements, missing: Object.keys(missing), ...(pageErrors.length ? { pageErrors } : {}), ...(logs.length ? { logs } : {}), ...(boundary ? { boundary: true } : {}) });
+    before = after;
+  }
+  location.hash = '#/';
+  await waitStable(1000, 4000);
+  return { ok, tabs };
 }
 
 // ---------- 会话冒烟 ----------

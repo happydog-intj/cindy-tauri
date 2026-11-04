@@ -113,6 +113,7 @@ fn boot_script() -> String {
         "smoke": smoke_out().is_some(),
         "sessionSmoke": session_smoke_phase().is_some(),
         "sessionSmokePhase": session_smoke_phase(),
+        "settingsSmoke": smoke_out().is_some() && std::env::var("CINDY_TAURI_SMOKE_SETTINGS").as_deref() == Ok("1"),
     });
     format!("Object.defineProperty(window, '__CINDY_BOOT__', {{ value: Object.freeze({boot}), configurable: false }});")
 }

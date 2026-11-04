@@ -77,6 +77,9 @@ jobs:
       - name: Desktop shell e2e
         run: node scripts/desktop-shell-e2e.mjs
 
+      - name: Settings e2e
+        run: node scripts/settings-e2e.mjs
+
       - name: Fetch Node runtime for sidecar
         run: npm run node:fetch -- ${{ matrix.triple }}
 
@@ -85,12 +88,17 @@ jobs:
 
       # CI 没有本机模型地址，只验证到 Pi 按需下载；真实任务在本地设置
       # CINDY_TAURI_SMOKE_MODEL_BASE_URL / CINDY_TAURI_SMOKE_MODEL_ID 后运行。
+      # 首屏通过后再巡检设置页各分区（CINDY_TAURI_SMOKE_SETTINGS=1），出现错误边界即失败。
       - name: Smoke test (macOS)
         if: runner.os == 'macOS'
+        env:
+          CINDY_TAURI_SMOKE_SETTINGS: '1'
         run: node scripts/smoke.mjs "src-tauri/target/release/bundle/macos/Cindy Tauri.app/Contents/MacOS/cindy-tauri"
 
       - name: Smoke test (Windows)
         if: runner.os == 'Windows'
+        env:
+          CINDY_TAURI_SMOKE_SETTINGS: '1'
         run: node scripts/smoke.mjs "src-tauri/target/release/cindy-tauri.exe"
 
       # 会话冒烟：mock 模型（scripts/mock-openai.mjs）+ 同一数据目录启动两次（run / verify），
