@@ -31,6 +31,12 @@ const child = spawn(process.execPath, [sidecarJs], {
   stdio: ['pipe', 'pipe', 'pipe'],
 });
 const errLines = [];
+// sidecar 提前退出时不要挂在等回复上。
+child.once('exit', (code) => {
+  if (waiters.size === 0) return;
+  console.error(`sidecar exited early (code ${code})\n${errLines.slice(-30).join('\n')}`);
+  process.exit(1);
+});
 readline.createInterface({ input: child.stderr }).on('line', (l) => { errLines.push(l); if (process.env.E2E_VERBOSE) console.error('  [sc]', l); });
 let seq = 0;
 const waiters = new Map();
