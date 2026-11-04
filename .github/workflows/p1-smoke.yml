@@ -80,6 +80,9 @@ jobs:
       - name: Settings e2e
         run: node scripts/settings-e2e.mjs
 
+      - name: Browser panel e2e
+        run: node scripts/browser-e2e.mjs
+
       - name: Fetch Node runtime for sidecar
         run: npm run node:fetch -- ${{ matrix.triple }}
 

@@ -160,7 +160,26 @@ if (session) {
   process.exit((await sessionSmoke()) ? 0 : 1);
 }
 
-const result = await runApp({}, 'basic');
+// 浏览器面板冒烟用的两张本地测试页（127.0.0.1，子 webview 允许访问）。
+async function startBrowserPages() {
+  const http = await import('node:http');
+  const page = (title, body) => `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title>`
+    + `<link rel="icon" href="data:,"></head><body><h1>${title}</h1>${body}<p id="section">section</p></body></html>`;
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, 'http://127.0.0.1');
+    const html = url.pathname === '/a.html' ? page('Cindy Smoke A', '<a href="b.html">B</a>')
+      : url.pathname === '/b.html' ? page('Cindy Smoke B', '<a href="a.html">A</a>') : null;
+    if (!html) { res.writeHead(404); res.end(); return; }
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.end(html);
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return { url: `http://127.0.0.1:${server.address().port}`, stop: () => server.close() };
+}
+
+const pages = await startBrowserPages();
+const result = await runApp({ CINDY_TAURI_SMOKE_BROWSER_URL: pages.url }, 'basic');
+pages.stop();
 if (!result) {
   console.error('smoke failed: no result file (timeout or app crashed)');
   process.exit(1);

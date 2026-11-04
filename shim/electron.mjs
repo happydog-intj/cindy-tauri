@@ -102,7 +102,7 @@ export const ipcRenderer = {
     else listeners.clear();
     return ipcRenderer;
   },
-  // 只用于 <webview> guest 页，Tauri 版没有 <webview>（P3 处理）。
+  // 只用于 <webview> guest 页。Tauri 的子 webview 跑的是外部网页，不注入 preload，没有 guest→宿主通道。
   sendToHost(channel) {
     console.warn(`[cindy-shim] sendToHost(${channel}) is not supported`);
   },

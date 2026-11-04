@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
-use tauri::{AppHandle, Manager, Runtime, WebviewWindow};
+use tauri::{AppHandle, Manager, Runtime, Window};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind, MessageDialogResult};
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
@@ -44,8 +44,9 @@ fn call_sidecar(method: &str, params: Value) -> Result<Value, String> {
     sidecar().ok_or_else(|| "sidecar unavailable".to_string())?.call(method, params)
 }
 
-pub fn main_window<R: Runtime>(app: &AppHandle<R>) -> Option<WebviewWindow<R>> {
-    app.get_webview_window("main")
+// 主窗口里还有浏览器子 webview，所以按 Window 取（get_webview_window 在多 webview 时返回 None）。
+pub fn main_window<R: Runtime>(app: &AppHandle<R>) -> Option<Window<R>> {
+    app.get_window("main")
 }
 
 pub fn quit<R: Runtime>(app: &AppHandle<R>) {
@@ -73,7 +74,7 @@ pub fn focus_main_window<R: Runtime>(app: &AppHandle<R>) {
 }
 
 // 隐藏主窗口；全屏时先退出全屏（macOS 全屏窗口直接 hide 会留下黑色空间）。
-pub fn hide_main_window<R: Runtime>(window: &WebviewWindow<R>) {
+pub fn hide_main_window<R: Runtime>(window: &Window<R>) {
     if window.is_fullscreen().unwrap_or(false) {
         let _ = window.set_fullscreen(false);
         let w = window.clone();
@@ -95,7 +96,7 @@ pub fn hide_main_window<R: Runtime>(window: &WebviewWindow<R>) {
 
 // ── 主窗口关闭（红灯 / Alt+F4 / 任务栏关闭 / Windows 自绘 X 里的 window.close()） ──
 
-pub fn on_main_close_requested<R: Runtime>(window: &WebviewWindow<R>, api: &tauri::CloseRequestApi) {
+pub fn on_main_close_requested<R: Runtime>(window: &Window<R>, api: &tauri::CloseRequestApi) {
     if is_quitting() {
         return;
     }

@@ -6,6 +6,7 @@
 // - CINDY_TAURI_SMOKE=1 时先跑 /__smoke/ 页面，再加载真实 renderer，最后写 CINDY_TAURI_SMOKE_OUT 并退出。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod browser;
 mod native;
 mod secrets;
 mod sidecar;
@@ -16,7 +17,7 @@ use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
 use tauri::http::{header, Response, StatusCode};
-use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Manager, State, Webview, WebviewUrl, WebviewWindowBuilder, Window};
 
 type SidecarHandle = Result<Arc<sidecar::Sidecar>, String>;
 
@@ -25,7 +26,7 @@ struct SidecarState(SidecarHandle);
 // 实际使用的数据目录（冒烟收尾时按它清理钥匙串条目）。
 static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 
-// 编译期嵌入的 preload（scripts/build-preload.mjs 生成）。
+// 编译期嵌入的 preload（scripts/build-frontend.mjs 生成）。
 const PRELOAD_JS: &str = include_str!("../preload/cindy-preload.js");
 
 // 冒烟包含 Pi 按需下载（30–45MB）、一次可选的真实模型调用和 renderer 首屏加载。
@@ -114,6 +115,8 @@ fn boot_script() -> String {
         "sessionSmoke": session_smoke_phase().is_some(),
         "sessionSmokePhase": session_smoke_phase(),
         "settingsSmoke": smoke_out().is_some() && std::env::var("CINDY_TAURI_SMOKE_SETTINGS").as_deref() == Ok("1"),
+        // 浏览器面板冒烟用的本地测试页（scripts/smoke.mjs 起的 127.0.0.1 服务）。
+        "browserSmokeUrl": smoke_out().and(std::env::var("CINDY_TAURI_SMOKE_BROWSER_URL").ok()),
     });
     format!("Object.defineProperty(window, '__CINDY_BOOT__', {{ value: Object.freeze({boot}), configurable: false }});")
 }
@@ -147,15 +150,17 @@ async fn sidecar_call(state: State<'_, SidecarState>, method: String, params: Va
 }
 
 // payload 是 shared/ipc-codec.mjs 编码后的参数数组，原样交给 sidecar，返回同样编码的结果。
+// 主窗口有浏览器子 webview 后就不再是 WebviewWindow，命令参数用 Webview，并且只接受主 webview。
 #[tauri::command]
 async fn ipc_invoke(
-    window: tauri::WebviewWindow,
+    webview: Webview,
     state: State<'_, SidecarState>,
     channel: String,
     payload: String,
 ) -> Result<Value, String> {
+    browser::require_main(&webview)?;
     if channel == "get-fullscreen-state" {
-        let full = window.is_fullscreen().unwrap_or(false);
+        let full = webview.window().is_fullscreen().unwrap_or(false);
         // 与 shared/ipc-codec.mjs 的编码一致：普通 JSON 值原样序列化。
         return Ok(Value::String(serde_json::to_string(&full).unwrap()));
     }
@@ -166,7 +171,7 @@ async fn ipc_invoke(
 }
 
 // 窗口控制类 channel 在 Rust 里原生处理（对齐 desktop bootstrap-electron.ts 的 ipcMain.on 实现）。
-fn handle_window_send(window: &tauri::WebviewWindow, channel: &str) -> bool {
+fn handle_window_send(window: &Window, channel: &str) -> bool {
     let result = match channel {
         "window-minimize" => window.minimize(),
         "window-maximize" => {
@@ -193,12 +198,13 @@ fn handle_window_send(window: &tauri::WebviewWindow, channel: &str) -> bool {
 
 #[tauri::command]
 async fn ipc_send(
-    window: tauri::WebviewWindow,
+    webview: Webview,
     state: State<'_, SidecarState>,
     channel: String,
     payload: String,
 ) -> Result<(), String> {
-    if handle_window_send(&window, &channel) {
+    browser::require_main(&webview)?;
+    if handle_window_send(&webview.window(), &channel) {
         return Ok(());
     }
     let sc = sidecar(&state)?;
@@ -288,6 +294,12 @@ fn create_main_window(app: &AppHandle) -> tauri::Result<()> {
                 tauri::webview::NewWindowResponse::Deny
             }
         });
+    // 冒烟时窗口常被别的窗口挡住，WebKit 会挂起被遮挡页面的定时器，回合等不到结束（macOS 14+ 生效）。
+    let builder = if smoke_out().is_some() {
+        builder.background_throttling(tauri::utils::config::BackgroundThrottlingPolicy::Disabled)
+    } else {
+        builder
+    };
     // 与 Electron 版一致：macOS 隐藏标题栏保留红绿灯，Windows 无边框（renderer 自绘窗口按钮）。
     #[cfg(target_os = "macos")]
     let builder = builder
@@ -296,7 +308,8 @@ fn create_main_window(app: &AppHandle) -> tauri::Result<()> {
         .traffic_light_position(tauri::LogicalPosition::new(12.0, 16.0));
     #[cfg(not(target_os = "macos"))]
     let builder = builder.decorations(false);
-    let window = builder.build()?;
+    // 之后会挂浏览器子 webview，窗口相关操作都按 Window 做。
+    let window = builder.build()?.as_ref().window();
     // 全屏切换推送 fullscreen-change（desktop mainWindowFullscreenStartup.ts 的行为）。
     let watched = window.clone();
     let last = std::sync::atomic::AtomicBool::new(window.is_fullscreen().unwrap_or(false));
@@ -337,6 +350,12 @@ fn main() {
         .plugin(tauri_plugin_opener::Builder::default().open_js_links_on_click(false).build())
         .plugin(tauri_plugin_notification::init())
         .register_asynchronous_uri_scheme_protocol("cindy-ipc", |ctx, request, responder| {
+            // 自定义协议算本地来源，只给主 webview 用；浏览器子 webview 的请求直接拒绝。
+            if ctx.webview_label() != "main" {
+                let denied = Response::builder().status(StatusCode::FORBIDDEN).body(Vec::new()).unwrap();
+                responder.respond(denied);
+                return;
+            }
             let app = ctx.app_handle().clone();
             let path = request.uri().path().to_string();
             let body = request.body().clone();
@@ -350,6 +369,7 @@ fn main() {
                 _ => app.path().app_data_dir().unwrap_or_else(|_| std::env::temp_dir().join("cindy-tauri")),
             });
             let _ = std::fs::create_dir_all(&data_dir);
+            let _ = browser::PARTITION_ROOT.set(data_dir.join("webview-partitions"));
             let env = [
                 ("CINDY_TAURI_DATA_DIR", data_dir.to_string_lossy().into_owned()),
                 ("CINDY_TAURI_APP_VERSION", app.package_info().version.to_string()),
@@ -412,7 +432,16 @@ fn main() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![smoke_info, sidecar_call, smoke_finish, ipc_invoke, ipc_send])
+        .invoke_handler(tauri::generate_handler![
+            smoke_info,
+            sidecar_call,
+            smoke_finish,
+            ipc_invoke,
+            ipc_send,
+            browser::browser_create,
+            browser::browser_op,
+            browser::browser_reset
+        ])
         .build(tauri::generate_context!())
         .expect("error while building cindy-tauri");
     app.run(|app, event| match event {

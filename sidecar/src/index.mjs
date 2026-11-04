@@ -18,6 +18,7 @@ import { initSecretStore, registerSecretIpc, secretMethods } from './secret-stor
 import { handleNativeReply, setNativeWriter } from './native.mjs';
 import { registerDesktopShellIpc } from './desktop-shell.mjs';
 import { registerSettingsIpc } from './settings-ipc.mjs';
+import { registerBrowserPanelIpc } from './browser-panel.mjs';
 
 // stdout 只用于 JSON 协议，其他模块的 console.log/info 改写到 stderr。
 for (const k of ['log', 'info', 'debug']) {
@@ -197,6 +198,7 @@ const makerIpc = registerMakerIpc({ dataDir, db, models, agentManifestDir });
 registerLocalDbIpc(db, { isRunning: (sid) => makerIpc.isTurnRunning?.(sid) ?? false });
 const shell = registerDesktopShellIpc({ dataDir, db, anySessionInTurn: () => makerIpc.anySessionInTurn?.() ?? false });
 Object.assign(rustOnly, shell.nativeMethods);
+registerBrowserPanelIpc({ dataDir });
 
 const rl = readline.createInterface({ input: process.stdin });
 const pending = new Set();

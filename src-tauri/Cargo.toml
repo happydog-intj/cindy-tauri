@@ -7,7 +7,8 @@ edition = "2021"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon", "image-png"] }
+# unstable：Window::add_child（浏览器面板的子 webview）需要。
+tauri = { version = "2", features = ["tray-icon", "image-png", "unstable"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # 主密钥存系统钥匙串：macOS Keychain / Windows 凭据管理器。
@@ -16,6 +17,14 @@ getrandom = "0.3"
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-notification = "2"
+
+# 浏览器面板的前进 / 后退 / 停止：Tauri 没有封装，直接调原生 webview。版本跟 wry 用的一致。
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "objc2-app-kit", "WKWebView", "WKNavigation"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSURL"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-core = "0.62"
 
 [profile.release]
 codegen-units = 1

@@ -36,6 +36,11 @@ export function installRendererSmoke() {
       settingsTour = await runSettingsTour(invoke, errors);
       ok = ok && settingsTour.ok;
     }
+    let browserSmoke;
+    if (boot.browserSmokeUrl && ok) {
+      browserSmoke = await runBrowserSmoke(boot.browserSmokeUrl);
+      ok = ok && browserSmoke.ok;
+    }
     let sessionSmoke;
     if (boot.sessionSmoke) {
       if (ok) {
@@ -54,6 +59,7 @@ export function installRendererSmoke() {
       ipc: stats,
       ...(sessionSmoke ? { sessionSmoke } : {}),
       ...(settingsTour ? { settingsTour } : {}),
+      ...(browserSmoke ? { browserSmoke } : {}),
     });
     await invoke('smoke_finish', { ok, detail });
   };
@@ -128,6 +134,136 @@ async function runSettingsTour(invoke, errors) {
   location.hash = '#/';
   await waitStable(1000, 4000);
   return { ok, tabs };
+}
+
+// ---------- 浏览器面板冒烟 ----------
+// 用 renderer 同款 document.createElement('webview') 建一个子 webview，打开本地测试页，走一遍
+// 事件、executeJavaScript、页内跳转、跳转 / 后退、隐藏、销毁。测试页见 scripts/smoke.mjs startBrowserPages。
+async function runBrowserSmoke(base) {
+  const result = { ok: false, steps: [] };
+  const step = stepRunner(result);
+  const seen = [];
+  const wv = document.createElement('webview');
+  const once = (type, pred = () => true) => new Promise((resolve) => {
+    const fn = (e) => {
+      if (!pred(e)) return;
+      wv.removeEventListener(type, fn);
+      resolve(e);
+    };
+    wv.addEventListener(type, fn);
+  });
+  const host = document.createElement('div');
+  host.style.cssText = 'position:fixed;right:16px;bottom:16px;width:480px;height:320px;z-index:2147483647;';
+  try {
+    await step('element', () => {
+      if (wv.tagName.toLowerCase() !== 'cindy-webview') throw new Error(`unexpected tag ${wv.tagName}`);
+      let threw = false;
+      try { wv.getWebContentsId(); } catch { threw = true; }
+      if (!threw) throw new Error('getWebContentsId should throw before attach');
+    });
+    for (const t of ['did-attach', 'did-start-loading', 'did-navigate', 'dom-ready', 'did-stop-loading', 'page-title-updated', 'did-navigate-in-page', 'page-favicon-updated']) {
+      wv.addEventListener(t, () => seen.push(t));
+    }
+    const ready = once('dom-ready');
+    const titled = once('page-title-updated', (e) => e.title === 'Cindy Smoke A');
+    wv.setAttribute('partition', 'persist:xdmaker-browser-app');
+    wv.setAttribute('src', `${base}/a.html`);
+    wv.setAttribute('style', 'width:100%;height:100%;');
+    host.appendChild(wv);
+    document.body.appendChild(host);
+    await step('load page A', async () => {
+      await ready;
+      await titled;
+      const id = wv.getWebContentsId();
+      if (!Number.isInteger(id) || id <= 0) throw new Error(`bad id ${id}`);
+      if (!wv.getURL().endsWith('/a.html')) throw new Error(`url ${wv.getURL()}`);
+      return { id, url: wv.getURL() };
+    });
+    await step('executeJavaScript', async () => {
+      const v = await wv.executeJavaScript('({ title: document.title, n: 1 + 1, list: [1, "x"] })');
+      if (v?.title !== 'Cindy Smoke A' || v.n !== 2 || v.list?.[1] !== 'x') throw new Error(JSON.stringify(v));
+      const undef = await wv.executeJavaScript('void 0');
+      if (undef !== undefined) throw new Error(`void 0 → ${JSON.stringify(undef)}`);
+      const stmt = await wv.executeJavaScript('var cindySmoke = 5; cindySmoke += 1;');
+      const read = await wv.executeJavaScript('window.cindySmoke');
+      if (read !== 6) throw new Error(`statement script → ${JSON.stringify(stmt)}, read ${read}`);
+      let msg = '';
+      try { await wv.executeJavaScript('(() => { throw new Error("boom") })()'); } catch (e) { msg = String(e.message); }
+      if (!msg.includes('boom')) throw new Error(`exception not surfaced: ${msg}`);
+      return { title: v.title };
+    });
+    // 外部页面拿不到 preload（electronAPI / 启动参数），调 Tauri 命令会被 ACL 拒绝。
+    await step('page cannot reach app IPC', async () => {
+      const probe = `(() => { window.__smokeIpc = {}; const i = window.__TAURI_INTERNALS__;
+        if (!i) { window.__smokeIpc = { done: true, internals: false }; return 0; }
+        const one = (cmd, args) => i.invoke(cmd, args).then(() => 'allowed', (e) => 'denied: ' + String(e).slice(0, 120));
+        Promise.all([one('ipc_invoke', { channel: 'app:get-version', payload: '[]' }), one('sidecar_call', { method: 'ping', params: {} }),
+          one('browser_op', { id: 1, op: 'state', arg: null })])
+          .then((r) => { window.__smokeIpc = { done: true, internals: true, r }; });
+        return 0; })()`;
+      await wv.executeJavaScript(probe);
+      const env = await wv.executeJavaScript('({ api: typeof window.electronAPI, boot: typeof window.__CINDY_BOOT__ })');
+      if (env.api !== 'undefined' || env.boot !== 'undefined') throw new Error(`preload leaked: ${JSON.stringify(env)}`);
+      let r;
+      for (let i = 0; i < 50; i++) {
+        r = await wv.executeJavaScript('window.__smokeIpc');
+        if (r?.done) break;
+        await new Promise((res) => setTimeout(res, 100));
+      }
+      if (!r?.done) throw new Error('probe did not finish');
+      if (r.internals && r.r.some((x) => x === 'allowed')) throw new Error(`IPC reachable from page: ${JSON.stringify(r.r)}`);
+      return r;
+    });
+    await step('in-page navigation', async () => {
+      const ev = once('did-navigate-in-page', (e) => String(e.url).endsWith('#section'));
+      await wv.executeJavaScript('(location.hash = "section", 0)');
+      const e = await ev;
+      return { url: e.url };
+    });
+    await step('navigate to page B', async () => {
+      const titled = once('page-title-updated', (e) => e.title === 'Cindy Smoke B');
+      const stopped = once('did-stop-loading');
+      await wv.loadURL(`${base}/b.html`);
+      await titled;
+      await stopped;
+      await waitFor(() => wv.canGoBack(), 'canGoBack', 5000);
+      return { url: wv.getURL(), canGoBack: wv.canGoBack() };
+    });
+    await step('go back', async () => {
+      const titled = once('page-title-updated', (e) => e.title === 'Cindy Smoke A');
+      wv.goBack();
+      await titled;
+      await waitFor(() => wv.getURL().includes('/a.html'), 'url after back', 5000);
+      await waitFor(() => wv.canGoForward(), 'canGoForward', 5000);
+      return { url: wv.getURL() };
+    });
+    await step('blocked schemes stay out', async () => {
+      let msg = '';
+      try { await wv.loadURL('http://tauri.localhost/index.html'); } catch (e) { msg = String(e?.message ?? e); }
+      if (!msg.includes('INVALID_PARAMS')) throw new Error(`tauri.localhost not rejected: ${msg}`);
+      return { msg: msg.slice(0, 80) };
+    });
+    await step('hide and destroy', async () => {
+      host.style.display = 'none';
+      await new Promise((r) => setTimeout(r, 400));
+      const id = wv.getWebContentsId();
+      host.remove();
+      await new Promise((r) => setTimeout(r, 400));
+      let gone = false;
+      try {
+        await window.__TAURI_INTERNALS__.invoke('browser_op', { id, op: 'state', arg: null });
+      } catch (e) {
+        gone = String(e).includes('NOT_FOUND');
+      }
+      if (!gone) throw new Error('child webview still alive after remove()');
+    });
+    result.ok = true;
+  } catch {
+    // 失败详情已记在 steps 里
+    host.remove();
+  }
+  result.events = [...new Set(seen)];
+  return result;
 }
 
 // ---------- 会话冒烟 ----------

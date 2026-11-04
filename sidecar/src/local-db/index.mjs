@@ -13,6 +13,7 @@ import { emitToRenderer, registerInvoke } from '../ipc.mjs';
 import { migrate } from './schema.mjs';
 import { messageToCamel, sessionToCamel, extractMessagePreview, PREVIEW_EXTRACT_CHARS } from './mapper.mjs';
 import { createEventPersister } from './persist.mjs';
+import { registerRightSidebarTabsIpc } from './right-sidebar-tabs.mjs';
 
 const fail = (code, message) => { throw new Error(`[${code}] ${message}`); };
 const requireString = (v, name) => {
@@ -312,6 +313,9 @@ export function openLocalDb({ dataDir, ownerId }) {
 export function registerLocalDbIpc(db, { isRunning = () => false } = {}) {
   const { sql } = db;
   const I = db._internal;
+
+  // ── right sidebar tabs ──
+  registerRightSidebarTabsIpc(sql);
 
   // ── sessions ──
   registerInvoke('local-db:sessions:list', (limit, status, options) => db.listSessions(limit, status, options ?? {}));

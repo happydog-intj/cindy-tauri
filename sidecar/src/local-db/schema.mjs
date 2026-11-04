@@ -63,6 +63,24 @@ const MIGRATIONS = [
     updated_at INTEGER NOT NULL
   );
   `,
+  // v2：右侧栏页签（desktop schema.ts rightSidebarTabs），浏览器面板等插件的页签持久化
+  `
+  CREATE TABLE IF NOT EXISTS right_sidebar_tabs (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    is_active INTEGER NOT NULL DEFAULT 0,
+    state TEXT NOT NULL DEFAULT '{}',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS right_sidebar_tabs_session_idx ON right_sidebar_tabs(session_id, position);
+  CREATE UNIQUE INDEX IF NOT EXISTS right_sidebar_tabs_subagents_singleton_idx
+    ON right_sidebar_tabs(session_id) WHERE kind = 'subagents';
+  CREATE UNIQUE INDEX IF NOT EXISTS right_sidebar_tabs_bot_artifacts_singleton_idx
+    ON right_sidebar_tabs(session_id) WHERE kind = 'bot-artifacts';
+  `,
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;
