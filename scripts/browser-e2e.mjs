@@ -155,6 +155,15 @@ try {
   const opened = sc.natives.find((n) => n.method === 'open.url');
   check('extension store opens via native', store.ok === true && /^https:\/\/chromewebstore\.google\.com\//.test(opened?.params?.url ?? ''), opened);
 
+  // ---------- 截图 / 录屏 / 远程桌面降级 ----------
+  const rd = await sc.invoke('remote-desktop:state', true);
+  check('remote desktop off', rd.enabled === false && rd.active === null && rd.windowsSupport === 'unavailable', rd);
+  check('remote desktop state validates', /INVALID_PARAMS/.test(await rejects(sc.invoke('remote-desktop:state', 'x')) ?? ''));
+  const perms = await sc.invoke('remote-desktop:permissions');
+  check('remote desktop permissions shape', perms.screenRecording === 'unknown' && perms.accessibility === 'unknown', perms);
+  check('remote desktop enable refused', /UNSUPPORTED_CAPABILITY/.test(await rejects(sc.invoke('remote-desktop:enable', true)) ?? ''));
+  check('screenshot compose empty', (await sc.invoke('region-screenshot:compose-take')) === null);
+
   // ---------- 重启后 ----------
   await sc.stop();
   sc = startSidecar();
