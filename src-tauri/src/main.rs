@@ -6,11 +6,12 @@
 // - CINDY_TAURI_SMOKE=1 时先跑 /__smoke/ 页面，再加载真实 renderer，最后写 CINDY_TAURI_SMOKE_OUT 并退出。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod secrets;
 mod sidecar;
 
 use serde_json::{json, Value};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
 use tauri::http::{header, Response, StatusCode};
@@ -19,6 +20,9 @@ use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder
 type SidecarHandle = Result<Arc<sidecar::Sidecar>, String>;
 
 struct SidecarState(SidecarHandle);
+
+// 实际使用的数据目录（冒烟收尾时按它清理钥匙串条目）。
+static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 // 编译期嵌入的 preload（scripts/build-preload.mjs 生成）。
 const PRELOAD_JS: &str = include_str!("../preload/cindy-preload.js");
@@ -124,12 +128,18 @@ fn smoke_info() -> Option<Value> {
             // 可选：冒烟时跑一次真实任务。未设置则只验证到 agent 下载。
             "modelBaseUrl": std::env::var("CINDY_TAURI_SMOKE_MODEL_BASE_URL").ok(),
             "modelId": std::env::var("CINDY_TAURI_SMOKE_MODEL_ID").ok(),
+            // 冒烟脚本每次生成的一次性假 key，用来走设置页保存 key 的同一条 IPC。
+            "apiKey": std::env::var("CINDY_TAURI_SMOKE_API_KEY").ok(),
         })
     })
 }
 
 #[tauri::command]
 async fn sidecar_call(state: State<'_, SidecarState>, method: String, params: Value) -> Result<Value, String> {
+    // 主密钥只能由 Rust 自己送，webview 不能调用 secrets.*。
+    if method.starts_with("secrets.") {
+        return Err(format!("method {method} is not callable from the webview"));
+    }
     let sc = sidecar(&state)?;
     tauri::async_runtime::spawn_blocking(move || sc.call(&method, params)).await.map_err(|e| e.to_string())?
 }
@@ -199,6 +209,12 @@ async fn ipc_send(
 #[tauri::command]
 fn smoke_finish(app: AppHandle, ok: bool, detail: String) {
     write_smoke(ok, &detail);
+    // 冒烟专用的钥匙串主密钥：会话冒烟 run 阶段成功时留给 verify 用，其余情况都删掉。
+    if session_smoke_phase().as_deref() != Some("run") || !ok {
+        if let Some(dir) = DATA_DIR.get() {
+            secrets::delete_smoke_entry(dir);
+        }
+    }
     app.exit(if ok { 0 } else { 1 });
 }
 
@@ -306,6 +322,25 @@ fn main() {
             .map_err(|e| format!("spawn sidecar failed ({}): {e}", node.display()));
             if let Err(e) = &handle {
                 eprintln!("{e}");
+            }
+            let _ = DATA_DIR.set(data_dir.clone());
+            // 钥匙串可能弹系统授权框，放到后台线程；sidecar 收到前，带 key 的 provider 显示为未连接。
+            if let Ok(sc) = &handle {
+                let sc = sc.clone();
+                let smoke = smoke_out().is_some();
+                let dir = data_dir.clone();
+                thread::spawn(move || {
+                    let reply = match secrets::load_or_create(smoke, &dir) {
+                        Ok(key) => sc.call("secrets.unlock", json!({ "key": key })),
+                        Err(reason) => {
+                            eprintln!("[secrets] keychain unavailable: {reason}");
+                            sc.call("secrets.unavailable", json!({ "reason": reason }))
+                        }
+                    };
+                    if let Err(e) = reply {
+                        eprintln!("[secrets] handing master key to sidecar failed: {e}");
+                    }
+                });
             }
             app.manage(SidecarState(handle));
             create_main_window(app.handle())?;

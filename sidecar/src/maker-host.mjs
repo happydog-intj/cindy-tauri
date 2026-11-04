@@ -1,7 +1,9 @@
 // 会话宿主：在 sidecar 里装配 maker-core 的 Maker + PiAgent（只支持 Pi）。
 // 参照 cindy-headless host.ts createHeadlessMaker 与 desktop maker-host/pi-host.ts buildPiAgent。
-// 模型来源只有 C 的自定义 OpenAI 兼容 provider（无 key），经 resolvePiNativeProviders 写进
+// 模型来源只有 C 的自定义 OpenAI 兼容 provider，经 resolvePiNativeProviders 写进
 // Pi 的 models.json 原生 provider 块；不接 Cindy 网关、不接订阅。
+// 带 key 的 provider：models.json 里只写 $CINDY_PI_KEY_<ID> 引用，key 经 env 交给 Pi 进程
+// （maker-core 会把这些变量名列进 CINDY_PI_SECRET_ENV_NAMES，Pi 的 bash 子进程拿不到）。
 import path from 'node:path';
 import { mkdirSync } from 'node:fs';
 import { Maker, PiAgent } from '@cindy/maker-core';
@@ -37,15 +39,17 @@ export function piRuntimeProviderId(providerId) {
   return RESERVED_PI_PROVIDER_IDS.has(slug) ? `cindy-tauri-${slug}` : slug;
 }
 
-// C 的模型配置 → Pi 原生 provider 描述。
+// 与 desktop pi-host.ts piNativeKeyEnvVar 同规则：CINDY_PI_KEY_<ID>，ID 规整成 [A-Z0-9_]。
+export function piNativeKeyEnvVar(providerId) {
+  return `CINDY_PI_KEY_${String(providerId).toUpperCase().replace(/[^A-Z0-9]+/g, '_')}`;
+}
+
+// C 的模型配置 → Pi 原生 provider 描述。apiKeyEnvVar 只是变量名，值由调用方放进 env。
 export function toPiNativeProvider(cfg) {
   if (!cfg) return null;
-  if (cfg.apiKey) {
-    // 这一里程碑不接安全存储，有 key 的 provider 一律拒绝，避免 key 写进 env/日志。
-    throw new Error('[NOT_IMPLEMENTED] provider with api key requires secure storage (not wired yet)');
-  }
   return {
     id: piRuntimeProviderId(cfg.providerId),
+    ...(cfg.authMethod === 'apiKey' ? { apiKeyEnvVar: piNativeKeyEnvVar(cfg.providerId) } : {}),
     sourceProviderId: cfg.providerId,
     name: cfg.providerName || cfg.providerId,
     baseUrl: cfg.baseUrl,
@@ -101,8 +105,16 @@ export function createMakerHost({ dataDir, models, agentManifestDir, logger = st
     resolvePiGatewayModelApi: () => 'openai-completions',
     resolveModelContextLimit: (providerId, modelId) => resolveConfig(providerId, modelId)?.contextLimit ?? null,
     resolvePiNativeProviders: async (ctx) => {
-      const spec = toPiNativeProvider(resolveConfig(ctx.providerId, ctx.model));
-      return { providers: spec ? [spec] : [], env: {} };
+      await models.whenSecretsReady?.();
+      const cfg = resolveConfig(ctx.providerId, ctx.model);
+      const spec = toPiNativeProvider(cfg);
+      if (!spec) return { providers: [], env: {} };
+      if (!spec.apiKeyEnvVar) return { providers: [spec], env: {} };
+      // 每次启动 / 恢复 Pi 时现取，断开连接后不会再用旧 key。取不到就抛错，maker-core 会按
+      // “所选 provider 不可解析”结束本次启动，而不是带着空 key 发请求。
+      const key = models.readProviderApiKey?.(cfg.providerId);
+      if (!key) throw new Error(`[AUTH_INVALID] API key for provider ${cfg.providerId} is missing`);
+      return { providers: [spec], env: { [spec.apiKeyEnvVar]: key } };
     },
   });
 
@@ -116,6 +128,10 @@ export function createMakerHost({ dataDir, models, agentManifestDir, logger = st
       if (agentStatus('pi', piCtx).installed) return;
       logger.info('pi binary missing, installing on demand', { version: status.version });
       await installAgent('pi', piCtx);
+    },
+    // 钥匙串主密钥到位（或确认不可用）后再解析模型，避免启动瞬间带 key 的 provider 被当成未连接。
+    async whenModelsReady() {
+      await models.whenSecretsReady?.();
     },
     // 把 renderer 传来的 providerId/model 落到 C 的配置上；缺 providerId 时用当前默认配置。
     resolveSessionModel(providerId, modelId) {

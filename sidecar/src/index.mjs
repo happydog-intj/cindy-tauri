@@ -14,6 +14,7 @@ import { registerBootStubs } from './boot-stubs.mjs';
 import { openLocalDb, registerLocalDbIpc } from './local-db/index.mjs';
 import * as models from './model-config.mjs';
 import { registerMakerIpc } from './maker-ipc.mjs';
+import { initSecretStore, registerSecretIpc, secretMethods } from './secret-store.mjs';
 
 // stdout 只用于 JSON 协议，其他模块的 console.log/info 改写到 stderr。
 for (const k of ['log', 'info', 'debug']) {
@@ -165,6 +166,8 @@ const handlers = {
   'agent.install': (params) => installAgent(params.kind ?? 'pi', { manifestDir: agentManifestDir, dataDir }),
   'headless.run': headlessRun,
   ...ipcMethods,
+  // 只由 Rust 侧调用（sidecar_call 拒绝 webview 调 secrets.*）。
+  ...secretMethods,
 };
 
 function reply(msg) {
@@ -178,6 +181,8 @@ registerBootStubs({ dataDir, agentManifestDir });
 // §9.5 会话链路：本地库（会话列表 / 历史）→ 模型配置 → maker 会话。注册顺序靠后者覆盖 boot stub。
 const LOCAL_OWNER_ID = 'local-v1';
 const db = openLocalDb({ dataDir, ownerId: LOCAL_OWNER_ID });
+initSecretStore({ dataDir });
+registerSecretIpc();
 models.registerProviderIpc({ dataDir });
 const makerIpc = registerMakerIpc({ dataDir, db, models, agentManifestDir });
 registerLocalDbIpc(db, { isRunning: (sid) => makerIpc.isTurnRunning?.(sid) ?? false });

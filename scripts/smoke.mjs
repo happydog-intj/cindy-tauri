@@ -3,8 +3,11 @@
 // --session：先启动 scripts/mock-openai.mjs，用同一个临时数据目录连续启动应用两次
 //   （CINDY_TAURI_SESSION_SMOKE=run 再 =verify），两次都 ok 才算通过。
 //   CINDY_TAURI_SMOKE_LOG_DIR 指定时，mock 请求日志和各阶段结果写到该目录（CI 失败时上传）。
+//   同时生成一次性的假 API key（CINDY_TAURI_SMOKE_API_KEY / MOCK_API_KEY），验证带 key 的 provider：
+//   run 阶段经设置页同款 IPC 保存，verify 阶段（重启后，主密钥要从系统钥匙串重新取出）仍能用它鉴权。
+import { randomBytes } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { createWriteStream, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createWriteStream, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
@@ -56,9 +59,9 @@ async function runApp(extraEnv, label, timeoutMs = 660_000) {
 }
 
 // 启动 mock 模型，读 stdout 第一行的 {"port":N}；stderr 请求日志写到 logFile。
-async function startMock(logFile) {
+async function startMock(logFile, apiKey) {
   const script = path.join(path.dirname(fileURLToPath(import.meta.url)), 'mock-openai.mjs');
-  const child = spawn(process.execPath, [script], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawn(process.execPath, [script], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, MOCK_API_KEY: apiKey } });
   const log = createWriteStream(logFile, { flags: 'a' });
   child.stderr.pipe(log);
   const port = await new Promise((resolve, reject) => {
@@ -85,6 +88,17 @@ function sessionDetail(result) {
   }
 }
 
+function findPlaintext(dir, needle, hits = [], base = dir) {
+  for (const name of readdirSync(dir)) {
+    const p = path.join(dir, name);
+    const st = statSync(p);
+    if (st.isDirectory()) { if (name !== 'agents') findPlaintext(p, needle, hits, base); continue; }
+    if (st.size > 20 * 1024 * 1024) continue;
+    if (readFileSync(p).includes(needle)) hits.push(path.relative(base, p));
+  }
+  return hits;
+}
+
 async function sessionSmoke() {
   const logDir = process.env.CINDY_TAURI_SMOKE_LOG_DIR
     ? path.resolve(process.env.CINDY_TAURI_SMOKE_LOG_DIR)
@@ -98,13 +112,15 @@ async function sessionSmoke() {
   mkdirSync(dataDir, { recursive: true });
   console.log(`session smoke: dataDir=${dataDir} logs=${logDir}`);
 
-  const mock = await startMock(mockLog);
+  const apiKey = `sk-smoke-${randomBytes(12).toString('hex')}`;
+  const mock = await startMock(mockLog, apiKey);
   console.log(`session smoke: mock-openai on 127.0.0.1:${mock.port}`);
   // Pi 的 openai-completions provider 在 baseUrl 后直接拼 /chat/completions，所以不带 /v1。
   const env = {
     CINDY_TAURI_DATA_DIR: dataDir,
     CINDY_TAURI_SMOKE_MODEL_BASE_URL: `http://127.0.0.1:${mock.port}`,
     CINDY_TAURI_SMOKE_MODEL_ID: 'mock-model',
+    CINDY_TAURI_SMOKE_API_KEY: apiKey,
   };
   const phases = {};
   try {
@@ -119,6 +135,12 @@ async function sessionSmoke() {
     mock.stop();
   }
 
+  // 假 key 不能以明文出现在数据目录、结果文件或 mock 日志里（CI 会上传这些文件）。
+  const leaks = findPlaintext(dataDir, apiKey).concat(findPlaintext(logDir, apiKey).map((f) => `logs/${f}`));
+  if (leaks.length) {
+    console.error(`session smoke failed: API key found in plaintext: ${leaks.join(', ')}`);
+    return false;
+  }
   if (!phases.run?.ok || !phases.verify?.ok) {
     console.error('session smoke failed');
     return false;

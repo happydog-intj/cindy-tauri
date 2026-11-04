@@ -213,6 +213,7 @@ export function registerMakerIpc({ dataDir, db, models, agentManifestDir, host: 
     if (live && live.getStatus() !== 'closed') return live;
     if (creating.has(id)) return creating.get(id);
     const task = (async () => {
+      await host.whenModelsReady?.();
       const cfg = host.resolveSessionModel(raw.providerId ?? null, raw.model);
       await host.ensurePiInstalled();
       const workingDir = typeof raw.workingDir === 'string' && raw.workingDir.trim()
@@ -331,6 +332,7 @@ export function registerMakerIpc({ dataDir, db, models, agentManifestDir, host: 
     if (agentKind !== 'pi') fail('INVALID_PARAMS', `unknown agentKind ${String(agentKind)}`);
     // desktop register.ts GET_CAPABILITIES：agent 能力 + host 级标志位；可选模型取自已连接的自定义 provider。
     const caps = maker.getCapabilities('pi');
+    await host.whenModelsReady?.();
     const fromProviders = typeof models?.getPiModelDescriptors === 'function' ? models.getPiModelDescriptors() : [];
     return {
       ...caps,

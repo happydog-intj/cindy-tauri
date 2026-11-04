@@ -1,6 +1,8 @@
-// 模型配置：自定义 provider（OpenAI Chat Completions 兼容、无 key）的持久化与 renderer IPC。
-// - 配置落 <dataDir>/providers.json，只含 id / 名称 / baseUrl / 模型清单，不含任何 key 或请求头；
-// - 带 key / OAuth / 自定义请求头的 provider 本里程碑不支持（安全存储未接入），一律返回 [NOT_IMPLEMENTED]；
+// 模型配置：自定义 provider（OpenAI Chat Completions 兼容）的持久化与 renderer IPC。
+// - 配置落 <dataDir>/providers.json，只含 id / 名称 / 鉴权方式 / baseUrl / 模型清单，不含任何 key 或请求头；
+// - 鉴权支持 none 和 apiKey。API key 存 secret-store（主密钥在系统钥匙串），键名与 desktop 相同
+//   （provider_key_<id>_pi），renderer 编辑表单可经 safe-storage-read 回填；
+// - OAuth 和自定义请求头仍不支持，返回 [NOT_IMPLEMENTED]；
 // - 环境变量 CINDY_TAURI_SMOKE_MODEL_BASE_URL / CINDY_TAURI_SMOKE_MODEL_ID 存在时注入只读的 "Smoke"
 //   provider（不落盘）并作为默认；
 // - ProviderView 由 @cindy/model-providers 的 buildUserProvider + buildRegistry 生成，与 desktop 同形状。
@@ -14,6 +16,7 @@ import {
   parseModelsListResponse,
 } from '@cindy/model-providers';
 import { emitToRenderer, registerInvoke, registerSync } from './ipc.mjs';
+import { getSecretSync, hasSecret, onSecretChange, removeSecret, setSecret, whenReady as whenSecretsReady } from './secret-store.mjs';
 
 // 本机模式 owner，与 boot-stubs 的 authState 一致。
 const DATA_OWNER_ID = 'local-v1';
@@ -82,9 +85,28 @@ function allConfigs() {
     .map(({ c }) => c);
 }
 
-function isConnected(config) {
-  return config.auth?.method === 'none';
+// 与 desktop shared/providerSecrets.ts customProviderSecretStorageKey(id, 'pi') 一致。
+export function piKeyName(providerId) {
+  return `provider_key_${providerId}_pi`;
 }
+
+function usesApiKey(config) {
+  return config.auth?.method === 'apiKey';
+}
+
+function isConnected(config) {
+  if (config.auth?.method === 'none') return true;
+  return usesApiKey(config) && hasSecret(piKeyName(config.id));
+}
+
+/** 已连接 apiKey provider 的明文 key；无鉴权或未存 key 返回 null。只给 maker-host 注入 Pi 环境变量用。 */
+export function readProviderApiKey(providerId) {
+  const config = allConfigs().find((c) => c.id === providerId);
+  if (!config || !usesApiKey(config)) return null;
+  return getSecretSync(piKeyName(config.id))?.trim() || null;
+}
+
+export { whenSecretsReady };
 
 /** 当前目录的 ProviderView[]（与 desktop maker:provider:list 的 providers 同形状）。 */
 export function getProviderViews() {
@@ -132,7 +154,8 @@ function toRunConfig(config, model) {
     modelId: model.id,
     baseUrl: rt.baseUrl,
     api: 'openai-completions',
-    apiKey: null,
+    // 只标记鉴权方式，key 本身由 maker-host 在启动 Pi 时现取，不随配置对象到处传。
+    authMethod: usesApiKey(config) ? 'apiKey' : 'none',
     reasoning: false,
   };
   // 只透传用户 / 发现结果明确给出的窗口；目录兜底的 200000 不当作上限。
@@ -197,16 +220,21 @@ function changed() {
 
 // ── 输入校验 ──────────────────────────────────────────────────────────
 
-function hasAnyKey(keys) {
-  if (keys === undefined || keys === null) return false;
+const MAX_KEY_CHARS = 16384;
+
+// desktop parseRuntimeKeys：{ [agent]: string }。只有 pi runtime，其余 agent 的 key 校验后忽略。返回去空白后的 pi key（可能为空串）。
+function parsePiKey(keys) {
+  if (keys === undefined || keys === null) return '';
   if (typeof keys !== 'object' || Array.isArray(keys)) throw ipcError('INVALID_PARAMS', 'invalid provider runtime keys');
   for (const [agent, value] of Object.entries(keys)) {
-    if (!AGENTS.includes(agent) || typeof value !== 'string') throw ipcError('INVALID_PARAMS', 'invalid provider runtime keys');
+    if (!AGENTS.includes(agent) || typeof value !== 'string' || value.length > MAX_KEY_CHARS) {
+      throw ipcError('INVALID_PARAMS', 'invalid provider runtime keys');
+    }
   }
-  return Object.values(keys).some((v) => v.length > 0);
+  return (keys.pi ?? '').trim();
 }
 
-const NOT_IMPLEMENTED_SECRET = 'providers with API keys, OAuth or custom headers need secure storage, which is not available in the Tauri build yet';
+const NOT_IMPLEMENTED_SECRET = 'providers with OAuth or custom request headers are not supported in the Tauri build yet';
 
 /** 把 renderer 传来的 CustomProviderConfig 收敛成只含 pi runtime、无凭据的规整形状；非法抛 IPC 错误。 */
 function sanitizeConfig(input) {
@@ -214,7 +242,11 @@ function sanitizeConfig(input) {
   const { id, name, auth, runtimes } = input;
   if (typeof id !== 'string' || !PROVIDER_ID_RE.test(id)) throw ipcError('INVALID_PARAMS', 'id must match /^[a-z0-9_-]{1,64}$/');
   if (typeof name !== 'string' || !name.trim() || name.length > 120) throw ipcError('INVALID_PARAMS', 'name required');
-  if (auth !== undefined && auth?.method !== 'none') throw ipcError('NOT_IMPLEMENTED', NOT_IMPLEMENTED_SECRET);
+  // 缺省 = apiKey（desktop 同口径，兼容历史配置）。
+  if (auth !== undefined && auth !== null && (typeof auth !== 'object' || Array.isArray(auth))) throw ipcError('INVALID_PARAMS', 'invalid auth');
+  const method = auth?.method ?? 'apiKey';
+  if (method === 'oauth') throw ipcError('NOT_IMPLEMENTED', NOT_IMPLEMENTED_SECRET);
+  if (method !== 'none' && method !== 'apiKey') throw ipcError('INVALID_PARAMS', 'invalid auth method');
   if (!runtimes || typeof runtimes !== 'object' || Array.isArray(runtimes)) throw ipcError('INVALID_PARAMS', 'runtimes required');
   const agents = Object.keys(runtimes);
   if (agents.some((a) => !AGENTS.includes(a))) throw ipcError('INVALID_PARAMS', 'invalid runtime');
@@ -249,7 +281,7 @@ function sanitizeConfig(input) {
   }
   const pi = { baseUrl, wireProtocol: 'openai-chat', models };
   if (modelsUrl) pi.modelsUrl = modelsUrl;
-  return { id, name: name.trim(), auth: { method: 'none' }, runtimes: { pi } };
+  return { id, name: name.trim(), auth: { method }, runtimes: { pi } };
 }
 
 function assertOwnerScope(scope) {
@@ -281,15 +313,17 @@ function classifyStatus(status) {
   return 'UNKNOWN';
 }
 
-// GET <baseUrl>/models（或显式 modelsUrl），10 秒超时，不跟随重定向，不带任何凭据。
-async function requestModels(baseUrl, modelsUrl, signal) {
+// GET <baseUrl>/models（或显式 modelsUrl），10 秒超时，不跟随重定向；有 key 时带 Authorization: Bearer。
+async function requestModels(baseUrl, modelsUrl, signal, apiKey = null) {
   const target = modelsUrl ?? `${baseUrl}/models`;
   const started = Date.now();
   const timeout = AbortSignal.timeout(FETCH_TIMEOUT_MS);
+  const headers = { accept: 'application/json' };
+  if (apiKey) headers.authorization = `Bearer ${apiKey}`;
   try {
     const res = await fetch(target, {
       method: 'GET',
-      headers: { accept: 'application/json' },
+      headers,
       redirect: 'error',
       signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
     });
@@ -326,31 +360,99 @@ function listProviders() {
   };
 }
 
+// 同一 provider 的配置 / key 变更串行执行，避免并发保存把 key 和配置拆开。
+let mutationQueue = Promise.resolve();
+function serialized(fn) {
+  const task = mutationQueue.then(fn);
+  mutationQueue = task.catch(() => {});
+  return task;
+}
+
+// key 变更：replacement 为字符串 = 写入，null = 删除。返回回滚函数（恢复成变更前的值）。
+async function applyKeyMutation(providerId, replacement) {
+  const name = piKeyName(providerId);
+  const previous = getSecretSync(name);
+  try {
+    if (replacement === null) await removeSecret(name);
+    else await setSecret(name, replacement);
+  } catch (err) {
+    if (String(err?.message).startsWith('[CREDENTIAL_STORAGE_UNAVAILABLE]')) throw err;
+    throw ipcError('CREDENTIAL_STORAGE_FAILED', 'saving the API key to secure storage failed');
+  }
+  return async () => {
+    try {
+      if (previous === null) await removeSecret(name);
+      else await setSecret(name, previous);
+    } catch (err) {
+      process.stderr.write(`[model-config] API key rollback failed for ${providerId}: ${err?.message ?? err}\n`);
+    }
+  };
+}
+
+function endpointChanged(prev, next) {
+  const a = prev?.runtimes.pi;
+  const b = next.runtimes.pi;
+  if (!a || !b) return false;
+  return a.baseUrl !== b.baseUrl || (a.modelsUrl ?? '') !== (b.modelsUrl ?? '');
+}
+
+// desktop planProviderKeyMutations 的 pi 子集：
+// - 新填了 key → 写入；
+// - 从 apiKey 切到 none → 删除旧 key；
+// - 没填新 key 但端点改了 → 删除旧 key（key 绑定端点，不能带去新主机）。
+function planKeyMutation(config, piKey, previous) {
+  if (!usesApiKey(config)) return previous && usesApiKey(previous) ? null : undefined;
+  if (piKey) return piKey;
+  if (previous && endpointChanged(previous, config)) return null;
+  return undefined;
+}
+
 async function createProvider(input, keys, options) {
   assertOptions(options);
-  if (hasAnyKey(keys)) throw ipcError('NOT_IMPLEMENTED', NOT_IMPLEMENTED_SECRET);
+  const piKey = parsePiKey(keys);
   if (input && typeof input === 'object' && (RESERVED_IDS.has(input.id))) {
     throw ipcError('INVALID_PARAMS', `id '${input.id}' is reserved`);
   }
   const config = sanitizeConfig(input);
-  if (store.providers.some((p) => p.id === config.id)) throw ipcError('ALREADY_EXISTS', `custom provider '${config.id}' already exists`);
-  store.providers.push(config);
-  await persist();
-  changed();
-  return { ok: true };
+  return serialized(async () => {
+    if (store.providers.some((p) => p.id === config.id)) throw ipcError('ALREADY_EXISTS', `custom provider '${config.id}' already exists`);
+    const mutation = planKeyMutation(config, piKey, null);
+    const rollback = mutation === undefined ? null : await applyKeyMutation(config.id, mutation);
+    store.providers.push(config);
+    try {
+      await persist();
+    } catch (err) {
+      store.providers = store.providers.filter((p) => p !== config);
+      await rollback?.();
+      throw err;
+    }
+    changed();
+    return { ok: true };
+  });
 }
 
 async function updateProvider(input, keys, options) {
   assertOptions(options);
-  if (hasAnyKey(keys)) throw ipcError('NOT_IMPLEMENTED', NOT_IMPLEMENTED_SECRET);
+  const piKey = parsePiKey(keys);
   if (input && typeof input === 'object') assertMutable(input.id);
   const config = sanitizeConfig(input);
-  const index = store.providers.findIndex((p) => p.id === config.id);
-  if (index < 0) throw ipcError('NOT_FOUND', `custom provider '${config.id}' not found`);
-  store.providers[index] = config;
-  await persist();
-  changed();
-  return { ok: true };
+  return serialized(async () => {
+    const index = store.providers.findIndex((p) => p.id === config.id);
+    if (index < 0) throw ipcError('NOT_FOUND', `custom provider '${config.id}' not found`);
+    const previous = store.providers[index];
+    const mutation = planKeyMutation(config, piKey, previous);
+    const rollback = mutation === undefined ? null : await applyKeyMutation(config.id, mutation);
+    store.providers[index] = config;
+    try {
+      await persist();
+    } catch (err) {
+      store.providers[index] = previous;
+      await rollback?.();
+      throw err;
+    }
+    changed();
+    return { ok: true };
+  });
 }
 
 async function deleteProvider(providerId, ownerScope, options) {
@@ -358,22 +460,31 @@ async function deleteProvider(providerId, ownerScope, options) {
   assertOptions(options);
   if (typeof providerId !== 'string' || !providerId) throw ipcError('INVALID_PARAMS', 'providerId required');
   assertMutable(providerId);
-  const before = store.providers.length;
-  store.providers = store.providers.filter((p) => p.id !== providerId);
-  store.providerOrder = store.providerOrder.filter((id) => id !== providerId);
-  if (store.providers.length !== before) {
-    await persist();
-    changed();
-  }
-  return { ok: true };
+  return serialized(async () => {
+    const before = store.providers.length;
+    store.providers = store.providers.filter((p) => p.id !== providerId);
+    store.providerOrder = store.providerOrder.filter((id) => id !== providerId);
+    if (store.providers.length !== before) await persist();
+    // 配置删了，key 也一并删（desktop 删除前先断开）。
+    if (PROVIDER_ID_RE.test(providerId) && hasSecret(piKeyName(providerId))) await removeSecret(piKeyName(providerId));
+    if (store.providers.length !== before) changed();
+    return { ok: true };
+  });
 }
 
-// desktop 只允许断开 API key 形态的连接；这里所有 provider 都是无鉴权，与 desktop 一致返回 INVALID_PARAMS。
-function disconnectProvider(providerId, ownerScope, options) {
+// desktop PROVIDER_CUSTOM_DISCONNECT：只对 API key 形态有效，删 key、保留配置以便重新连接。
+async function disconnectProvider(providerId, ownerScope, options) {
   assertOwnerScope(ownerScope);
   assertOptions(options);
   if (typeof providerId !== 'string' || !providerId) throw ipcError('INVALID_PARAMS', 'providerId required');
-  throw ipcError('INVALID_PARAMS', 'API connection required');
+  assertMutable(providerId);
+  return serialized(async () => {
+    const config = store.providers.find((p) => p.id === providerId);
+    if (!config || !usesApiKey(config)) throw ipcError('INVALID_PARAMS', 'API connection required');
+    await applyKeyMutation(config.id, null);
+    changed();
+    return { ok: true };
+  });
 }
 
 const connectionTests = new Map();
@@ -389,20 +500,30 @@ async function testConnection(input) {
   }
   let route;
   let modelId;
+  let apiKey = null;
   if (input.kind === 'saved') {
     if (typeof input.providerId !== 'string' || !AGENTS.includes(input.agent)) throw ipcError('INVALID_PARAMS', 'invalid test-connection input');
     const config = allConfigs().find((c) => c.id === input.providerId);
     const rt = input.agent === 'pi' ? config?.runtimes.pi : null;
     if (!rt) throw ipcError('INVALID_PARAMS', 'invalid saved provider connection');
+    // 已存 key 只发往已存端点。
     route = { baseUrl: rt.baseUrl, modelsUrl: rt.modelsUrl ?? null };
     modelId = rt.models[0]?.id ?? null;
+    if (usesApiKey(config)) {
+      apiKey = readProviderApiKey(config.id);
+      if (!apiKey) return { ok: false, code: 'AUTH_INVALID', latencyMs: 0, decision: 'blocked' };
+    }
   } else if (input.kind === 'adhoc') {
     const spec = input.spec;
     if (!spec || typeof spec !== 'object' || !AGENTS.includes(spec.agent)) throw ipcError('INVALID_PARAMS', 'invalid test-connection input');
-    if ((typeof spec.apiKey === 'string' && spec.apiKey.length > 0) || spec.authMethod === 'oauth'
-      || (spec.headers && Object.keys(spec.headers).length > 0)) {
+    if (spec.authMethod === 'oauth' || (spec.headers && Object.keys(spec.headers).length > 0)) {
       throw ipcError('NOT_IMPLEMENTED', NOT_IMPLEMENTED_SECRET);
     }
+    if (spec.apiKey !== undefined && spec.apiKey !== null && (typeof spec.apiKey !== 'string' || spec.apiKey.length > MAX_KEY_CHARS)) {
+      throw ipcError('INVALID_PARAMS', 'invalid test-connection input');
+    }
+    // 表单里刚填的 key（renderer 是本机可信设置页），只用于这一次探测，不落盘。
+    apiKey = spec.authMethod === 'none' ? null : spec.apiKey?.trim() || null;
     if (spec.wireProtocol !== undefined && spec.wireProtocol !== 'openai-chat') {
       throw ipcError('NOT_IMPLEMENTED', 'only OpenAI Chat Completions compatible endpoints are supported');
     }
@@ -419,7 +540,7 @@ async function testConnection(input) {
     connectionTests.set(input.requestId, controller);
   }
   try {
-    const r = await requestModels(route.baseUrl, route.modelsUrl, controller.signal);
+    const r = await requestModels(route.baseUrl, route.modelsUrl, controller.signal, apiKey);
     if (r.cancelled) return { ok: false, latencyMs: 0, decision: 'cancelled' };
     const selected = { baseUrl: route.baseUrl, wireProtocol: 'openai-chat' };
     if (!r.ok) return { ok: false, code: r.code, ...(r.status ? { status: r.status } : {}), latencyMs: r.latencyMs, decision: 'blocked' };
@@ -436,10 +557,13 @@ async function testConnection(input) {
 async function fetchModels(input) {
   if (!input || typeof input !== 'object' || !AGENTS.includes(input.agent)) throw ipcError('INVALID_PARAMS', 'invalid models-fetch input');
   if (!['apiKey', 'oauth', 'none'].includes(input.authMethod)) throw ipcError('INVALID_PARAMS', 'invalid models-fetch input');
-  if ((typeof input.apiKey === 'string' && input.apiKey.length > 0) || input.authMethod === 'oauth'
-    || (input.headers && Object.keys(input.headers).length > 0)) {
+  if (input.authMethod === 'oauth' || (input.headers && Object.keys(input.headers).length > 0)) {
     throw ipcError('NOT_IMPLEMENTED', NOT_IMPLEMENTED_SECRET);
   }
+  if (input.apiKey !== undefined && input.apiKey !== null && (typeof input.apiKey !== 'string' || input.apiKey.length > MAX_KEY_CHARS)) {
+    throw ipcError('INVALID_PARAMS', 'invalid models-fetch input');
+  }
+  let apiKey = input.authMethod === 'apiKey' ? input.apiKey?.trim() || null : null;
   let baseUrl = normalizeBaseUrl(input.baseUrl);
   let modelsUrl = null;
   if (typeof input.modelsUrl === 'string' && input.modelsUrl.trim()) {
@@ -448,11 +572,15 @@ async function fetchModels(input) {
   }
   if (!baseUrl) throw ipcError('INVALID_PARAMS', 'invalid models-fetch input');
   // 已保存 provider：目标钉回已存端点，与 desktop 一致。
+  // 表单没带 key 时用已存 key；目标已钉回已存端点，key 不会发往别处。
   if (typeof input.savedProviderId === 'string') {
     const saved = savedPiRoute(input.savedProviderId);
-    if (saved) ({ baseUrl, modelsUrl } = saved);
+    if (saved) {
+      ({ baseUrl, modelsUrl } = saved);
+      if (!apiKey && input.authMethod === 'apiKey') apiKey = readProviderApiKey(input.savedProviderId);
+    }
   }
-  const r = await requestModels(baseUrl, modelsUrl);
+  const r = await requestModels(baseUrl, modelsUrl, undefined, apiKey);
   if (!r.ok) return { ok: false, code: r.code, ...(r.status ? { status: r.status } : {}) };
   if (!r.models) return { ok: false, code: 'WIRE_INCOMPATIBLE', status: r.status };
   if (r.models.length === 0 && input.allowEmpty !== true) return { ok: false, code: 'MODEL_NOT_FOUND', status: r.status };
@@ -497,6 +625,10 @@ export function registerProviderIpc({ dataDir }) {
   store = { version: 1, providers: [], providerOrder: [] };
   visibilityMirror = {};
   loadStore();
+  // 钥匙串解锁、key 写入或删除后，连接状态可能变化，通知 renderer 重新拉列表。
+  onSecretChange((name) => {
+    if (name === null || /^provider_key_[a-z0-9_-]+_pi$/.test(name)) changed();
+  });
 
   // 模型可见性 owner 认领：ipc.mjs 默认返回 null，preload 会兜底成 canWriteOwnerScoped:false，
   // renderer 的可见性迁移因此卡在 owner-pending，providers 快照永不提交，输入框显示

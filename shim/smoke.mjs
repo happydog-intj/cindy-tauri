@@ -122,7 +122,7 @@ async function runSessionSmoke(phase, invoke) {
   }
   try {
     if (phase === 'run') await sessionRun(api, invoke, result);
-    else if (phase === 'verify') await sessionVerify(api, result);
+    else if (phase === 'verify') await sessionVerify(api, invoke, result);
     else throw new Error(`unknown sessionSmokePhase: ${phase}`);
     result.ok = true;
   } catch (err) {
@@ -277,10 +277,93 @@ async function sessionRun(api, invoke, result) {
   } catch (err) {
     result.closed = errText(err);
   }
+
+  if (info?.apiKey) await keyedProviderRun(api, info, model, result);
+}
+
+const KEYED_ID = 'smoke-keyed';
+// 带 key 的 mock 路径（scripts/mock-openai.mjs 的 /keyed/... 要求 Bearer）。
+const keyedBaseUrl = (info) => `${String(info.modelBaseUrl).replace(/\/+$/, '')}/keyed`;
+
+async function waitKeyedConnected(api) {
+  return waitFor(async () => {
+    const list = await api.maker.listProviders();
+    const p = list?.providers?.find((x) => x.id === KEYED_ID);
+    return p?.connected === true ? p : null;
+  }, 'keyed provider connected', 20_000);
+}
+
+// 带 key 的 provider：按设置页的调用顺序 models-fetch → createCustomProvider → 测试连接 → 跑一轮会话。
+// 结果里只记布尔值和状态码，不记 key。
+async function keyedProviderRun(api, info, model, result) {
+  const step = stepRunner(result);
+  const baseUrl = keyedBaseUrl(info);
+  await step('keyed models-fetch', async () => {
+    const r = await api.maker.fetchProviderModels({ agent: 'pi', baseUrl, authMethod: 'apiKey', apiKey: info.apiKey });
+    if (!r?.ok) throw new Error(`models-fetch failed: ${r?.code ?? 'unknown'}`);
+    return { models: r.models.map((m) => m.id) };
+  });
+  await step('keyed createCustomProvider', async () => {
+    const r = await api.maker.createCustomProvider({
+      id: KEYED_ID, name: 'Smoke (API key)', auth: { method: 'apiKey' },
+      runtimes: { pi: { baseUrl, wireProtocol: 'openai-chat', models: [{ id: model, name: `${model} (keyed)` }] } },
+    }, { pi: info.apiKey }, {});
+    if (r?.ok !== true) throw new Error(`create failed: ${JSON.stringify(r)?.slice(0, 200)}`);
+    return { ok: true };
+  });
+  await step('keyed provider connected', async () => ({ connected: (await waitKeyedConnected(api)).connected }));
+  await step('keyed test-connection (saved)', async () => {
+    const r = await api.maker.testProviderConnection({ kind: 'saved', providerId: KEYED_ID, agent: 'pi' });
+    if (r?.ok !== true) throw new Error(`test-connection failed: ${r?.code ?? r?.decision}`);
+    return { status: r.status };
+  });
+  await step('keyed Pi turn', async () => {
+    const s = await api.localDb.sessions.create({
+      agentKind: 'pi', title: `${SMOKE_TITLE} (keyed)`, model, effort: '', permissionMode: 'ask', workspaceKind: 'dialogue', providerId: KEYED_ID,
+    });
+    const events = [];
+    const unsub = api.maker.onEvent((p) => { if (p?.sessionId === s.id && p.event) events.push(p.event); });
+    try {
+      const created = await api.maker.createSession({
+        id: s.id, agentKind: 'pi', workingDir: s.workingDir ?? '', model, title: s.title,
+        effort: '', permissionMode: 'ask', planMode: false, displayReasoning: 'summarized', providerId: KEYED_ID,
+      });
+      const ctx = { model, permissionMode: 'ask', workingDir: created.workDir || s.workingDir || '', providerId: KEYED_ID };
+      await api.maker.input.enqueue(s.id, buildQueued('Hello', ctx), { sendAtMs: Date.now() });
+      const end = await waitFor(() => events.find((e) => e.type === 'done' || (e.type === 'error' && e.data?.willRetry !== true)), 'keyed turn end');
+      if (end.type === 'error') throw new Error(`turn error: ${JSON.stringify(end.data).slice(0, 300)}`);
+      const text = events.filter((e) => e.type === 'text').map((e) => e.data?.text ?? '').join('');
+      if (!text.includes('Hello from mock.')) throw new Error('unexpected keyed reply');
+      return { sessionId: s.id };
+    } finally {
+      try { unsub?.(); } catch { /* 忽略 */ }
+      await withTimeout(api.maker.closeSession(s.id), 'closeSession', 15_000).catch(() => {});
+    }
+  });
+}
+
+// verify 阶段：重启后主密钥要从系统钥匙串重新取出，已存 key 仍可解密并用于鉴权；最后断开连接。
+async function keyedProviderVerify(api, result) {
+  const step = stepRunner(result);
+  await step('keyed provider connected after restart', async () => ({ connected: (await waitKeyedConnected(api)).connected }));
+  await step('keyed test-connection after restart', async () => {
+    const r = await api.maker.testProviderConnection({ kind: 'saved', providerId: KEYED_ID, agent: 'pi' });
+    if (r?.ok !== true) throw new Error(`test-connection failed: ${r?.code ?? r?.decision}`);
+    return { status: r.status };
+  });
+  await step('keyed disconnect', async () => {
+    const r = await api.maker.disconnectCustomProvider(KEYED_ID, { dataOwnerId: 'local-v1', ownerGeneration: 1 }, {});
+    if (r?.ok !== true) throw new Error(`disconnect failed: ${JSON.stringify(r)?.slice(0, 200)}`);
+    const list = await api.maker.listProviders();
+    const p = list?.providers?.find((x) => x.id === KEYED_ID);
+    if (!p || p.connected !== false) throw new Error('provider still connected or missing after disconnect');
+    if ((await api.safeStorageRead(`provider_key_${KEYED_ID}_pi`)) !== null) throw new Error('key still stored after disconnect');
+    return { connected: false };
+  });
 }
 
 // verify 阶段：重启后会话列表里应有上次 run 的会话（scripts/smoke.mjs 再按 sessionId 交叉核对）。
-async function sessionVerify(api, result) {
+async function sessionVerify(api, invoke, result) {
   const step = stepRunner(result);
   const found = await step('localDb.sessions.list', async () => {
     const list = await api.localDb.sessions.list(100);
@@ -299,4 +382,6 @@ async function sessionVerify(api, result) {
   } catch (err) {
     result.messages = { sessionId: id, error: errText(err) };
   }
+  const info = await invoke('smoke_info').catch(() => null);
+  if (info?.apiKey) await keyedProviderVerify(api, result);
 }

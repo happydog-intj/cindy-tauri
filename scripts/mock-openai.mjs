@@ -7,7 +7,10 @@
 // - 最近一条 user 消息含 MOCK_WRITE_FILE：返回一个工具调用，写 mock-ok.txt，内容 ok；
 // - 其它情况：分几个 chunk 回复 "Hello from mock."。
 // 环境变量：MOCK_PORT（默认 0 = 随机端口）；MOCK_DUMP=1 时把每个请求体写到 MOCK_DUMP_DIR（默认系统临时目录）。
+// 带 key 路径：/keyed/... 下的同名接口要求 Authorization: Bearer <MOCK_API_KEY>，否则 401。
+// 日志只记 auth: ok / missing / wrong，不记 key 本身。
 import { createServer } from 'node:http';
+import { timingSafeEqual } from 'node:crypto';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -19,7 +22,18 @@ const MODEL_ID = process.env.MOCK_MODEL_ID || 'mock-model';
 const dumpDir = process.env.MOCK_DUMP === '1' ? path.resolve(process.env.MOCK_DUMP_DIR || os.tmpdir()) : null;
 if (dumpDir) mkdirSync(dumpDir, { recursive: true });
 
+const API_KEY = process.env.MOCK_API_KEY || null;
+
 let seq = 0;
+
+function checkAuth(req) {
+  const h = req.headers.authorization;
+  if (typeof h !== 'string' || !h.startsWith('Bearer ')) return 'missing';
+  if (!API_KEY) return 'wrong';
+  const a = Buffer.from(h.slice(7));
+  const b = Buffer.from(API_KEY);
+  return a.length === b.length && timingSafeEqual(a, b) ? 'ok' : 'wrong';
+}
 const log = (obj) => process.stderr.write(`[mock-openai] ${JSON.stringify({ at: new Date().toISOString(), ...obj })}\n`);
 
 // 消息 content 可能是字符串或 [{type:'text', text}] 数组。
@@ -144,10 +158,21 @@ function readBody(req) {
 const server = createServer(async (req, res) => {
   const n = ++seq;
   const url = new URL(req.url ?? '/', 'http://127.0.0.1');
-  const route = url.pathname.replace(/\/+$/, '').replace(/^\/v1(?=\/)/, '');
+  let route = url.pathname.replace(/\/+$/, '');
+  let auth;
+  if (route.startsWith('/keyed/')) {
+    route = route.slice('/keyed'.length);
+    auth = checkAuth(req);
+    if (auth !== 'ok') {
+      log({ n, method: req.method, path: url.pathname, auth, status: 401 });
+      sendJson(res, 401, { error: { message: 'invalid api key', type: 'invalid_request_error', code: 'invalid_api_key' } });
+      return;
+    }
+  }
+  route = route.replace(/^\/v1(?=\/)/, '');
   try {
     if (req.method === 'GET' && route === '/models') {
-      log({ n, method: req.method, path: url.pathname });
+      log({ n, method: req.method, path: url.pathname, ...(auth ? { auth } : {}) });
       sendJson(res, 200, { object: 'list', data: [{ id: MODEL_ID, object: 'model', created: 0, owned_by: 'mock' }] });
       return;
     }
@@ -162,7 +187,7 @@ const server = createServer(async (req, res) => {
       }
       const reply = decide(body);
       log({
-        n, method: req.method, path: url.pathname, model: body.model, stream: body.stream === true,
+        n, method: req.method, path: url.pathname, ...(auth ? { auth } : {}), model: body.model, stream: body.stream === true,
         messages: Array.isArray(body.messages) ? body.messages.map((m) => m?.role).join(',') : null,
         tools: Array.isArray(body.tools) ? body.tools.map((t) => t?.function?.name ?? t?.name) : [],
         reply: reply.kind === 'tool' ? { tool: reply.name, args: reply.args } : { text: reply.text }, reason: reply.reason,
