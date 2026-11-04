@@ -55,7 +55,7 @@ await build({
   define: { 'import.meta.url': '__u' },
   banner: { js: 'const __u=require("node:url").pathToFileURL(__filename).href;' },
   // 原生模块不打包：sidecar 只用 node:sqlite。
-  external: ['better-sqlite3', 'sharp'],
+  external: ['better-sqlite3', 'sharp', 'node-pty'],
   plugins: [mainStringsPlugin],
   logLevel: 'info',
 });

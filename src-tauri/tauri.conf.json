@@ -24,7 +24,8 @@
     ],
     "resources": {
       "../sidecar/dist/sidecar.cjs": "sidecar/sidecar.cjs",
-      "../sidecar/dist/headless/": "sidecar/headless/"
+      "../sidecar/dist/headless/": "sidecar/headless/",
+      "../sidecar/dist/native/": "sidecar/native/"
     }
   }
 }

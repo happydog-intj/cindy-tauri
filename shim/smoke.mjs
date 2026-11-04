@@ -41,6 +41,12 @@ export function installRendererSmoke() {
       browserSmoke = await runBrowserSmoke(boot.browserSmokeUrl);
       ok = ok && browserSmoke.ok;
     }
+    // 终端：打包后的 node-pty 能从 resources 加载并跑通一条命令（会话冒烟两阶段不重复跑）。
+    let terminalSmoke;
+    if (!boot.sessionSmoke && ok) {
+      terminalSmoke = await runTerminalSmoke(boot.platform);
+      ok = ok && terminalSmoke.ok;
+    }
     let sessionSmoke;
     if (boot.sessionSmoke) {
       if (ok) {
@@ -60,6 +66,7 @@ export function installRendererSmoke() {
       ...(sessionSmoke ? { sessionSmoke } : {}),
       ...(settingsTour ? { settingsTour } : {}),
       ...(browserSmoke ? { browserSmoke } : {}),
+      ...(terminalSmoke ? { terminalSmoke } : {}),
     });
     await invoke('smoke_finish', { ok, detail });
   };
@@ -293,6 +300,56 @@ function waitFor(check, label, ms = STEP_TIMEOUT_MS) {
 }
 
 // 依次执行步骤，把每步结果记到 steps；任一步失败即停止并 ok=false。
+async function runTerminalSmoke(platform) {
+  const result = { ok: false, steps: [] };
+  const step = stepRunner(result);
+  const api = window.electronAPI.terminal;
+  const id = `smoke-term-${Date.now()}`;
+  let out = '';
+  let exit = null;
+  const offData = api.onData((p) => { if (p?.id === id) out += p.chunk; });
+  const offExit = api.onExit((p) => { if (p?.id === id) exit = p.exit; });
+  const waitUntil = async (pred, what) => {
+    const end = Date.now() + 20_000;
+    while (!pred()) {
+      if (Date.now() > end) throw new Error(`timeout: ${what}; output tail ${JSON.stringify(out.slice(-200))}`);
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  };
+  try {
+    const shells = await step('list shells', async () => {
+      const list = await api.listAvailableShells();
+      if (!Array.isArray(list) || list.length === 0) throw new Error('no shells');
+      return { ids: list.map((s) => s.id) };
+    });
+    const win = platform === 'win32';
+    const pref = win ? (shells.ids.includes('pwsh') ? 'pwsh' : 'powershell') : 'auto';
+    await step('create', async () => {
+      const r = await api.create({ id, cwd: '/', cols: 90, rows: 24, shellPref: pref });
+      if (!r?.pid) throw new Error(`bad create result ${JSON.stringify(r)}`);
+      return { shellId: r.shellId };
+    });
+    await step('echo', async () => {
+      await api.write(id, win ? "Write-Output ('tauri' + (6*7))\r" : 'echo tauri$((6*7))\r');
+      await waitUntil(() => out.includes('tauri42'), 'echo output');
+    });
+    await step('resize', () => api.resize(id, 100, 30));
+    await step('exit', async () => {
+      await api.write(id, 'exit 0\r');
+      await waitUntil(() => exit !== null, 'exit push');
+      return exit;
+    });
+    result.ok = true;
+  } catch {
+    // 失败步骤已记在 steps
+  } finally {
+    try { await api.dispose(id); } catch { /* 已清理 */ }
+    offData?.();
+    offExit?.();
+  }
+  return result;
+}
+
 function stepRunner(result) {
   return async (name, fn) => {
     const t0 = Date.now();

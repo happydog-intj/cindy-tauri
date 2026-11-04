@@ -21,6 +21,7 @@ import { registerSettingsIpc } from './settings-ipc.mjs';
 import { registerBrowserPanelIpc } from './browser-panel.mjs';
 import { registerCaptureDegradedIpc } from './capture-degraded.mjs';
 import { registerDesktopImportIpc } from './desktop-import.mjs';
+import { registerTerminalIpc } from './terminal.mjs';
 
 // stdout 只用于 JSON 协议，其他模块的 console.log/info 改写到 stderr。
 for (const k of ['log', 'info', 'debug']) {
@@ -204,6 +205,8 @@ registerBrowserPanelIpc({ dataDir });
 registerCaptureDegradedIpc();
 // P4：从 Cindy 桌面版导入任务 / 模型服务（首次启动询问一次）。
 registerDesktopImportIpc({ dataDir, db, models });
+// P4：右侧栏终端（node-pty，原生模块随包放在 resources/sidecar/native/）。
+const terminal = registerTerminalIpc({ settingsDir: path.join(dataDir, 'settings') });
 
 const rl = readline.createInterface({ input: process.stdin });
 const pending = new Set();
@@ -242,6 +245,7 @@ async function handleLine(line) {
 // stdin 关闭后等待未完成的请求回复完再退出。
 rl.on('close', async () => {
   await Promise.allSettled([...pending]);
+  terminal.disposeAll();
   await Promise.resolve(makerIpc.shutdown?.()).catch(() => undefined);
   try { db.close(); } catch { /* 已关闭 */ }
   process.exit(0);

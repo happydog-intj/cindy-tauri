@@ -7,10 +7,14 @@
     "sidecar:build": "node sidecar/build.mjs",
     "node:fetch": "node scripts/fetch-node.mjs",
     "headless:fetch": "node scripts/fetch-headless.mjs",
+    "native:fetch": "node scripts/fetch-native.mjs",
     "tauri": "tauri"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.0.0",
     "esbuild": "^0.25.0"
+  },
+  "dependencies": {
+    "node-pty": "1.1.0"
   }
 }

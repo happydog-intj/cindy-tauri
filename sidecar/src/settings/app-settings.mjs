@@ -1,6 +1,5 @@
 // 应用级设置：外观 / 快捷键 / 本地主题 / 窗口行为（菜单栏、开机启动、防休眠）/ 更新通道 /
 // 终端 shell 偏好 / 外设（Work Louder、手柄）。形状与校验对齐 desktop，逐项注明出处。
-import { existsSync, statSync } from 'node:fs';
 import path from 'node:path';
 import {
   DEFAULT_APPEARANCE_SETTINGS,
@@ -300,20 +299,6 @@ export function registerAppSettingsIpc({ settingsDir, platform = process.platfor
     return autoUpdateWire();
   });
 
-  // ── 终端 shell ── desktop main/terminal/shellResolver.ts probeAvailableShells + terminalPrefsStore.ts
-  const SHELL_PREFS = ['auto', 'zsh', 'bash', 'fish', 'sh', 'pwsh', 'powershell', 'cmd', 'gitbash', 'wsl'];
-  const terminalPrefsFile = file('terminal-prefs.json');
-  registerInvoke('terminal:list-available-shells', async () => probeAvailableShells(platform));
-  registerInvoke('terminal:get-default-shell-pref', async () => {
-    let raw;
-    try { raw = readJson(terminalPrefsFile)?.defaultShellPref; } catch { raw = undefined; }
-    return SHELL_PREFS.includes(raw) ? raw : 'auto';
-  });
-  registerInvoke('terminal:set-default-shell-pref', async (value) => {
-    if (typeof value !== 'string' || !SHELL_PREFS.includes(value)) fail('INVALID_PARAMS', `invalid shell pref: ${String(value)}`);
-    writeJsonAtomic(terminalPrefsFile, { defaultShellPref: value });
-  });
-
   // ── 外设 ── Tauri 版没有 HID / 手柄宿主：按 desktop 「SDK 不可用」快照返回默认设置。
   // desktop main/worklouder-codex/accessories.ts projectModel（live.connectionStatus='unavailable' 且 deviceEnabled=false 分支）
   registerInvoke('worklouder-codex:get-state', async () => Object.fromEntries(WORKLOUDER_MODELS.map((model) => {
@@ -387,46 +372,4 @@ function parseAppearancePatch(raw) {
   return patch;
 }
 
-// desktop main/terminal/shellResolver.ts:297 probeAvailableShells 的最小重写
-function whichSync(bin, platform) {
-  const sep = platform === 'win32' ? ';' : ':';
-  const exts = platform === 'win32' ? ['', ...(process.env.PATHEXT ?? '.EXE;.CMD;.BAT;.COM').split(';').map((e) => e.toLowerCase())] : [''];
-  for (const dir of (process.env.PATH ?? '').split(sep)) {
-    if (!dir) continue;
-    for (const ext of exts) {
-      const candidate = path.join(dir, bin + ext);
-      try { if (existsSync(candidate) && statSync(candidate).isFile()) return candidate; } catch { /* 跳过无权限目录 */ }
-    }
-  }
-  return null;
-}
-
-function probeAvailableShells(platform) {
-  const out = [];
-  if (platform === 'win32') {
-    // Windows 下 auto 目标：pwsh → powershell → cmd（desktop shellResolver.ts:144）
-    const pwsh = whichSync('pwsh.exe', platform);
-    const powershell = whichSync('powershell.exe', platform);
-    const cmd = process.env.COMSPEC?.trim() || 'cmd.exe';
-    const auto = pwsh ? 'pwsh' : powershell ? 'powershell' : 'cmd';
-    if (pwsh) out.push({ id: 'pwsh', command: pwsh, displayName: 'PowerShell' });
-    if (powershell) out.push({ id: 'powershell', command: powershell, displayName: 'Windows PowerShell' });
-    out.push({ id: 'cmd', command: cmd, displayName: 'Command Prompt' });
-    const wsl = whichSync('wsl.exe', platform);
-    if (wsl) out.push({ id: 'wsl', command: wsl, displayName: 'WSL' });
-    return out.map((s) => ({ ...s, isAutoDetectTarget: s.id === auto }));
-  }
-  // *nix：auto 目标优先 $SHELL，其次 /bin/zsh → /bin/bash → /bin/sh（desktop shellResolver.ts:181）
-  const shellEnv = process.env.SHELL?.trim();
-  const base = (p) => path.basename(p).toLowerCase();
-  let auto = 'sh';
-  if (shellEnv && existsSync(shellEnv)) auto = ['zsh', 'bash', 'fish'].includes(base(shellEnv)) ? base(shellEnv) : 'sh';
-  else auto = existsSync('/bin/zsh') ? 'zsh' : existsSync('/bin/bash') ? 'bash' : 'sh';
-  const fallback = { zsh: '/bin/zsh', bash: '/bin/bash', sh: '/bin/sh' };
-  for (const id of ['zsh', 'bash', 'fish', 'sh']) {
-    const p = whichSync(id, platform) ?? fallback[id];
-    if (p && existsSync(p)) out.push({ id, command: p, displayName: id, isAutoDetectTarget: id === auto });
-  }
-  return out;
-}
 
