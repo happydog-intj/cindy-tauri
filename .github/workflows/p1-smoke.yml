@@ -66,6 +66,10 @@ jobs:
           CINDY_DIR: .cache/cindy
         run: npm run sidecar:build
 
+      # 桌面外壳 IPC（通知 / 角标 / 对话框 / 打开链接 / 关闭行为 / 托盘文案），脚本扮演 Rust 回反向调用。
+      - name: Desktop shell e2e
+        run: node scripts/desktop-shell-e2e.mjs
+
       - name: Build frontend (renderer + preload shim)
         run: node scripts/build-frontend.mjs .cache/cindy
 

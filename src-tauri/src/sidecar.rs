@@ -2,6 +2,7 @@
 // - 请求：{"id":1,"method":"...","params":{...}}
 // - 响应：{"id":1,"result":...} 或 {"id":1,"error":"..."}
 // - 推送：{"push":{...}}（无 id，交给 on_push，例如转发成 renderer 事件）
+// - 反向调用：{"native":{"id"?:n,"method":"...","params":{...}}}（交给 on_native；带 id 的用 reply_native 回）
 // 读线程按 id 分发响应，多个请求可以同时在途，长任务不再阻塞其他调用。
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -24,9 +25,10 @@ pub struct Sidecar {
 }
 
 impl Sidecar {
-    pub fn spawn<F>(node: &Path, script: &Path, env: &[(&str, String)], on_push: F) -> std::io::Result<Self>
+    pub fn spawn<F, N>(node: &Path, script: &Path, env: &[(&str, String)], on_push: F, on_native: N) -> std::io::Result<Self>
     where
         F: Fn(Value) + Send + 'static,
+        N: Fn(Value) + Send + 'static,
     {
         let mut cmd = Command::new(node);
         cmd.arg(script).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
@@ -56,6 +58,10 @@ impl Sidecar {
                     on_push(push.clone());
                     continue;
                 }
+                if let Some(native) = msg.get("native") {
+                    on_native(native.clone());
+                    continue;
+                }
                 let Some(id) = msg.get("id").and_then(Value::as_u64) else { continue };
                 let tx = reader_pending.lock().ok().and_then(|mut p| p.remove(&id));
                 if let Some(tx) = tx {
@@ -77,15 +83,29 @@ impl Sidecar {
         Ok(Self { child: Mutex::new(child), stdin: Mutex::new(stdin), pending, next_id: AtomicU64::new(1) })
     }
 
+    fn write_line(&self, line: &str) -> Result<(), String> {
+        self.stdin.lock().map_err(|_| "sidecar lock poisoned".to_string()).and_then(|mut w| {
+            writeln!(w, "{line}").and_then(|_| w.flush()).map_err(|e| format!("write failed: {e}"))
+        })
+    }
+
+    // 回复 sidecar 的反向调用。
+    pub fn reply_native(&self, id: u64, reply: Result<Value, String>) {
+        let body = match reply {
+            Ok(result) => json!({ "nativeReply": { "id": id, "result": result } }),
+            Err(error) => json!({ "nativeReply": { "id": id, "error": error } }),
+        };
+        if let Err(e) = self.write_line(&body.to_string()) {
+            eprintln!("[sidecar] native reply failed: {e}");
+        }
+    }
+
     pub fn call(&self, method: &str, params: Value) -> Reply {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::channel();
         self.pending.lock().map_err(|_| "sidecar lock poisoned")?.insert(id, tx);
         let line = json!({ "id": id, "method": method, "params": params }).to_string();
-        let written = self.stdin.lock().map_err(|_| "sidecar lock poisoned".to_string()).and_then(|mut w| {
-            writeln!(w, "{line}").and_then(|_| w.flush()).map_err(|e| format!("write failed: {e}"))
-        });
-        if let Err(e) = written {
+        if let Err(e) = self.write_line(&line) {
             if let Ok(mut p) = self.pending.lock() {
                 p.remove(&id);
             }

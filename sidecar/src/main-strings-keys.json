@@ -1,0 +1,23 @@
+[
+  "settings.windowBehavior.trayMenu.show",
+  "settings.windowBehavior.trayMenu.quit",
+  "settings.windowBehavior.closePrompt.title",
+  "settings.windowBehavior.closePrompt.message",
+  "settings.windowBehavior.closePrompt.detail",
+  "settings.windowBehavior.closeBehavior.tray",
+  "settings.windowBehavior.closeBehavior.quit",
+  "settings.windowBehavior.trayError.title",
+  "settings.windowBehavior.trayError.message",
+  "credentialStore.dialog.openLogs",
+  "logSupport.title",
+  "settings.about.openLogsDirError",
+  "titleBar.closeConfirm.title",
+  "titleBar.closeConfirm.description",
+  "titleBar.closeConfirm.confirm",
+  "titleBar.closeConfirm.cancel",
+  "settings.notifications.sessionEvent.untitled",
+  "settings.notifications.sessionEvent.done",
+  "settings.notifications.sessionEvent.error",
+  "settings.notifications.sessionEvent.needsReply",
+  "settings.notifications.sessionEvent.inputHandoff"
+]

@@ -6,6 +6,7 @@
 // - CINDY_TAURI_SMOKE=1 时先跑 /__smoke/ 页面，再加载真实 renderer，最后写 CINDY_TAURI_SMOKE_OUT 并退出。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod native;
 mod secrets;
 mod sidecar;
 
@@ -50,7 +51,7 @@ fn write_smoke(ok: bool, detail: &str) {
 }
 
 // Windows 上 Tauri 返回的路径可能带 \\?\ 前缀，Node 的 realpath 不接受，传给子进程前去掉。
-fn strip_verbatim(p: PathBuf) -> PathBuf {
+pub(crate) fn strip_verbatim(p: PathBuf) -> PathBuf {
     let s = p.to_string_lossy().into_owned();
     if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
         PathBuf::from(format!(r"\\{rest}"))
@@ -136,8 +137,8 @@ fn smoke_info() -> Option<Value> {
 
 #[tauri::command]
 async fn sidecar_call(state: State<'_, SidecarState>, method: String, params: Value) -> Result<Value, String> {
-    // 主密钥只能由 Rust 自己送，webview 不能调用 secrets.*。
-    if method.starts_with("secrets.") {
+    // 主密钥只能由 Rust 自己送，native.* 是 Rust 专用回调，webview 都不能调用。
+    if method.starts_with("secrets.") || method.starts_with("native.") {
         return Err(format!("method {method} is not callable from the webview"));
     }
     let sc = sidecar(&state)?;
@@ -171,10 +172,10 @@ fn handle_window_send(window: &tauri::WebviewWindow, channel: &str) -> bool {
             if window.is_maximized().unwrap_or(false) { window.unmaximize() } else { window.maximize() }
         }
         "window-exit-fullscreen" => window.set_fullscreen(false),
-        // 自定义 X 按钮：主窗口 = 退出 app（Windows 先关窗，与 desktop 一致）。
+        // 自定义 X 按钮：主窗口 = 退出 app；Windows 走 close()，由关闭行为决定收起到托盘还是退出（与 desktop 一致）。
         "window-close" => {
             if window.label() == "main" && !cfg!(windows) {
-                window.app_handle().exit(0);
+                native::quit(window.app_handle());
                 Ok(())
             } else {
                 window.close()
@@ -267,7 +268,25 @@ fn create_main_window(app: &AppHandle) -> tauri::Result<()> {
         .inner_size(1280.0, 800.0)
         .min_inner_size(800.0, 600.0)
         .initialization_script(boot_script())
-        .initialization_script(PRELOAD_JS);
+        .initialization_script(PRELOAD_JS)
+        // 主窗口里的 http(s) 链接交给系统浏览器（desktop will-navigate / setWindowOpenHandler）。
+        .on_navigation({
+            let app = app.clone();
+            move |url| {
+                if is_internal_url(url) {
+                    return true;
+                }
+                native::open_external_from_webview(&app, url);
+                false
+            }
+        })
+        .on_new_window({
+            let app = app.clone();
+            move |url, _features| {
+                native::open_external_from_webview(&app, &url);
+                tauri::webview::NewWindowResponse::Deny
+            }
+        });
     // 与 Electron 版一致：macOS 隐藏标题栏保留红绿灯，Windows 无边框（renderer 自绘窗口按钮）。
     #[cfg(target_os = "macos")]
     let builder = builder
@@ -281,6 +300,10 @@ fn create_main_window(app: &AppHandle) -> tauri::Result<()> {
     let watched = window.clone();
     let last = std::sync::atomic::AtomicBool::new(window.is_fullscreen().unwrap_or(false));
     window.on_window_event(move |event| {
+        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+            native::on_main_close_requested(&watched, api);
+            return;
+        }
         if let tauri::WindowEvent::Resized(_) = event {
             let now = watched.is_fullscreen().unwrap_or(false);
             if last.swap(now, std::sync::atomic::Ordering::Relaxed) != now {
@@ -292,8 +315,26 @@ fn create_main_window(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+// renderer 自身的页面（tauri:// / http://tauri.localhost / 开发服务器）和内部 scheme。
+fn is_internal_url(url: &tauri::Url) -> bool {
+    match url.scheme() {
+        "tauri" | "cindy-ipc" | "about" | "data" | "blob" => true,
+        "http" | "https" => match url.host_str() {
+            Some("tauri.localhost" | "cindy-ipc.localhost") => true,
+            // 开发服务器只在 debug 构建放行。
+            Some("localhost" | "127.0.0.1") => cfg!(debug_assertions),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 fn main() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        // 不注入 opener 的 JS 点击拦截（需要给 webview 开 opener 权限）；_blank 链接走 on_new_window。
+        .plugin(tauri_plugin_opener::Builder::default().open_js_links_on_click(false).build())
+        .plugin(tauri_plugin_notification::init())
         .register_asynchronous_uri_scheme_protocol("cindy-ipc", |ctx, request, responder| {
             let app = ctx.app_handle().clone();
             let path = request.uri().path().to_string();
@@ -313,17 +354,29 @@ fn main() {
                 ("CINDY_TAURI_APP_VERSION", app.package_info().version.to_string()),
             ];
             let emitter = app.handle().clone();
-            let handle = sidecar::Sidecar::spawn(&node, &script, &env, move |push| {
-                if let Err(e) = emitter.emit("cindy:ipc", push) {
-                    eprintln!("[sidecar] emit failed: {e}");
-                }
-            })
+            let native_app = app.handle().clone();
+            // 通知点击的回调要在第一条通知前注册，否则点击不会上报。
+            native::register_notification_click(app.handle());
+            let handle = sidecar::Sidecar::spawn(
+                &node,
+                &script,
+                &env,
+                move |push| {
+                    if let Err(e) = emitter.emit("cindy:ipc", push) {
+                        eprintln!("[sidecar] emit failed: {e}");
+                    }
+                },
+                move |msg| native::dispatch(&native_app, msg),
+            )
             .map(Arc::new)
             .map_err(|e| format!("spawn sidecar failed ({}): {e}", node.display()));
             if let Err(e) = &handle {
                 eprintln!("{e}");
             }
             let _ = DATA_DIR.set(data_dir.clone());
+            if let Ok(sc) = &handle {
+                let _ = native::SIDECAR.set(sc.clone());
+            }
             // 钥匙串可能弹系统授权框，放到后台线程；sidecar 收到前，带 key 的 provider 显示为未连接。
             if let Ok(sc) = &handle {
                 let sc = sc.clone();
@@ -344,6 +397,10 @@ fn main() {
             }
             app.manage(SidecarState(handle));
             create_main_window(app.handle())?;
+            // desktop：Windows 启动就建托盘，渲染层出错时也能从托盘打开日志。
+            if cfg!(windows) && smoke_out().is_none() {
+                native::ensure_tray(app.handle());
+            }
 
             if smoke_out().is_some() {
                 thread::spawn(|| {
@@ -355,6 +412,16 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![smoke_info, sidecar_call, smoke_finish, ipc_invoke, ipc_send])
-        .run(tauri::generate_context!())
-        .expect("error while running cindy-tauri");
+        .build(tauri::generate_context!())
+        .expect("error while building cindy-tauri");
+    app.run(|app, event| match event {
+        // macOS 点 Dock 图标：恢复隐藏的主窗口。
+        #[cfg(target_os = "macos")]
+        tauri::RunEvent::Reopen { .. } => native::focus_main_window(app),
+        // ⌘Q / 菜单退出：不再拦截主窗口关闭。
+        tauri::RunEvent::ExitRequested { .. } => native::mark_quitting(),
+        _ => {
+            let _ = app;
+        }
+    });
 }

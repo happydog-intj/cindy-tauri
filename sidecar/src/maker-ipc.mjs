@@ -473,8 +473,16 @@ export function registerMakerIpc({ dataDir, db, models, agentManifestDir, host: 
     return maker.getSession(sid)?.isTurnRunning() ?? false;
   });
 
+  // 对齐 desktop anySessionInTurn：协调器记下的 activeTurn，加上 live session 自报的 isTurnRunning()。
+  const anySessionInTurn = () => {
+    for (const s of states.values()) if (s.activeTurn) return true;
+    return maker.listActiveSessions().some((s) => s.isTurnRunning());
+  };
+  registerInvoke('maker:any-session-in-turn', async () => anySessionInTurn());
+
   return {
     host,
+    anySessionInTurn,
     isTurnRunning: (sid) => getState(sid).activeTurn !== null || (maker.getSession(sid)?.isTurnRunning() ?? false),
     shutdown: () => host.shutdown(),
   };

@@ -15,6 +15,8 @@ import { openLocalDb, registerLocalDbIpc } from './local-db/index.mjs';
 import * as models from './model-config.mjs';
 import { registerMakerIpc } from './maker-ipc.mjs';
 import { initSecretStore, registerSecretIpc, secretMethods } from './secret-store.mjs';
+import { handleNativeReply, setNativeWriter } from './native.mjs';
+import { registerDesktopShellIpc } from './desktop-shell.mjs';
 
 // stdout 只用于 JSON 协议，其他模块的 console.log/info 改写到 stderr。
 for (const k of ['log', 'info', 'debug']) {
@@ -156,6 +158,9 @@ function readFinalText(traceFile) {
   return text;
 }
 
+// Rust 专用方法（native.*）在 desktop-shell 注册后合并进来。
+const rustOnly = {};
+
 const handlers = {
   ping: () => ({ pong: true, at: new Date().toISOString() }),
   info: () => ({ node: process.version, platform: process.platform, arch: process.arch, pid: process.pid }),
@@ -169,6 +174,7 @@ const handlers = {
   // 只由 Rust 侧调用（sidecar_call 拒绝 webview 调 secrets.*）。
   ...secretMethods,
 };
+const isRustOnly = (method) => Object.hasOwn(rustOnly, method);
 
 function reply(msg) {
   process.stdout.write(JSON.stringify(msg) + '\n');
@@ -176,6 +182,7 @@ function reply(msg) {
 
 // 没有 id 的推送消息，Rust 侧转发为 Tauri 事件 "cindy:ipc"。
 setPush((push) => reply({ push }));
+setNativeWriter((msg) => reply(msg));
 registerBootStubs({ dataDir, agentManifestDir });
 
 // §9.5 会话链路：本地库（会话列表 / 历史）→ 模型配置 → maker 会话。注册顺序靠后者覆盖 boot stub。
@@ -186,6 +193,8 @@ registerSecretIpc();
 models.registerProviderIpc({ dataDir });
 const makerIpc = registerMakerIpc({ dataDir, db, models, agentManifestDir });
 registerLocalDbIpc(db, { isRunning: (sid) => makerIpc.isTurnRunning?.(sid) ?? false });
+const shell = registerDesktopShellIpc({ dataDir, db, anySessionInTurn: () => makerIpc.anySessionInTurn?.() ?? false });
+Object.assign(rustOnly, shell.nativeMethods);
 
 const rl = readline.createInterface({ input: process.stdin });
 const pending = new Set();
@@ -204,7 +213,12 @@ async function handleLine(line) {
     reply({ id: null, error: 'invalid json' });
     return;
   }
-  const handler = handlers[req.method];
+  // Rust 对 sidecar → Rust 反向调用的回复。
+  if (req && typeof req === 'object' && req.nativeReply) {
+    handleNativeReply(req.nativeReply);
+    return;
+  }
+  const handler = isRustOnly(req.method) ? rustOnly[req.method] : handlers[req.method];
   if (!handler) {
     reply({ id: req.id, error: `unknown method: ${req.method}` });
     return;

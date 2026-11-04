@@ -2,10 +2,39 @@
 import { build } from 'esbuild';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { readFileSync } from 'node:fs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 // 直接复用 cindy desktop 的纯函数模块（shared/ 下无 electron 依赖的部分）。
 const cindyDir = path.resolve(process.env.CINDY_DIR ?? path.join(here, '..', '..', 'cindy'));
+
+// 主进程侧文案（托盘 / 通知 / 原生对话框）：只抽 main-strings-keys.json 列出的 key，
+// 生成 virtual:cindy-main-strings = { [locale]: { [key]: string } }。
+const localesDir = path.join(cindyDir, 'apps', 'desktop', 'src', 'renderer', 'i18n', 'locales');
+const MAIN_LOCALES = ['zh-CN', 'zh-TW', 'en', 'ja', 'ko', 'es', 'fr', 'de', 'pt-PT', 'pt-BR', 'zh-Hant-x-lzh', 'zh-Hans-x-lzh'];
+const mainStringsPlugin = {
+  name: 'cindy-main-strings',
+  setup(b) {
+    b.onResolve({ filter: /^virtual:cindy-main-strings$/ }, (a) => ({ path: a.path, namespace: 'cindy-main-strings' }));
+    b.onLoad({ filter: /.*/, namespace: 'cindy-main-strings' }, () => {
+      const keys = JSON.parse(readFileSync(path.join(here, 'src', 'main-strings-keys.json'), 'utf8'));
+      const out = {};
+      for (const loc of MAIN_LOCALES) {
+        const bundle = JSON.parse(readFileSync(path.join(localesDir, loc, 'common.json'), 'utf8'));
+        const picked = {};
+        for (const key of keys) {
+          const v = key.split('.').reduce((o, k) => (o && typeof o === 'object' ? o[k] : undefined), bundle);
+          if (typeof v === 'string') picked[key] = v;
+        }
+        out[loc] = picked;
+      }
+      if (Object.keys(out.en).length !== keys.length) {
+        throw new Error(`main strings missing in en: ${keys.filter((k) => !(k in out.en)).join(', ')}`);
+      }
+      return { contents: JSON.stringify(out), loader: 'json' };
+    });
+  },
+};
 await build({
   alias: { '@cindy-desktop-shared': path.join(cindyDir, 'apps', 'desktop', 'src', 'shared') },
   entryPoints: [path.join(here, 'src/index.mjs')],
@@ -27,5 +56,6 @@ await build({
   banner: { js: 'const __u=require("node:url").pathToFileURL(__filename).href;' },
   // 原生模块不打包：sidecar 只用 node:sqlite。
   external: ['better-sqlite3', 'sharp'],
+  plugins: [mainStringsPlugin],
   logLevel: 'info',
 });

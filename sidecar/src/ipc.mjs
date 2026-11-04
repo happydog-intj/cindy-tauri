@@ -61,7 +61,7 @@ const sendHandlers = {
   },
 };
 
-function preferredLocale() {
+export function preferredLocale() {
   const raw = Intl.DateTimeFormat().resolvedOptions().locale || 'en';
   if (/^zh[-_](TW|HK|MO|Hant)/i.test(raw)) return 'zh-TW';
   if (/^zh/i.test(raw)) return 'zh-CN';
