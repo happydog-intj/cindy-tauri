@@ -571,6 +571,15 @@ async function sessionRun(api, invoke, result) {
       if (!text.includes('done')) throw new Error(`unexpected final text: ${JSON.stringify(text)}`);
       return { toolUses, toolResults: toolResults.length, text };
     });
+
+    // 模型切换通道：renderer 的 ModelSelector 经 maker.setModel 切模型，空闲时应直接生效。
+    await step('maker.setModel', async () => {
+      const r = await api.maker.setModel(sessionId, model, providerId, undefined, { effort: null, fastMode: false });
+      if (r?.deferred !== false) throw new Error(`unexpected setModel result: ${JSON.stringify(r)}`);
+      const s = await api.localDb.sessions.get(sessionId);
+      if (s?.model !== model || s?.providerId !== providerId) throw new Error(`session not persisted: ${s?.model}/${s?.providerId}`);
+      return r;
+    });
   } finally {
     result.eventCounts = events.reduce((acc, e) => ({ ...acc, [e.type]: (acc[e.type] ?? 0) + 1 }), {});
     result.interactionCount = interactions.length;

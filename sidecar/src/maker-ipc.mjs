@@ -1,8 +1,10 @@
 // A 子任务：maker:* 会话 IPC（创建 / 发送 / 输入队列 / 审批 / 关闭）。
 // 返回形状对齐 desktop main/maker-ipc（preload.ts 类型 + register.ts / sessionCreateHandler.ts）。
 // 只做最小链路：每个 session 一个串行输入队列，一次只跑一个 turn。
+// 运行中切换：set-model / set-effort / set-fast-mode / set-thinking-enabled / set-permission-mode
+// （对齐 desktop register.ts，空闲时热切；回合进行中登记、回合结束再应用，返回 deferred:true）。
 // 未覆盖（保持 [NOT_IMPLEMENTED]）：中断恢复、队列合并/steer、device-link、Orca、IM、伙伴、自动续跑、
-// Claude Code / Codex。
+// 跨引擎切换（switch-session-agent）、Claude Code / Codex。
 import { randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
@@ -15,6 +17,7 @@ import { createMakerHost } from './maker-host.mjs';
 // desktop schedulePendingPermissionTimeout 同款：permission 10 分钟无人处理按 deny 收尾。
 const PERMISSION_TIMEOUT_MS = 10 * 60 * 1000;
 const SAFE_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
+const PERMISSION_MODES = new Set(['ask', 'default', 'acceptEdits', 'plan', 'auto', 'bypassPermissions']);
 
 function fail(code, msg) {
   throw new Error(`[${code}] ${msg}`);
@@ -61,6 +64,11 @@ export function registerMakerIpc({ dataDir, db, models, agentManifestDir, host: 
         permissionMode: undefined,
         eventChain: Promise.resolve(),
         wired: null, // 已接线的 Session 实例
+        selection: null, // 最近一次 set-model 的 { model, providerId }；重建会话时优先于入队项里的旧 createOpts
+        pendingSelection: null, // 回合进行中登记的 set-model，回合结束后应用
+        resumeAfterRebuild: null, // 热切失败、关掉重建时保留的 Pi 会话文件，下次懒创建时续上历史
+        switching: null, // 正在进行的运行时切换；派发新回合前等它结束
+        liveRoute: null, // 运行中 Pi 进程实际用的 { model, providerId }
       };
       states.set(sessionId, s);
     }
@@ -166,6 +174,13 @@ export function registerMakerIpc({ dataDir, db, models, agentManifestDir, host: 
     s.activeTurn = null;
     void upsertRow(sessionId, {});
     pushProjection(sessionId);
+    if (s.pendingSelection) {
+      const sel = s.pendingSelection;
+      s.pendingSelection = null;
+      runSwitch(sessionId, () => applySelection(sessionId, sel)).catch((err) => {
+        process.stderr.write(`[maker-ipc] deferred set-model failed: ${err?.message ?? err}\n`);
+      });
+    }
     void pump(sessionId);
   }
 
@@ -212,9 +227,16 @@ export function registerMakerIpc({ dataDir, db, models, agentManifestDir, host: 
     const live = maker.getSession(id);
     if (live && live.getStatus() !== 'closed') return live;
     if (creating.has(id)) return creating.get(id);
+    const s0 = getState(id);
+    const selected = s0.selection;
+    const resumeSessionId = typeof raw.resumeSessionId === 'string' && raw.resumeSessionId
+      ? raw.resumeSessionId
+      : s0.resumeAfterRebuild;
     const task = (async () => {
       await host.whenModelsReady?.();
-      const cfg = host.resolveSessionModel(raw.providerId ?? null, raw.model);
+      const cfg = selected
+        ? host.resolveSessionModel(selected.providerId, selected.model)
+        : host.resolveSessionModel(raw.providerId ?? null, raw.model);
       await host.ensurePiInstalled();
       const workingDir = typeof raw.workingDir === 'string' && raw.workingDir.trim()
         ? raw.workingDir
@@ -232,7 +254,7 @@ export function registerMakerIpc({ dataDir, db, models, agentManifestDir, host: 
         ...(raw.permissionMode ? { permissionMode: raw.permissionMode } : {}),
         ...(typeof raw.planMode === 'boolean' ? { planMode: raw.planMode } : {}),
         ...(typeof raw.userPrompt === 'string' ? { userPrompt: raw.userPrompt } : {}),
-        ...(typeof raw.resumeSessionId === 'string' && raw.resumeSessionId ? { resumeSessionId: raw.resumeSessionId } : {}),
+        ...(resumeSessionId ? { resumeSessionId } : {}),
         ...(raw.workspaceKind === 'project' || raw.workspaceKind === 'dialogue' ? { workspaceKind: raw.workspaceKind } : {}),
         vendorOptions: {
           ...(raw.vendorOptions && typeof raw.vendorOptions === 'object' && !Array.isArray(raw.vendorOptions) ? raw.vendorOptions : {}),
@@ -242,6 +264,8 @@ export function registerMakerIpc({ dataDir, db, models, agentManifestDir, host: 
       const session = await maker.createSession(opts);
       wireSession(session);
       const s = getState(id);
+      if (s.resumeAfterRebuild === resumeSessionId) s.resumeAfterRebuild = null;
+      s.liveRoute = { model: cfg.modelId, providerId: cfg.providerId };
       s.permissionMode = raw.permissionMode;
       await upsertRow(id, {
         agentKind: 'pi',
@@ -288,6 +312,7 @@ export function registerMakerIpc({ dataDir, db, models, agentManifestDir, host: 
     s.error = null;
     pushProjection(sessionId);
     try {
+      if (s.switching) await s.switching.catch(() => undefined);
       const session = await ensureSession(sessionId, { ...item.createOpts, workingDir: item.createOpts?.workingDir || item.workingDir });
       await applyPermissionMode(session, item.permissionMode || item.createOpts?.permissionMode);
       const message = buildMakerUserMessage(item);
@@ -310,6 +335,118 @@ export function registerMakerIpc({ dataDir, db, models, agentManifestDir, host: 
         pushProjection(sessionId);
       }
     }
+  }
+
+  // ── 运行中切换 ──────────────────────────────────────────────────────────
+  // 同一 session 的切换串行执行；pump 派发新回合前会等 s.switching。
+  function runSwitch(sessionId, fn) {
+    const s = getState(sessionId);
+    const run = (s.switching ?? Promise.resolve()).catch(() => undefined).then(fn);
+    const tail = run.finally(() => { if (s.switching === tail) s.switching = null; });
+    s.switching = tail;
+    return run;
+  }
+
+  const inTurn = (sessionId) => getState(sessionId).activeTurn !== null || (maker.getSession(sessionId)?.isTurnRunning() ?? false);
+
+  function readSessionRow(sessionId) {
+    try {
+      return db.getSession(sessionId) ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  // 落库并推 local-db:sessions:patched；内存里的 s.row 同步改，避免回合结束的 upsertRow 写回旧模型。
+  function persistSessionPatch(sessionId, patch) {
+    const s = getState(sessionId);
+    if (s.row) {
+      if (patch.model !== undefined) s.row.model = patch.model;
+      if (patch.providerId !== undefined) s.row.providerId = patch.providerId;
+      if (patch.permissionMode !== undefined) s.row.permissionMode = patch.permissionMode;
+    }
+    if (!readSessionRow(sessionId)) return;
+    db._internal.updateSession(sessionId, patch);
+  }
+
+  function modelEfforts(modelId) {
+    const d = typeof models?.getPiModelDescriptors === 'function'
+      ? models.getPiModelDescriptors().find((m) => m.id === modelId)
+      : null;
+    return Array.isArray(d?.efforts) ? d.efforts : [];
+  }
+
+  // 把 (providerId, model) 落到已配置的 provider；model-only 切换沿用会话当前来源。
+  function resolveTarget(sessionId, model, providerId) {
+    const s = getState(sessionId);
+    const current = s.selection?.providerId ?? readSessionRow(sessionId)?.providerId ?? s.row?.providerId ?? null;
+    const pid = typeof providerId === 'string' && providerId ? providerId : current;
+    const cfg = host.resolveSessionModel(pid, model);
+    if (cfg.modelId !== model) fail('MODEL_NOT_CONFIGURED', `model ${model} is not configured`);
+    return cfg;
+  }
+
+  // 空闲 session 上热切；Pi 判定需要换启动参数（窗口 / 压缩设置变了）时关掉进程，
+  // 下一条消息按新模型懒创建，并用原 Pi 会话文件续上历史。
+  async function applySelection(sessionId, sel) {
+    const session = maker.getSession(sessionId);
+    if (!session || session.getStatus() === 'closed') return;
+    const s = getState(sessionId);
+    const route = s.liveRoute;
+    const sameRoute = route?.model === sel.model && route?.providerId === sel.providerId;
+    if (sameRoute && sel.effort === undefined && sel.thinking === undefined) return;
+    try {
+      await session.setModel(sel.model, {
+        providerId: sel.providerId,
+        ...(sel.effort !== undefined ? { effort: sel.effort } : {}),
+        ...(sel.thinking !== undefined ? { thinkingEnabled: sel.thinking } : {}),
+      });
+      s.liveRoute = { model: sel.model, providerId: sel.providerId };
+    } catch (err) {
+      const sdk = session.sdkSessionId;
+      process.stderr.write(`[maker-ipc] live set-model failed, rebuilding on next send: ${err?.message ?? err}\n`);
+      s.liveRoute = null;
+      if (sdk && sdk !== '<pending>') s.resumeAfterRebuild = sdk;
+      cancelInteractionsForSession(sessionId, 'session_closed');
+      await maker.closeSession(sessionId, 'runtime-refresh');
+    }
+  }
+
+  async function setModel(sessionId, model, providerId, expectedRevision, selection) {
+    const sid = requireSessionId(sessionId);
+    if (typeof model !== 'string' || !model) fail('INVALID_PARAMS', 'model required');
+    if (providerId !== undefined && providerId !== null && typeof providerId !== 'string') fail('INVALID_PARAMS', 'invalid providerId');
+    if (expectedRevision !== undefined && expectedRevision !== null && !(Number.isSafeInteger(expectedRevision) && expectedRevision >= 0)) {
+      fail('INVALID_PARAMS', 'invalid expectedAgentSwitchRevision');
+    }
+    if (selection !== undefined && selection !== null && (typeof selection !== 'object' || Array.isArray(selection))) {
+      fail('INVALID_PARAMS', 'invalid selection');
+    }
+    await host.whenModelsReady?.();
+    const cfg = resolveTarget(sid, model, providerId);
+    const efforts = modelEfforts(cfg.modelId);
+    const effort = typeof selection?.effort === 'string' && efforts.includes(selection.effort) ? selection.effort : undefined;
+    const thinking = typeof selection?.thinking === 'boolean' && efforts.length > 0 ? selection.thinking : undefined;
+    const fastMode = typeof selection?.fastMode === 'boolean' ? selection.fastMode : undefined;
+    const sel = { model: cfg.modelId, providerId: cfg.providerId, effort, thinking };
+    const s = getState(sid);
+    s.selection = { model: sel.model, providerId: sel.providerId };
+    persistSessionPatch(sid, {
+      model: sel.model,
+      providerId: sel.providerId,
+      ...(effort !== undefined ? { effort } : {}),
+      ...(fastMode !== undefined ? { fastMode } : {}),
+    });
+    if (inTurn(sid)) {
+      s.pendingSelection = sel;
+      return { deferred: true, superseded: false };
+    }
+    s.pendingSelection = null;
+    await runSwitch(sid, async () => {
+      await applySelection(sid, sel);
+      if (fastMode !== undefined) await maker.getSession(sid)?.setFastMode(fastMode).catch(() => undefined);
+    });
+    return { deferred: false };
   }
 
   // ── 通道 ────────────────────────────────────────────────────────────────
@@ -380,6 +517,58 @@ export function registerMakerIpc({ dataDir, db, models, agentManifestDir, host: 
       pushProjection(sid);
       throw err;
     }
+  });
+
+  registerInvoke('maker:set-model', (sessionId, model, providerId, expectedRevision, selection) =>
+    setModel(sessionId, model, providerId, expectedRevision, selection));
+
+  registerInvoke('maker:set-effort', async (sessionId, effort) => {
+    const sid = requireSessionId(sessionId);
+    if (typeof effort !== 'string' || !effort) fail('INVALID_PARAMS', 'sessionId + effort required');
+    persistSessionPatch(sid, { effort });
+    const s = getState(sid);
+    if (s.pendingSelection) { s.pendingSelection.effort = effort; return undefined; }
+    const session = maker.getSession(sid);
+    if (!session || session.getStatus() === 'closed') return undefined;
+    // 无档位模型的占位 effort 不下发（Pi 会拒绝不在目录里的档位）。
+    if (!modelEfforts(session.model).includes(effort)) return undefined;
+    try {
+      await runSwitch(sid, () => session.setEffort(effort));
+    } catch (err) {
+      process.stderr.write(`[maker-ipc] set-effort failed: ${err?.message ?? err}\n`);
+      fail('INTERNAL', 'Runtime effort update failed');
+    }
+    return undefined;
+  });
+
+  registerInvoke('maker:set-fast-mode', async (sessionId, enabled) => {
+    const sid = requireSessionId(sessionId);
+    if (typeof enabled !== 'boolean' && enabled !== 'ultrafast') fail('INVALID_PARAMS', 'sessionId + enabled required');
+    if (enabled === 'ultrafast') fail('NOT_SUPPORTED', 'Ultrafast requires the Codex runtime');
+    persistSessionPatch(sid, { fastMode: enabled });
+    const session = maker.getSession(sid);
+    if (session && session.getStatus() !== 'closed') await session.setFastMode(enabled);
+    return undefined;
+  });
+
+  registerInvoke('maker:set-thinking-enabled', async (sessionId, enabled) => {
+    const sid = requireSessionId(sessionId);
+    if (typeof enabled !== 'boolean') fail('INVALID_PARAMS', 'sessionId + enabled required');
+    const s = getState(sid);
+    if (s.pendingSelection) { s.pendingSelection.thinking = enabled; return undefined; }
+    const session = maker.getSession(sid);
+    if (!session || session.getStatus() === 'closed' || modelEfforts(session.model).length === 0) return undefined;
+    await runSwitch(sid, () => session.setThinkingEnabled(enabled));
+    return undefined;
+  });
+
+  registerInvoke('maker:set-permission-mode', async (sessionId, mode) => {
+    const sid = requireSessionId(sessionId);
+    if (typeof mode !== 'string' || !PERMISSION_MODES.has(mode)) fail('INVALID_PARAMS', 'invalid permission mode');
+    persistSessionPatch(sid, { permissionMode: mode });
+    const session = maker.getSession(sid);
+    if (session && session.getStatus() !== 'closed') await applyPermissionMode(session, mode);
+    return undefined;
   });
 
   registerInvoke('maker:input:get-projection', async (sessionId) => ({
