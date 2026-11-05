@@ -6,8 +6,8 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 
-const SERVICE: &str = "com.cindy.tauri.p1";
-const SMOKE_SERVICE: &str = "com.cindy.tauri.p1.smoke";
+const SERVICE: &str = "com.cindy.tauri";
+const SMOKE_SERVICE: &str = "com.cindy.tauri.smoke";
 const ACCOUNT: &str = "secret-store-master-key";
 
 fn entry(smoke: bool, data_dir: &Path) -> Result<Entry, Error> {
