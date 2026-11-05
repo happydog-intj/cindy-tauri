@@ -6,7 +6,7 @@
 // 用法：node scripts/build-frontend.mjs [cindy 仓库目录]
 // 需要先在 cindy 仓库里构建 renderer：pnpm --filter desktop exec vite build --config vite.renderer.config.ts
 import { build } from 'esbuild';
-import { cp, mkdir, rm, stat, writeFile } from 'node:fs/promises';
+import { cp, mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -57,6 +57,44 @@ await mkdir(frontendOut, { recursive: true });
 await cp(rendererDist, frontendOut, { recursive: true });
 await cp(path.join(root, 'ui'), path.join(frontendOut, '__smoke'), { recursive: true });
 await writeFile(path.join(frontendOut, '.cindy-source'), `${cindyDir}\n`);
+
+// P5 体积：HarmonyOS Sans SC 每个字重 82 个分片、约 4.6 MB，woff2 不可再压缩。
+// renderer 只用到 400 / 500 / 600 / 700（typographyDiscipline 测试禁止 800 / 900，代码里没有 100 / 300），
+// 删掉 Thin(100) / Light(300) / Black(900) 三个字重的 @font-face 和字体文件；万一请求到这些字重，浏览器按就近字重回退。
+const PRUNED_FONT_FAMILY = 'HarmonyOS Sans SC';
+const PRUNED_FONT_WEIGHTS = new Set(['100', '300', '900']);
+
+async function pruneFontWeights(dir) {
+  const assets = path.join(dir, 'assets');
+  const names = await readdir(assets);
+  const removed = new Set();
+  let rules = 0;
+  for (const name of names.filter((n) => n.endsWith('.css'))) {
+    const file = path.join(assets, name);
+    const css = await readFile(file, 'utf8');
+    const next = css.replace(/@font-face\{[^}]*\}/g, (rule) => {
+      const family = rule.match(/font-family:\s*["']?([^;"'}]+)["']?\s*[;}]/)?.[1]?.trim();
+      const weight = rule.match(/font-weight:\s*(\d+)/)?.[1];
+      if (family !== PRUNED_FONT_FAMILY || !PRUNED_FONT_WEIGHTS.has(weight)) return rule;
+      for (const m of rule.matchAll(/url\(["']?\/?assets\/([^)"']+\.woff2)["']?\)/g)) removed.add(m[1]);
+      rules += 1;
+      return '';
+    });
+    if (next !== css) await writeFile(file, next);
+  }
+  // 其他 CSS / JS 不能再引用被删的文件，否则说明规则匹配漏了。
+  const texts = await Promise.all(names.filter((n) => /\.(css|js|mjs|html)$/.test(n)).map((n) => readFile(path.join(assets, n), 'utf8')));
+  const stillUsed = [...removed].filter((f) => texts.some((t) => t.includes(f)));
+  if (stillUsed.length) throw new Error(`pruned font files still referenced: ${stillUsed.slice(0, 5).join(', ')}`);
+  let bytes = 0;
+  for (const f of removed) {
+    bytes += (await stat(path.join(assets, f))).size;
+    await rm(path.join(assets, f));
+  }
+  console.log(`fonts: removed ${rules} @font-face rules / ${removed.size} files (${(bytes / 1048576).toFixed(1)} MB) for ${PRUNED_FONT_FAMILY} weights ${[...PRUNED_FONT_WEIGHTS].join('/')}`);
+}
+
+await pruneFontWeights(frontendOut);
 
 const { size } = await stat(preloadOut);
 console.log(`preload: ${preloadOut} (${(size / 1024).toFixed(0)} KB)`);
