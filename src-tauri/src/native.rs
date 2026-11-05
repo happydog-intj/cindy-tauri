@@ -39,6 +39,11 @@ fn sidecar() -> Option<Arc<Sidecar>> {
     None
 }
 
+// 自动更新安装前要让 sidecar 退出。
+pub fn sidecar_handle() -> Option<Arc<Sidecar>> {
+    SIDECAR.get().cloned()
+}
+
 // 调用 sidecar 里只给 Rust 用的 native.* 方法（index.mjs rustOnly）。
 fn call_sidecar(method: &str, params: Value) -> Result<Value, String> {
     sidecar().ok_or_else(|| "sidecar unavailable".to_string())?.call(method, params)
@@ -410,6 +415,8 @@ fn run<R: Runtime>(app: &AppHandle<R>, method: &str, params: &Value) -> Result<V
         "reveal" => reveal(app, params),
         // 从桌面版导入：取 Electron safeStorage 密钥材料（macOS 可能弹钥匙串授权框）。
         "desktopImport.safeStorageKey" => crate::desktop_import::safe_storage_key(params),
+        // 自动更新：检查 / 下载 / 安装 / 系统空闲时长（updater.rs）。
+        m if m.starts_with("update.") => crate::updater::run(app, m, params),
         other => Err(format!("[NOT_IMPLEMENTED] native method {other}")),
     }
 }

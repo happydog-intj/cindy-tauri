@@ -13,13 +13,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 type Reply = Result<Value, String>;
 type Pending = Arc<Mutex<HashMap<u64, mpsc::Sender<Reply>>>>;
 
 pub struct Sidecar {
     child: Mutex<Child>,
-    stdin: Mutex<ChildStdin>,
+    // shutdown 后为 None：关掉 stdin 让 sidecar 自己收尾退出。
+    stdin: Mutex<Option<ChildStdin>>,
     pending: Pending,
     next_id: AtomicU64,
 }
@@ -80,13 +82,41 @@ impl Sidecar {
             }
         });
 
-        Ok(Self { child: Mutex::new(child), stdin: Mutex::new(stdin), pending, next_id: AtomicU64::new(1) })
+        Ok(Self { child: Mutex::new(child), stdin: Mutex::new(Some(stdin)), pending, next_id: AtomicU64::new(1) })
     }
 
     fn write_line(&self, line: &str) -> Result<(), String> {
-        self.stdin.lock().map_err(|_| "sidecar lock poisoned".to_string()).and_then(|mut w| {
-            writeln!(w, "{line}").and_then(|_| w.flush()).map_err(|e| format!("write failed: {e}"))
-        })
+        let mut guard = self.stdin.lock().map_err(|_| "sidecar lock poisoned".to_string())?;
+        let w = guard.as_mut().ok_or_else(|| "sidecar stopped".to_string())?;
+        writeln!(w, "{line}").and_then(|_| w.flush()).map_err(|e| format!("write failed: {e}"))
+    }
+
+    // 不等回复的通知（Rust → sidecar），例如更新下载进度。
+    pub fn notify(&self, method: &str, params: Value) {
+        let line = json!({ "method": method, "params": params }).to_string();
+        if let Err(e) = self.write_line(&line) {
+            eprintln!("[sidecar] notify {method} failed: {e}");
+        }
+    }
+
+    // 关 stdin，等 sidecar 处理完在途请求、关数据库、杀掉终端后自己退出；超时就强杀。
+    // 安装更新前调用：Windows 安装程序要覆盖 cindy-node.exe，进程还在就会写失败。
+    pub fn shutdown(&self, timeout: Duration) {
+        if let Ok(mut s) = self.stdin.lock() {
+            s.take();
+        }
+        let Ok(mut c) = self.child.lock() else { return };
+        let deadline = Instant::now() + timeout;
+        loop {
+            match c.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+                _ => break,
+            }
+        }
+        eprintln!("[sidecar] did not exit within {timeout:?}, killing");
+        let _ = c.kill();
+        let _ = c.wait();
     }
 
     // 回复 sidecar 的反向调用。

@@ -17,6 +17,7 @@ getrandom = "0.3"
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-notification = "2"
+tauri-plugin-updater = "2.14.1"
 
 # 浏览器面板的前进 / 后退 / 停止：Tauri 没有封装，直接调原生 webview。版本跟 wry 用的一致。
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -26,7 +27,8 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 [target.'cfg(windows)'.dependencies]
 windows-core = "0.62"
 # 从桌面版导入时用 DPAPI 解开 Electron safeStorage 的 AES key。
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+# 自动更新的「空闲时重启」用 GetLastInputInfo 取系统无操作时长。
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_SystemInformation", "Win32_UI_Input_KeyboardAndMouse"] }
 
 [profile.release]
 codegen-units = 1

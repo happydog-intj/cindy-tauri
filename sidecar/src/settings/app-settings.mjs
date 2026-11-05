@@ -330,6 +330,9 @@ export function registerAppSettingsIpc({ settingsDir, platform = process.platfor
     device: emptyGamepadDevice(family),
     settings: createXboxGamepadDefaultSettings(),
   }])));
+
+  // 自动更新（update.mjs）读「空闲时自动重启」开关。
+  return { readAutoRelaunchOnIdle: () => autoUpdate.readState().value.autoRelaunchOnIdle };
 }
 
 // desktop main/appearance-settings-ipc.ts parsePatch（customWallpaperUrl 只读，不接受写入）

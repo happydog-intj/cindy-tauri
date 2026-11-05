@@ -11,6 +11,7 @@ mod desktop_import;
 mod native;
 mod secrets;
 mod sidecar;
+mod updater;
 
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -32,6 +33,10 @@ const PRELOAD_JS: &str = include_str!("../preload/cindy-preload.js");
 
 // 冒烟包含 Pi 按需下载（30–45MB）、一次可选的真实模型调用和 renderer 首屏加载。
 const SMOKE_TIMEOUT: Duration = Duration::from_secs(600);
+
+fn no_keychain_smoke() -> bool {
+    smoke_out().is_some() && std::env::var("CINDY_TAURI_SMOKE_NO_KEYCHAIN").as_deref() == Ok("1")
+}
 
 fn smoke_out() -> Option<String> {
     if std::env::var("CINDY_TAURI_SMOKE").as_deref() != Ok("1") {
@@ -76,7 +81,16 @@ fn runtime_paths(app: &AppHandle) -> (PathBuf, PathBuf) {
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
             .unwrap_or_default();
         let name = if cfg!(windows) { "cindy-node.exe" } else { "cindy-node" };
-        let script = app.path().resource_dir().map(|d| d.join("sidecar/sidecar.cjs")).unwrap_or_default();
+        // resource_dir 失败（例如 macOS 上可执行文件路径含符号链接）时退回 exe 旁的相对位置，
+        // 不能给空路径：node 没有脚本参数会把 stdin 当脚本执行。
+        let script = app.path().resource_dir().map(|d| d.join("sidecar/sidecar.cjs")).unwrap_or_else(|e| {
+            eprintln!("[sidecar] resource_dir unavailable: {e}");
+            if cfg!(target_os = "macos") {
+                exe_dir.join("../Resources/sidecar/sidecar.cjs")
+            } else {
+                exe_dir.join("sidecar/sidecar.cjs")
+            }
+        });
         (strip_verbatim(exe_dir.join(name)), strip_verbatim(script))
     }
 }
@@ -118,6 +132,8 @@ fn boot_script() -> String {
         "settingsSmoke": smoke_out().is_some() && std::env::var("CINDY_TAURI_SMOKE_SETTINGS").as_deref() == Ok("1"),
         // 浏览器面板冒烟用的本地测试页（scripts/smoke.mjs 起的 127.0.0.1 服务）。
         "browserSmokeUrl": smoke_out().and(std::env::var("CINDY_TAURI_SMOKE_BROWSER_URL").ok()),
+        // 自动更新冒烟：期望更新到的版本（scripts/update-smoke.mjs 起本机 latest.json）。
+        "updateSmokeExpect": updater::smoke_endpoint().and(std::env::var("CINDY_TAURI_SMOKE_UPDATE_EXPECT").ok()),
     });
     format!("Object.defineProperty(window, '__CINDY_BOOT__', {{ value: Object.freeze({boot}), configurable: false }});")
 }
@@ -219,7 +235,7 @@ async fn ipc_send(
 fn smoke_finish(app: AppHandle, ok: bool, detail: String) {
     write_smoke(ok, &detail);
     // 冒烟专用的钥匙串主密钥：会话冒烟 run 阶段成功时留给 verify 用，其余情况都删掉。
-    if session_smoke_phase().as_deref() != Some("run") || !ok {
+    if (session_smoke_phase().as_deref() != Some("run") || !ok) && !no_keychain_smoke() {
         if let Some(dir) = DATA_DIR.get() {
             secrets::delete_smoke_entry(dir);
         }
@@ -350,6 +366,8 @@ fn main() {
         // 不注入 opener 的 JS 点击拦截（需要给 webview 开 opener 权限）；_blank 链接走 on_new_window。
         .plugin(tauri_plugin_opener::Builder::default().open_js_links_on_click(false).build())
         .plugin(tauri_plugin_notification::init())
+        // 自动更新：配置在 tauri.conf.json plugins.updater（公钥、GitHub Releases 的 latest.json）。
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .register_asynchronous_uri_scheme_protocol("cindy-ipc", |ctx, request, responder| {
             // 自定义协议算本地来源，只给主 webview 用；浏览器子 webview 的请求直接拒绝。
             if ctx.webview_label() != "main" {
@@ -370,12 +388,15 @@ fn main() {
                 _ => app.path().app_data_dir().unwrap_or_else(|_| std::env::temp_dir().join("cindy-tauri")),
             });
             let _ = std::fs::create_dir_all(&data_dir);
+            updater::init(&data_dir);
             let _ = browser::PARTITION_ROOT.set(data_dir.join("webview-partitions"));
             let env = [
                 ("CINDY_TAURI_DATA_DIR", data_dir.to_string_lossy().into_owned()),
                 ("CINDY_TAURI_APP_VERSION", app.package_info().version.to_string()),
                 // 首次启动询问是否从桌面版导入；冒烟不问。
                 ("CINDY_TAURI_DESKTOP_IMPORT_PROMPT", if smoke_out().is_some() { "0" } else { "1" }.to_string()),
+                // 自动更新：auto（正式包）/ manual（冒烟配了本机更新地址）/ off。
+                ("CINDY_TAURI_UPDATES", updater::mode().to_string()),
             ];
             let emitter = app.handle().clone();
             let native_app = app.handle().clone();
@@ -407,7 +428,12 @@ fn main() {
                 let smoke = smoke_out().is_some();
                 let dir = data_dir.clone();
                 thread::spawn(move || {
-                    let reply = match secrets::load_or_create(smoke, &dir) {
+                    // 更新冒烟：新旧两个版本是不同的 ad-hoc 签名，读同一钥匙串条目会弹系统授权框，冒烟里跳过钥匙串。
+                    let reply = match if no_keychain_smoke() {
+                        Err("smoke without keychain".to_string())
+                    } else {
+                        secrets::load_or_create(smoke, &dir)
+                    } {
                         Ok(key) => sc.call("secrets.unlock", json!({ "key": key })),
                         Err(reason) => {
                             eprintln!("[secrets] keychain unavailable: {reason}");
@@ -445,7 +471,11 @@ fn main() {
             browser::browser_op,
             browser::browser_reset
         ])
-        .build(tauri::generate_context!())
+        .build({
+            let mut ctx = tauri::generate_context!();
+            updater::apply_smoke_config(ctx.config_mut());
+            ctx
+        })
         .expect("error while building cindy-tauri");
     app.run(|app, event| match event {
         // macOS 点 Dock 图标：恢复隐藏的主窗口。

@@ -41,9 +41,15 @@ export function installRendererSmoke() {
       browserSmoke = await runBrowserSmoke(boot.browserSmokeUrl);
       ok = ok && browserSmoke.ok;
     }
-    // 终端：打包后的 node-pty 能从 resources 加载并跑通一条命令（会话冒烟两阶段不重复跑）。
+    // 自动更新：旧版本检查 → 下载 → 安装重启（不返回）；重启后的新版本确认版本号并收尾。
+    let updateSmoke;
+    if (boot.updateSmokeExpect && ok) {
+      updateSmoke = await runUpdateSmoke(boot.updateSmokeExpect);
+      ok = ok && updateSmoke.ok;
+    }
+    // 终端：打包后的 node-pty 能从 resources 加载并跑通一条命令（会话冒烟两阶段、更新冒烟不重复跑）。
     let terminalSmoke;
-    if (!boot.sessionSmoke && ok) {
+    if (!boot.sessionSmoke && !boot.updateSmokeExpect && ok) {
       terminalSmoke = await runTerminalSmoke(boot.platform);
       ok = ok && terminalSmoke.ok;
     }
@@ -67,6 +73,7 @@ export function installRendererSmoke() {
       ...(settingsTour ? { settingsTour } : {}),
       ...(browserSmoke ? { browserSmoke } : {}),
       ...(terminalSmoke ? { terminalSmoke } : {}),
+      ...(updateSmoke ? { updateSmoke } : {}),
     });
     await invoke('smoke_finish', { ok, detail });
   };
@@ -346,6 +353,55 @@ async function runTerminalSmoke(platform) {
     try { await api.dispose(id); } catch { /* 已清理 */ }
     offData?.();
     offExit?.();
+  }
+  return result;
+}
+
+// 旧版本：手动检查应得到 ready，再走 UpdateBanner 的「立即重启」通道。安装成功时进程会被替换，
+// 这里只会在失败（status=error 或超时）时返回。新版本：版本号对上、再检查是 idle 即成功。
+async function runUpdateSmoke(expect) {
+  const api = window.electronAPI;
+  const result = { ok: false, appVersion: api.appVersion, expect, steps: [] };
+  const step = stepRunner(result);
+  const statuses = [];
+  const off = api.onUpdateStatus?.((s) => statuses.push(s));
+  try {
+    if (api.appVersion === expect) {
+      await step('updated version', () => ({ appVersion: api.appVersion }));
+      await step('check after update is idle', async () => {
+        const r = await api.checkForUpdate();
+        if (r?.result !== 'idle') throw new Error(`unexpected ${JSON.stringify(r)}`);
+      });
+      result.ok = true;
+      return result;
+    }
+    await step('check finds and downloads update', async () => {
+      const r = await withTimeout(api.checkForUpdate(), 'checkForUpdate', 180_000);
+      if (r?.result !== 'ready') throw new Error(`unexpected ${JSON.stringify(r)} statuses ${JSON.stringify(statuses.slice(-3))}`);
+      const st = await api.getUpdateStatus();
+      if (st?.status !== 'ready' || st?.version !== expect) throw new Error(`status ${JSON.stringify(st)}`);
+      return { progressPushes: statuses.filter((s) => s.status === 'downloading').length };
+    });
+    await step('not busy before relaunch', async () => {
+      const s = await api.describeRelaunchBlockingActivity();
+      if (s?.busy !== false) throw new Error(`busy ${JSON.stringify(s)}`);
+    });
+    // 成功路径到不了下面的等待结束：进程被安装 / 重启替换。
+    api.relaunchToUpdate('dark');
+    await new Promise((resolve, reject) => {
+      const t0 = Date.now();
+      const tick = () => {
+        const err = statuses.find((s) => s.status === 'error');
+        if (err) reject(new Error(`install failed: ${JSON.stringify(err)}`));
+        else if (Date.now() - t0 > 120_000) reject(new Error('install did not restart the app in 120s'));
+        else setTimeout(tick, 200);
+      };
+      tick();
+    }).catch((err) => { result.steps.push({ name: 'install and relaunch', ok: false, error: errText(err) }); });
+  } catch {
+    // 失败步骤已记在 steps
+  } finally {
+    off?.();
   }
   return result;
 }

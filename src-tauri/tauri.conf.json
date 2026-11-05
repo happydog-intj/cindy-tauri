@@ -26,6 +26,19 @@
       "../sidecar/dist/sidecar.cjs": "sidecar/sidecar.cjs",
       "../sidecar/dist/headless/": "sidecar/headless/",
       "../sidecar/dist/native/": "sidecar/native/"
+    },
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDFBOUZDODI5RkRCOTcyNDEKUldSQmNybjlLY2lmR2srdUo0NXM5SDBuVHltSVJlZFdVWGxwMGQ5L3JwazlMaTlrcDlOS0o4RCsK",
+      "endpoints": [
+        "https://github.com/happydog-intj/cindy-tauri/releases/latest/download/latest.json"
+      ],
+      "requireSignedVersion": true,
+      "windows": {
+        "installMode": "passive"
+      }
     }
   }
 }

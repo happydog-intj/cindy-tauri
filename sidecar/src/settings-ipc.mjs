@@ -11,8 +11,9 @@ import { registerVoiceInputDataIpc } from './settings/voice-input-data.mjs';
 export function registerSettingsIpc({ dataDir, piStatus }) {
   const settingsDir = path.join(dataDir, 'settings');
   mkdirSync(settingsDir, { recursive: true });
-  registerAppSettingsIpc({ settingsDir });
+  const app = registerAppSettingsIpc({ settingsDir });
   registerMakerSettingsIpc({ settingsDir });
   registerMiscSettingsIpc({ settingsDir, piStatus });
   registerVoiceInputDataIpc({ settingsDir });
+  return { readAutoRelaunchOnIdle: app.readAutoRelaunchOnIdle };
 }

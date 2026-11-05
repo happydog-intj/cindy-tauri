@@ -3,6 +3,8 @@ name: p1-smoke
 on:
   push:
     branches: [main]
+    # v* 标签：同一套构建和冒烟通过后，用正式更新签名密钥出包并发布到本仓库 Releases（publish 任务）。
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -94,11 +96,60 @@ jobs:
       - name: Terminal e2e
         run: node scripts/terminal-e2e.mjs
 
+      # 自动更新状态机：脚本扮演 Rust 回 update.*，覆盖检查 / 下载进度 / 失败回退 / superseding / 空闲自动重启。
+      - name: Update e2e
+        run: node scripts/update-e2e.mjs
+
+      # 更新签名密钥：v* 标签用仓库 secret 里的正式密钥（和 tauri.conf.json 的 pubkey 配对）；
+      # 其余构建用一次性密钥并覆盖 pubkey，正式私钥不进普通 CI。
+      - name: Updater signing key
+        shell: bash
+        env:
+          RELEASE_KEY: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
+        run: |
+          if [ -n "$RELEASE_KEY" ]; then
+            printf '%s' "$RELEASE_KEY" > "$RUNNER_TEMP/updater.key"
+            echo '{}' > "$RUNNER_TEMP/updater-ci.json"
+          else
+            npx tauri signer generate --ci -p "" -w "$RUNNER_TEMP/updater.key" > /dev/null
+            node -e "const fs=require('fs');fs.writeFileSync(process.argv[2],JSON.stringify({plugins:{updater:{pubkey:fs.readFileSync(process.argv[1],'utf8').trim()}}}))" "$RUNNER_TEMP/updater.key.pub" "$RUNNER_TEMP/updater-ci.json"
+          fi
+          echo "TAURI_SIGNING_PRIVATE_KEY=$RUNNER_TEMP/updater.key" >> "$GITHUB_ENV"
+          echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=" >> "$GITHUB_ENV"
+          # 更新冒烟用的「新版本」= 当前版本 patch + 1
+          node -e "const c=require('./src-tauri/tauri.conf.json');const [a,b,p]=c.version.split('-')[0].split('.').map(Number);console.log('APP_VERSION='+c.version);console.log('NEXT_VERSION='+a+'.'+b+'.'+(p+1))" >> "$GITHUB_ENV"
+
       - name: Fetch Node runtime for sidecar
         run: npm run node:fetch -- ${{ matrix.triple }}
 
       - name: Build app
-        run: npx tauri build --bundles ${{ matrix.bundles }}
+        shell: bash
+        run: npx tauri build --bundles ${{ matrix.bundles }} -c "$RUNNER_TEMP/updater-ci.json"
+
+      # 发布产物先挪出 bundle 目录（后面的更新冒烟会重新打包覆盖它），文件名去掉空格（GitHub 会把空格改成点）。
+      - name: Stage release artifacts
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          D="$RUNNER_TEMP/release" && mkdir -p "$D"
+          B=src-tauri/target/release/bundle
+          if [ "$RUNNER_OS" = macOS ]; then
+            cp "$B/macos/Cindy Tauri.app.tar.gz" "$D/Cindy-Tauri_${APP_VERSION}_aarch64.app.tar.gz"
+            cp "$B/macos/Cindy Tauri.app.tar.gz.sig" "$D/Cindy-Tauri_${APP_VERSION}_aarch64.app.tar.gz.sig"
+            cp "$B/dmg/"*.dmg "$D/Cindy-Tauri_${APP_VERSION}_aarch64.dmg"
+          else
+            cp "$B/nsis/"*"_${APP_VERSION}_x64-setup.exe" "$D/Cindy-Tauri_${APP_VERSION}_x64-setup.exe"
+            cp "$B/nsis/"*"_${APP_VERSION}_x64-setup.exe.sig" "$D/Cindy-Tauri_${APP_VERSION}_x64-setup.exe.sig"
+          fi
+          ls -l "$D"
+
+      - name: Upload release artifacts
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.triple }}
+          path: ${{ runner.temp }}/release/
+          if-no-files-found: error
 
       # 桌面版导入的 DPAPI 解包只能在 Windows 上验证。
       - name: Rust unit tests (Windows DPAPI)
@@ -156,3 +207,67 @@ jobs:
           name: cindy-tauri-${{ matrix.triple }}
           path: src-tauri/target/release/bundle/
           if-no-files-found: ignore
+
+      # 自动更新冒烟：上面的 0.0.1 包作为旧版本，再打一个 0.0.2 的更新包，
+      # 旧版本经本机 latest.json 检查 → 下载 → 验签 → 安装 → 以 0.0.2 启动。
+      # macOS 额外验证篡改过的包会被签名校验拒绝。
+      - name: Update smoke (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          B=src-tauri/target/release/bundle/macos
+          rm -rf "$RUNNER_TEMP/upd-old" "$RUNNER_TEMP/upd-new" && mkdir -p "$RUNNER_TEMP/upd-old" "$RUNNER_TEMP/upd-new"
+          cp -R "$B/Cindy Tauri.app" "$RUNNER_TEMP/upd-old/"
+          node -e "const fs=require('fs');const c=JSON.parse(fs.readFileSync(process.argv[1],'utf8'));c.version=process.argv[3];fs.writeFileSync(process.argv[2],JSON.stringify(c))" "$RUNNER_TEMP/updater-ci.json" "$RUNNER_TEMP/updater-ci-v2.json" "$NEXT_VERSION"
+          npx tauri build --bundles app -c "$RUNNER_TEMP/updater-ci-v2.json"
+          cp "$B/Cindy Tauri.app.tar.gz" "$B/Cindy Tauri.app.tar.gz.sig" "$RUNNER_TEMP/upd-new/"
+          node scripts/update-smoke.mjs --old "$RUNNER_TEMP/upd-old/Cindy Tauri.app" --new "$RUNNER_TEMP/upd-new/Cindy Tauri.app.tar.gz" --version "$NEXT_VERSION" --tamper 1
+          node scripts/update-smoke.mjs --old "$RUNNER_TEMP/upd-old/Cindy Tauri.app" --new "$RUNNER_TEMP/upd-new/Cindy Tauri.app.tar.gz" --version "$NEXT_VERSION"
+
+      - name: Update smoke (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          N=src-tauri/target/release/bundle/nsis
+          rm -rf "$RUNNER_TEMP/upd-old" "$RUNNER_TEMP/upd-new" && mkdir -p "$RUNNER_TEMP/upd-old" "$RUNNER_TEMP/upd-new"
+          cp "$N"/*"_${APP_VERSION}_x64-setup.exe" "$RUNNER_TEMP/upd-old/"
+          node -e "const fs=require('fs');const c=JSON.parse(fs.readFileSync(process.argv[1],'utf8'));c.version=process.argv[3];fs.writeFileSync(process.argv[2],JSON.stringify(c))" "$RUNNER_TEMP/updater-ci.json" "$RUNNER_TEMP/updater-ci-v2.json" "$NEXT_VERSION"
+          npx tauri build --bundles nsis -c "$RUNNER_TEMP/updater-ci-v2.json"
+          cp "$N"/*"_${NEXT_VERSION}_x64-setup.exe" "$N"/*"_${NEXT_VERSION}_x64-setup.exe.sig" "$RUNNER_TEMP/upd-new/"
+          node scripts/update-smoke.mjs --old "$(ls "$RUNNER_TEMP"/upd-old/*-setup.exe)" --new "$(ls "$RUNNER_TEMP"/upd-new/*-setup.exe)" --version "$NEXT_VERSION"
+
+  # v* 标签：两个平台的构建和冒烟都通过后才发布。latest.json 同时给带安装类型和不带的键。
+  publish:
+    needs: smoke
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          V=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          if [ "v$V" != "$TAG" ]; then echo "tag $TAG does not match tauri.conf.json version $V"; exit 1; fi
+          MAC="release/Cindy-Tauri_${V}_aarch64.app.tar.gz"
+          WIN="release/Cindy-Tauri_${V}_x64-setup.exe"
+          node scripts/latest-json.mjs --version "$V" --notes "Cindy Tauri $V" \
+            --base-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/" --out release/latest.json \
+            darwin-aarch64-app="$MAC" darwin-aarch64="$MAC" windows-x86_64-nsis="$WIN" windows-x86_64="$WIN"
+          ls -l release
+          gh release create "$TAG" --title "Cindy Tauri $V" --notes "Cindy Tauri $V（未签名构建：macOS 首次打开需右键「打开」，Windows 需在 SmartScreen 选「仍要运行」）" \
+            release/Cindy-Tauri_* release/latest.json

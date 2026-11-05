@@ -60,7 +60,6 @@ export function registerBootStubs({ dataDir, agentManifestDir }) {
   registerInvoke('auth:initialize', async () => authState());
   registerInvoke('auth:get-login-state', async () => null);
   registerInvoke('check-app-update', async () => ({ hasUpdate: false, action: 'none' }));
-  registerInvoke('update-get-status', async () => ({ status: 'idle' }));
   registerInvoke('analytics:settings-get', async () => ({
     privacyConsentAccepted: true,
     analyticsEnabled: false,
