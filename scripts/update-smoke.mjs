@@ -147,7 +147,9 @@ try {
     };
     const displayVersion = () => regValue('DisplayVersion');
     const installDir = regValue('InstallLocation') ?? path.join(process.env.LOCALAPPDATA, 'Cindy Tauri');
-    const exe = path.join(installDir, `${regValue('MainBinaryName') ?? 'cindy-tauri'}.exe`);
+    // MainBinaryName 已带 .exe（例如 cindy-tauri.exe）。
+    const bin = regValue('MainBinaryName') ?? 'cindy-tauri.exe';
+    const exe = path.join(installDir, /\.exe$/i.test(bin) ? bin : `${bin}.exe`);
     if (!existsSync(exe)) throw new Error(`installed exe not found: ${exe}`);
     const oldVersion = displayVersion();
     console.log(`update smoke: installed old version ${oldVersion} at ${exe}`);
