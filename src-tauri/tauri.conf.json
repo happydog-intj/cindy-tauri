@@ -27,7 +27,11 @@
       "../sidecar/dist/headless/": "sidecar/headless/",
       "../sidecar/dist/native/": "sidecar/native/"
     },
-    "createUpdaterArtifacts": true
+    "createUpdaterArtifacts": true,
+    "macOS": {
+      "signingIdentity": "-",
+      "hardenedRuntime": false
+    }
   },
   "plugins": {
     "updater": {

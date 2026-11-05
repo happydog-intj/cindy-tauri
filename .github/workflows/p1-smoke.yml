@@ -127,6 +127,15 @@ jobs:
         run: npx tauri build --bundles ${{ matrix.bundles }} -c "$RUNNER_TEMP/updater-ci.json"
 
       # 发布产物先挪出 bundle 目录（后面的更新冒烟会重新打包覆盖它），文件名去掉空格（GitHub 会把空格改成点）。
+      - name: Verify bundle signature (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          # ad-hoc 签名也要封住 Resources，否则下载后 Gatekeeper 报「已损坏」而不是「无法验证开发者」
+          APP="src-tauri/target/release/bundle/macos/Cindy Tauri.app"
+          codesign --verify --deep --strict -v "$APP"
+          codesign -dv "$APP" 2>&1 | grep -E '^(Identifier|Sealed Resources)='
+          "$APP/Contents/MacOS/cindy-node" -p process.version
       - name: Stage release artifacts
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
@@ -269,5 +278,5 @@ jobs:
             --base-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/" --out release/latest.json \
             darwin-aarch64-app="$MAC" darwin-aarch64="$MAC" windows-x86_64-nsis="$WIN" windows-x86_64="$WIN"
           ls -l release
-          gh release create "$TAG" --title "Cindy Tauri $V" --notes "Cindy Tauri $V（未签名构建：macOS 首次打开需右键「打开」，Windows 需在 SmartScreen 选「仍要运行」）" \
+          gh release create "$TAG" --title "Cindy Tauri $V" --notes "Cindy Tauri $V（未签名构建：macOS 首次打开被拦截后，到「系统设置 → 隐私与安全性」点「仍要打开」；Windows 在 SmartScreen 点「更多信息 → 仍要运行」）" \
             release/Cindy-Tauri_* release/latest.json
