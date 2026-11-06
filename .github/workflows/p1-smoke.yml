@@ -18,7 +18,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          # macos-14 镜像已被 GitHub 下线（The configuration ... is not supported）。
+          - os: macos-15
             triple: aarch64-apple-darwin
             bundles: app,dmg
           - os: windows-latest
