@@ -5,7 +5,8 @@
 // - OAuth 和自定义请求头仍不支持，返回 [NOT_IMPLEMENTED]；
 // - 环境变量 CINDY_TAURI_SMOKE_MODEL_BASE_URL / CINDY_TAURI_SMOKE_MODEL_ID 存在时注入只读的 "Smoke"
 //   provider（不落盘）并作为默认；
-// - ProviderView 由 @cindy/model-providers 的 buildUserProvider + buildRegistry 生成，与 desktop 同形状。
+// - ProviderView 由 @cindy/model-providers 的 buildUserProvider + buildRegistry 生成，与 desktop 同形状；
+// - 云端模式下目录最前面加上 Cindy AI（xd），模型清单与连接状态来自 model-access.mjs。
 import { existsSync, readFileSync } from 'node:fs';
 import { mkdir, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -16,11 +17,20 @@ import {
   parseModelsListResponse,
 } from '@cindy/model-providers';
 import { emitToRenderer, registerInvoke, registerSync } from './ipc.mjs';
+import { isCurrentOwner, ownerStamp } from './owner.mjs';
 import { getSecretSync, hasSecret, onSecretChange, removeSecret, setSecret, whenReady as whenSecretsReady } from './secret-store.mjs';
+import {
+  catalogModelToDescriptor,
+  defaultXdRunConfig,
+  foregroundRefreshXdModels,
+  getXdProvider,
+  onXdChange,
+  refreshXdGatewayModels,
+  resolveXdRunConfig,
+  XD_PROVIDER_ID,
+  xdConnected,
+} from './model-access.mjs';
 
-// 本机模式 owner，与 boot-stubs 的 authState 一致。
-const DATA_OWNER_ID = 'local-v1';
-const OWNER_GENERATION = 1;
 const SMOKE_PROVIDER_ID = 'smoke';
 const PROVIDER_CHANGED = 'maker:provider:changed';
 const FETCH_TIMEOUT_MS = 10_000;
@@ -111,8 +121,10 @@ export { whenSecretsReady };
 /** 当前目录的 ProviderView[]（与 desktop maker:provider:list 的 providers 同形状）。 */
 export function getProviderViews() {
   const configs = allConfigs();
-  const catalog = { version: 'cindy-tauri-local', providers: configs.map((c) => buildUserProvider(c)) };
+  const xd = getXdProvider();
+  const catalog = { version: 'cindy-tauri-local', providers: [...(xd ? [xd] : []), ...configs.map((c) => buildUserProvider(c))] };
   const connected = Object.fromEntries(configs.map((c) => [c.id, isConnected(c)]));
+  if (xd) connected[XD_PROVIDER_ID] = xdConnected();
   return buildRegistry(catalog, connected);
 }
 
@@ -126,21 +138,11 @@ export function getPiModelDescriptors() {
   const out = [];
   for (const provider of getProviderViews()) {
     if (!provider.connected || provider.routing?.pi?.disabled === true) continue;
+    const userProvider = provider.source === 'user';
     for (const m of provider.models?.pi ?? []) {
-      if (seen.has(m.id) || !isModelSelectableForNewRoute(m, { userProvider: true })) continue;
+      if (seen.has(m.id) || !isModelSelectableForNewRoute(m, { userProvider })) continue;
       seen.add(m.id);
-      const d = {
-        id: m.id,
-        displayName: m.name,
-        contextWindow: m.contextWindow,
-        efforts: m.efforts,
-        defaultEffort: m.defaultEffort,
-        effortsUnknown: m.effortsUnknown === true,
-      };
-      if (m.group !== undefined) d.group = m.group;
-      if (m.defaultEnabled !== undefined) d.defaultEnabled = m.defaultEnabled;
-      if (m.supportsImageInput !== undefined) d.supportsImageInput = m.supportsImageInput;
-      out.push(d);
+      out.push(catalogModelToDescriptor(m));
     }
   }
   return out;
@@ -166,13 +168,14 @@ function toRunConfig(config, model) {
 /** renderer 传来的 (providerId, modelId) → Pi 运行配置；找不到或不可用返回 null。 */
 export function resolveModel(providerId, modelId) {
   if (typeof providerId !== 'string' || typeof modelId !== 'string') return null;
+  if (providerId === XD_PROVIDER_ID) return resolveXdRunConfig(modelId);
   const config = allConfigs().find((c) => c.id === providerId);
   if (!config || !isConnected(config) || !config.runtimes.pi) return null;
   const model = config.runtimes.pi.models.find((m) => m.id === modelId);
   return model ? toRunConfig(config, model) : null;
 }
 
-/** 默认 Pi 运行配置：Smoke 优先，其次按 provider 顺序第一个已连接 provider 的第一个模型；未配置返回 null。 */
+/** 默认 Pi 运行配置：Smoke 优先，其次按 provider 顺序第一个已连接 provider 的第一个模型，最后是 Cindy AI；未配置返回 null。 */
 export function getModelConfig() {
   const configs = allConfigs();
   const ordered = [...configs.filter((c) => c.id === SMOKE_PROVIDER_ID), ...configs.filter((c) => c.id !== SMOKE_PROVIDER_ID)];
@@ -180,7 +183,7 @@ export function getModelConfig() {
     const model = isConnected(config) ? config.runtimes.pi?.models[0] : null;
     if (model) return toRunConfig(config, model);
   }
-  return null;
+  return defaultXdRunConfig();
 }
 
 // ── 持久化 ────────────────────────────────────────────────────────────
@@ -287,7 +290,7 @@ function sanitizeConfig(input) {
 function assertOwnerScope(scope) {
   if (scope === undefined) return;
   if (!scope || typeof scope !== 'object' || Array.isArray(scope)) throw ipcError('INVALID_PARAMS', 'Invalid owner scope');
-  if (scope.dataOwnerId !== DATA_OWNER_ID || scope.ownerGeneration !== OWNER_GENERATION) {
+  if (!isCurrentOwner(scope.dataOwnerId, scope.ownerGeneration)) {
     throw ipcError('INTERNAL', 'active account changed during provider mutation');
   }
 }
@@ -350,12 +353,16 @@ function savedPiRoute(providerId) {
 
 // ── IPC handler ──────────────────────────────────────────────────────
 
+// xd 只在云端模式出现在目录里，放最前；用户排序只作用于自定义 provider。
+function providerOrderIds() {
+  return [...(getXdProvider() ? [XD_PROVIDER_ID] : []), ...allConfigs().map((c) => c.id)];
+}
+
 function listProviders() {
   return {
-    dataOwnerId: DATA_OWNER_ID,
-    ownerGeneration: OWNER_GENERATION,
+    ...ownerStamp(),
     providers: getProviderViews(),
-    providerOrder: allConfigs().map((c) => c.id),
+    providerOrder: providerOrderIds(),
     modelVisibilityOverrides: { ...visibilityMirror },
   };
 }
@@ -628,10 +635,11 @@ async function setProviderOrder(input) {
     throw ipcError('INVALID_PARAMS', 'providerIds must be a bounded unique non-empty string[]');
   }
   assertOwnerScope({ dataOwnerId, ownerGeneration });
-  const catalogIds = new Set(allConfigs().map((c) => c.id));
+  const catalogIds = new Set(providerOrderIds());
   if (ids.some((id) => !catalogIds.has(id))) throw ipcError('INVALID_PARAMS', 'providerIds must belong to the current provider catalog');
-  if (JSON.stringify(store.providerOrder) !== JSON.stringify(ids)) {
-    store.providerOrder = [...ids];
+  const customIds = ids.filter((id) => id !== XD_PROVIDER_ID);
+  if (JSON.stringify(store.providerOrder) !== JSON.stringify(customIds)) {
+    store.providerOrder = customIds;
     await persist();
     changed();
   }
@@ -640,7 +648,7 @@ async function setProviderOrder(input) {
 
 // renderer 单向镜像的模型可见性快照；owner 不匹配的迟到快照直接丢弃（desktop 同语义）。
 function syncModelVisibility(dataOwnerId, ownerGeneration, map, policy) {
-  if (dataOwnerId !== DATA_OWNER_ID || ownerGeneration !== OWNER_GENERATION) return undefined;
+  if (!isCurrentOwner(dataOwnerId, ownerGeneration)) return undefined;
   if (!map || typeof map !== 'object' || Array.isArray(map)) throw ipcError('INVALID_PARAMS', 'invalid visibility map');
   if (policy?.pending === true) return undefined;
   const next = Object.fromEntries(Object.entries(map).filter(([k, v]) => typeof k === 'string' && typeof v === 'boolean'));
@@ -660,14 +668,15 @@ export function registerProviderIpc({ dataDir }) {
   onSecretChange((name) => {
     if (name === null || /^provider_key_[a-z0-9_-]+_pi$/.test(name)) changed();
   });
+  // Cindy AI 登录 / 登出 / 目录刷新 / 网关 key 变化。
+  onXdChange(changed);
 
   // 模型可见性 owner 认领：ipc.mjs 默认返回 null，preload 会兜底成 canWriteOwnerScoped:false，
   // renderer 的可见性迁移因此卡在 owner-pending，providers 快照永不提交，输入框显示
   // "Model Details Unavailable"。本机模式只有一个 owner，直接给出可写、无旧数据的认领结果。
   registerSync('maker:model-visibility:legacy-owner-claim-sync', () => ({
-    dataOwnerId: DATA_OWNER_ID,
-    ownerGeneration: OWNER_GENERATION,
-    canWriteOwnerScoped: true,
+    ...ownerStamp(),
+    canWriteOwnerScoped: ownerStamp().dataOwnerId !== null,
     claimed: false,
     claimedByOtherOwner: false,
     canInitialize: false,
@@ -682,24 +691,25 @@ export function registerProviderIpc({ dataDir }) {
   registerInvoke('maker:provider:custom:disconnect', disconnectProvider);
   registerInvoke('maker:provider:test-connection', testConnection);
   registerInvoke('maker:provider:models-fetch', fetchModels);
-  // 只接受内置 provider id（desktop 同口径）；本构建没有内置 provider，合法 id 直接回成功。
-  registerInvoke('maker:provider:models-refresh', (providerId) => {
+  // 只接受内置 provider id（desktop 同口径）；xd 真的重拉 Cindy AI 目录，其余没有内置清单，直接回成功。
+  registerInvoke('maker:provider:models-refresh', async (providerId) => {
     if (!BUILTIN_REFRESHABLE.includes(providerId)) {
       throw ipcError('INVALID_PARAMS', `providerId must be one of: ${BUILTIN_REFRESHABLE.join(', ')}`);
     }
+    if (providerId === XD_PROVIDER_ID) await refreshXdGatewayModels();
     return { ok: true, providerId };
   });
-  // ModelSelector 打开时会调；没有内置动态清单，直接成功。
+  // ModelSelector / 设置页打开时会调：代替 desktop 的窗口聚焦刷新，Cindy AI 目录最多 5 分钟拉一次。
   registerInvoke('maker:provider:models-auto-refresh', (trigger) => {
     if (!AUTO_REFRESH_TRIGGERS.includes(trigger)) {
       throw ipcError('INVALID_PARAMS', `trigger must be one of: ${AUTO_REFRESH_TRIGGERS.join(', ')}`);
     }
+    foregroundRefreshXdModels();
     return { ok: true };
   });
   registerInvoke('maker:provider:order:set', setProviderOrder);
   registerInvoke('maker:provider:local-cli-scan', () => ({ detections: [] }));
   registerInvoke('maker:provider:detect', () => ({ candidates: [], reason: 'insufficient_evidence' }));
   registerInvoke('maker:model-visibility:sync', syncModelVisibility);
-  registerInvoke('model-access:get-status', () => ({ state: 'idle', source: null, endpoint: null, accountTier: null }));
   registerInvoke('ghosts:models:list', () => []);
 }

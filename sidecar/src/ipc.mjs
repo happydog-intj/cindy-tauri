@@ -3,6 +3,7 @@
 // - 未实现的 invoke 返回 [NOT_IMPLEMENTED] 错误，send 直接丢弃，sendSync 返回 undefined；
 // - 每个 channel 的调用次数都记下来（ipc.stats），用于排迁移优先级。
 import os from 'node:os';
+import { websiteUrl } from './cloud-endpoints.mjs';
 import { decode, encode } from '../../shared/ipc-codec.mjs';
 
 const counts = { invoke: new Map(), send: new Map(), sendSync: new Map() };
@@ -29,11 +30,10 @@ const appVersion = process.env.CINDY_TAURI_APP_VERSION ?? '0.0.0';
 const syncHandlers = {
   'app-locale:get-preferred-system-locale-sync': () => preferredLocale(),
   'get-app-display-version-info': () => ({ display: `${appVersion} · tauri`, detail: `${appVersion} (tauri)` }),
-  'client-endpoints:get-sync': () => ({ websiteUrl: '' }),
+  'client-endpoints:get-sync': () => ({ websiteUrl: websiteUrl() }),
   'appearance-settings:get-sync': () => null,
   'get-os-release': () => os.release(),
   'get-app-version': () => appVersion,
-  'auth:has-persisted-session-hint-sync': () => false,
   'local-themes:list-sync': () => ({ success: true, themes: [], diagnostics: [] }),
   'app-shortcuts:get': () => ({ overrides: {}, platform: process.platform, globalFailures: [] }),
   // layout 和 ghosts 由各自的 store 实现（后续批次）；这里先返回 null，preload 会走它自己的兜底。

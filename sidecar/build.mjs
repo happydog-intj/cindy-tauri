@@ -35,6 +35,40 @@ const mainStringsPlugin = {
     });
   },
 };
+// desktop src/main 只按文件放行（DESIGN.md §9.12）：sidecar 通过 @cindy-desktop-main/<相对路径>
+// 引用下面这些无 Electron 依赖的纯模块，跟随上游自动同步；其余 src/main 文件一律构建失败。
+// 名单要扩大须先征得同意。
+const desktopMainDir = path.join(cindyDir, 'apps', 'desktop', 'src', 'main');
+const DESKTOP_MAIN_ALLOWLIST = [
+  'authHostedCallback.ts',
+  'authRefreshBackoff.ts',
+  'model-access/credentialsSync.ts',
+  'model-access/modelsSyncRefresh.ts',
+  'maker-host/pi-gateway-model-catalog.ts',
+  'billing/projection.ts',
+];
+// 名单内文件的纯传递依赖（运行时 import，不算新增引用点）。
+const DESKTOP_MAIN_TRANSITIVE = ['model-access/authSessionIdentity.ts', 'billing/paymentRedirect.ts'];
+const allowedMain = new Set([...DESKTOP_MAIN_ALLOWLIST, ...DESKTOP_MAIN_TRANSITIVE].map((f) => path.join(desktopMainDir, f)));
+const desktopMainPlugin = {
+  name: 'cindy-desktop-main-allowlist',
+  setup(b) {
+    b.onResolve({ filter: /^@cindy-desktop-main\// }, (a) => {
+      const rel = a.path.slice('@cindy-desktop-main/'.length);
+      if (!DESKTOP_MAIN_ALLOWLIST.includes(rel)) {
+        return { errors: [{ text: `desktop src/main file not in allowlist: ${rel}` }] };
+      }
+      return { path: path.join(desktopMainDir, rel) };
+    });
+    const esc = desktopMainDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    b.onLoad({ filter: new RegExp(`^${esc}[\\\\/]`) }, (a) => {
+      if (!allowedMain.has(a.path)) {
+        return { errors: [{ text: `desktop src/main file not in allowlist: ${path.relative(desktopMainDir, a.path)}` }] };
+      }
+      return undefined;
+    });
+  },
+};
 await build({
   alias: { '@cindy-desktop-shared': path.join(cindyDir, 'apps', 'desktop', 'src', 'shared') },
   entryPoints: [path.join(here, 'src/index.mjs')],
@@ -52,10 +86,11 @@ await build({
   // maker-core 内置的 Pi 扩展源码 / prompt 以 .md 文本形式 import。
   loader: { '.md': 'text' },
   // CJS 里没有 import.meta.url，用 banner 里的 __u 顶替。
-  define: { 'import.meta.url': '__u' },
+  // desktop shared/brandRegion.ts 从 import.meta.env 读构建区域；Tauri 只做 global 区。
+  define: { 'import.meta.url': '__u', 'import.meta.env': '{"VITE_CINDY_AUTH_REGION":"global"}' },
   banner: { js: 'const __u=require("node:url").pathToFileURL(__filename).href;' },
   // 原生模块不打包：sidecar 只用 node:sqlite。
   external: ['better-sqlite3', 'sharp', 'node-pty'],
-  plugins: [mainStringsPlugin],
+  plugins: [mainStringsPlugin, desktopMainPlugin],
   logLevel: 'info',
 });

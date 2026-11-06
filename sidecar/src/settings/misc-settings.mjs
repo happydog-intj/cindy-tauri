@@ -7,9 +7,8 @@ import { isUtilityModelProviderKind } from '@cindy-desktop-shared/utilityModelPr
 import { registerInvoke } from '../ipc.mjs';
 import { createOverrideSettingsFile, overrideWire } from './override-file.mjs';
 import { fail } from './maker-settings.mjs';
+import { isCurrentOwner } from '../owner.mjs';
 
-// 本机模式的 owner 戳（同 boot-stubs.mjs:31）
-const LOCAL_OWNER = { dataOwnerId: 'local-v1', ownerGeneration: 1 };
 
 // desktop bootstrap-electron.ts:1507 assertCompactionMutationOwner + chat-embedding-owner-stamp.ts
 function assertLocalOwner(raw) {
@@ -17,7 +16,7 @@ function assertLocalOwner(raw) {
     && (typeof raw.dataOwnerId === 'string' || raw.dataOwnerId === null)
     && Number.isSafeInteger(raw.ownerGeneration);
   if (!ok) fail('INVALID_PARAMS', 'compaction owner stamp required');
-  if (raw.dataOwnerId !== LOCAL_OWNER.dataOwnerId || raw.ownerGeneration !== LOCAL_OWNER.ownerGeneration) {
+  if (!isCurrentOwner(raw.dataOwnerId, raw.ownerGeneration)) {
     fail('PRECONDITION_FAILED', 'Compaction setting belongs to a stale account session.');
   }
 }

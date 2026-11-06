@@ -7,11 +7,10 @@ import { agentStatus } from './agents.mjs';
 import { coerceLayout } from '@cindy-desktop-shared/layoutTree';
 import { hostLocalProjectKeysOnly, parseSyncedProjectOrderMode } from '@cindy/maker-shared/project-order-sync';
 import { emitToRenderer, registerInvoke, registerSync } from './ipc.mjs';
+import { isCurrentOwner, ownerStamp } from './owner.mjs';
 
-// desktop main/profile/profileRegistryModel.ts 的 LOCAL_PROFILE_DATA_OWNER_ID。
-const LOCAL_DATA_OWNER_ID = 'local-v1';
-
-function deviceId(dataDir) {
+// 设备 id：登录时作为 auth-client 的 deviceId，刷新 token 与它绑定，不能随意重置。
+export function deviceId(dataDir) {
   const file = path.join(dataDir, 'device-id');
   try {
     const v = readFileSync(file, 'utf8').trim();
@@ -25,19 +24,6 @@ function deviceId(dataDir) {
 
 export function registerBootStubs({ dataDir, agentManifestDir }) {
   const id = deviceId(dataDir);
-  const authState = () => ({
-    user: null,
-    mode: 'local',
-    dataOwnerId: LOCAL_DATA_OWNER_ID,
-    ownerGeneration: 1,
-    canEnterApp: true,
-    isAuthenticated: false,
-    isCanary: false,
-    deviceId: id,
-    hasAccountDeletionReceipt: false,
-    accountDeletionRestored: false,
-    credentialStoreUnavailable: false,
-  });
 
   // 这一版只支持 Pi；Claude Code / Codex 标成 skipped。Pi 未下载时也放行（renderer 里 Pi 是可选 agent）。
   registerInvoke('check-environment', async () => {
@@ -57,8 +43,6 @@ export function registerBootStubs({ dataDir, agentManifestDir }) {
       platform: process.platform,
     };
   });
-  registerInvoke('auth:initialize', async () => authState());
-  registerInvoke('auth:get-login-state', async () => null);
   registerInvoke('check-app-update', async () => ({ hasUpdate: false, action: 'none' }));
   registerInvoke('analytics:settings-get', async () => ({
     privacyConsentAccepted: true,
@@ -116,7 +100,6 @@ export function registerBootStubs({ dataDir, agentManifestDir }) {
 
   // 侧栏项目排序：desktop main/projectOrderStore.ts 的单 owner 版，存 <dataDir>/project-order.v1.json。
   const orderFile = path.join(dataDir, 'project-order.v1.json');
-  const ownerStamp = { dataOwnerId: LOCAL_DATA_OWNER_ID, ownerGeneration: 1 };
   const normalizeOrder = (raw) => {
     const v = raw && typeof raw === 'object' ? raw : {};
     return {
@@ -127,16 +110,16 @@ export function registerBootStubs({ dataDir, agentManifestDir }) {
   const orderSnapshot = () => {
     let saved = null;
     try { saved = JSON.parse(readFileSync(orderFile, 'utf8')); } catch { /* 未自定义 */ }
-    return { authoritative: saved !== null, available: true, ...normalizeOrder(saved), ownerStamp };
+    return { authoritative: saved !== null, available: true, ...normalizeOrder(saved), ownerStamp: ownerStamp() };
   };
   registerInvoke('sidebar-settings:get-project-order', async () => orderSnapshot());
   registerInvoke('sidebar-settings:apply-project-order', async (req) => {
-    if (!req || typeof req !== 'object' || req.dataOwnerId !== ownerStamp.dataOwnerId || req.ownerGeneration !== ownerStamp.ownerGeneration) {
+    if (!req || typeof req !== 'object' || !isCurrentOwner(req.dataOwnerId, req.ownerGeneration)) {
       throw new Error('[PRECONDITION_FAILED] active account changed during project order mutation');
     }
     writeFileSync(orderFile, JSON.stringify(normalizeOrder(req)));
     const snapshot = orderSnapshot();
-    emitToRenderer('sidebar-settings:project-order-changed', snapshot, ownerStamp);
+    emitToRenderer('sidebar-settings:project-order-changed', snapshot, ownerStamp());
     return snapshot;
   });
 

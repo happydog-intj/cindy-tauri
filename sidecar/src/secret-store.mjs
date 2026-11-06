@@ -14,6 +14,9 @@ import { registerInvoke } from './ipc.mjs';
 const CHECK_NAME = '__check__';
 const CHECK_PLAIN = 'cindy-tauri-secret-store-v1';
 const KEY_NAME_RE = /^[a-zA-Z0-9_-]{1,200}$/;
+// 登录凭据只在 sidecar 内部使用（auth.mjs），renderer 的通用通道读写不到。
+// desktop 的 isRendererAccessibleSafeStorageKey 不拦这些键（desktop 另走独立存储），这里自己补上。
+const AUTH_ONLY_KEYS = new Set(['cindy_auth_session_v1', 'cindy_auth_accounts_v1', 'cindy_auth_refresh_token', 'refresh_token']);
 const CUSTOM_PROVIDER_RUNTIME_KEY_RE = /^provider_key_[a-zA-Z0-9_-]+_(?:claude-code|codex|pi)$/;
 const MAX_VALUE_CHARS = 64 * 1024;
 const READY_TIMEOUT_MS = 15_000;
@@ -198,7 +201,9 @@ export function isCustomProviderRuntimeKeyName(name) {
 // renderer 的通用 safeStorage 通道（desktop bootstrap-electron.ts safe-storage-*）：
 // 键名规则和 main-only 黑名单与 desktop 相同；provider key 可回读，用于编辑表单回填。
 function rendererKey(key) {
-  return typeof key === 'string' && KEY_NAME_RE.test(key) && key !== CHECK_NAME && isRendererAccessibleSafeStorageKey(key);
+  return typeof key === 'string' && KEY_NAME_RE.test(key) && key !== CHECK_NAME
+    && !AUTH_ONLY_KEYS.has(key.toLowerCase()) && !key.toLowerCase().startsWith('cindy_auth_')
+    && isRendererAccessibleSafeStorageKey(key);
 }
 
 export function registerSecretIpc() {

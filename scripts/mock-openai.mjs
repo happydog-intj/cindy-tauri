@@ -9,6 +9,7 @@
 // 环境变量：MOCK_PORT（默认 0 = 随机端口）；MOCK_DUMP=1 时把每个请求体写到 MOCK_DUMP_DIR（默认系统临时目录）。
 // 带 key 路径：/keyed/... 下的同名接口要求 Authorization: Bearer <MOCK_API_KEY>，否则 401。
 // 日志只记 auth: ok / missing / wrong，不记 key 本身。
+// MOCK_LOG_HEADER_NAMES=1 时聊天请求日志多一个 headers 字段：只有 header 名，没有值（测转发有没有漏内部头）。
 import { createServer } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
 import { mkdirSync, writeFileSync } from 'node:fs';
@@ -23,6 +24,7 @@ const dumpDir = process.env.MOCK_DUMP === '1' ? path.resolve(process.env.MOCK_DU
 if (dumpDir) mkdirSync(dumpDir, { recursive: true });
 
 const API_KEY = process.env.MOCK_API_KEY || null;
+const LOG_HEADER_NAMES = process.env.MOCK_LOG_HEADER_NAMES === '1';
 
 let seq = 0;
 
@@ -188,6 +190,7 @@ const server = createServer(async (req, res) => {
       const reply = decide(body);
       log({
         n, method: req.method, path: url.pathname, ...(auth ? { auth } : {}), model: body.model, stream: body.stream === true,
+        ...(LOG_HEADER_NAMES ? { headers: Object.keys(req.headers).sort() } : {}),
         messages: Array.isArray(body.messages) ? body.messages.map((m) => m?.role).join(',') : null,
         tools: Array.isArray(body.tools) ? body.tools.map((t) => t?.function?.name ?? t?.name) : [],
         reply: reply.kind === 'tool' ? { tool: reply.name, args: reply.args } : { text: reply.text }, reason: reply.reason,

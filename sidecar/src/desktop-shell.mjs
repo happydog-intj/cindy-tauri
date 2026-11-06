@@ -7,10 +7,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { emitToRenderer, registerInvoke, registerSend } from './ipc.mjs';
 import { onMainLocaleChange, setMainLocale, t } from './main-locale.mjs';
 import { callNative, notifyNative } from './native.mjs';
+import { isCurrentOwner } from './owner.mjs';
 
-// desktop main/profile/profileRegistryModel.ts 的本机 owner。
-const LOCAL_DATA_OWNER_ID = 'local-v1';
-const LOCAL_OWNER_GENERATION = 1;
 const CLIENT_NOTIFICATION_NAME = 'Cindy';
 const CHATGPT_APP_URL = 'codex://';
 const BILLING_SUPPORT_EMAIL = 'xd-billing@xd.com';
@@ -221,7 +219,7 @@ export function registerDesktopShellIpc({ dataDir, db, anySessionInTurn = () => 
       || sessionIds.some((id) => typeof id !== 'string' || id.length === 0 || id.length > 256)) {
       fail('INVALID_PARAMS', 'App attention snapshot requires session IDs');
     }
-    if (snapshot.dataOwnerId !== LOCAL_DATA_OWNER_ID || snapshot.ownerGeneration !== LOCAL_OWNER_GENERATION) return undefined;
+    if (!isCurrentOwner(snapshot.dataOwnerId, snapshot.ownerGeneration)) return undefined;
     projectedCount = count;
     for (const id of sessionIds) projectedIds.add(id);
     if (projectedIds.size > MAX_SESSION_IDS * 2) projectedIds.clear();

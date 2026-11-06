@@ -10,7 +10,10 @@ import { copyFile, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path';
 import { agentStatus, installAgent } from './agents.mjs';
 import { ipcMethods, setPush } from './ipc.mjs';
+import { registerAuthIpc } from './auth.mjs';
+import { registerModelAccessIpc } from './model-access.mjs';
 import { registerBootStubs } from './boot-stubs.mjs';
+import { initAppSession } from './owner.mjs';
 import { openLocalDb, registerLocalDbIpc } from './local-db/index.mjs';
 import * as models from './model-config.mjs';
 import { registerMakerIpc } from './maker-ipc.mjs';
@@ -189,6 +192,8 @@ function reply(msg) {
 // 没有 id 的推送消息，Rust 侧转发为 Tauri 事件 "cindy:ipc"。
 setPush((push) => reply({ push }));
 setNativeWriter((msg) => reply(msg));
+// 应用会话（本机 / 未登录 / 云端）要先于所有带 owner 戳的 handler 就位。
+initAppSession({ dataDir });
 registerBootStubs({ dataDir, agentManifestDir });
 const settings = registerSettingsIpc({ dataDir, piStatus: () => agentStatus('pi', { manifestDir: agentManifestDir, dataDir }) });
 
@@ -197,6 +202,10 @@ const LOCAL_OWNER_ID = 'local-v1';
 const db = openLocalDb({ dataDir, ownerId: LOCAL_OWNER_ID });
 initSecretStore({ dataDir });
 registerSecretIpc();
+// Cindy 账号登录（refresh token 存在 secret store，所以排在它后面）。
+const auth = registerAuthIpc({ dataDir });
+// Cindy AI 云端模型（网关凭据、模型目录、余额、本地网关转发），跟着登录状态走。
+const modelAccess = registerModelAccessIpc({ dataDir });
 models.registerProviderIpc({ dataDir });
 const makerIpc = registerMakerIpc({ dataDir, db, models, agentManifestDir });
 registerLocalDbIpc(db, { isRunning: (sid) => makerIpc.isTurnRunning?.(sid) ?? false });
@@ -253,6 +262,7 @@ async function handleLine(line) {
 rl.on('close', async () => {
   await Promise.allSettled([...pending]);
   update.dispose();
+  auth.dispose(); modelAccess.dispose();
   terminal.disposeAll();
   await Promise.resolve(makerIpc.shutdown?.()).catch(() => undefined);
   try { db.close(); } catch { /* 已关闭 */ }

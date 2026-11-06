@@ -57,9 +57,10 @@ jobs:
       # 真实 renderer：只跑 vite renderer 构建，不碰 Electron 主进程。
       - name: Build cindy renderer
         working-directory: .cache/cindy/apps/desktop
-        # 与 cindy 自己的 CI 一致，renderer 打包需要较大的堆。
+        # 与 cindy 自己的 CI 一致，renderer 打包需要较大的堆。登录页按区域烘焙：Tauri 只做 global 区。
         env:
           NODE_OPTIONS: --max-old-space-size=6144
+          VITE_CINDY_AUTH_REGION: global
         run: npx vite build --config vite.renderer.config.ts
 
       # sidecar 复用 cindy desktop shared/ 下的纯函数模块。
@@ -103,6 +104,11 @@ jobs:
       # 运行中切换模型：同来源 / 跨来源热切、回合中延期、落库、重启后按新模型重建（mock 模型，会下载 Pi）。
       - name: Model switch e2e
         run: node scripts/model-switch-e2e.mjs
+
+      # Cindy 账号登录与云端模型：mock auth / model-access / 网关，邮箱验证码 + 浏览器登录、续期、
+      # 退出、本地网关转发（上游只见真实 key、没有内部头）、余额。
+      - name: Auth e2e
+        run: node scripts/auth-e2e.mjs
 
       # 更新签名密钥：v* 标签用仓库 secret 里的正式密钥（和 tauri.conf.json 的 pubkey 配对）；
       # 其余构建用一次性密钥并覆盖 pubkey，正式私钥不进普通 CI。
