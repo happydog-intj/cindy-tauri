@@ -311,9 +311,13 @@ async function runRefresh({ coldStart }) {
 export function refresh() {
   if (getAppMode() !== 'cloud') return Promise.resolve(false);
   if (refreshPromise) return refreshPromise;
-  if (refreshBackoff.runtimeRemaining(authStateEpoch) > 0) return Promise.resolve(false);
+  // 新版 AuthRefreshBackoff 有运行时快速重试（runtimeRemaining / startRuntimeAttempt）；CI 固定的上游版本还没有，退回 remaining。
+  const waitMs = typeof refreshBackoff.runtimeRemaining === 'function'
+    ? refreshBackoff.runtimeRemaining(authStateEpoch)
+    : refreshBackoff.remaining(authStateEpoch);
+  if (waitMs > 0) return Promise.resolve(false);
   clearRefreshTimer();
-  refreshBackoff.startRuntimeAttempt(authStateEpoch);
+  refreshBackoff.startRuntimeAttempt?.(authStateEpoch);
   const run = runRefresh({ coldStart: false }).finally(() => { if (refreshPromise === run) refreshPromise = null; });
   refreshPromise = run;
   return run;
