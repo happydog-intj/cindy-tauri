@@ -118,6 +118,16 @@ try {
   const row = await sc.invoke('local-db:sessions:create', { agentKind: 'pi', title: 'E2E', workspaceKind: 'dialogue', model: 'mock-model', providerId, permissionMode: 'ask' });
   check('local-db session created', row?.id && row.workingDir, row?.workingDir);
   const sid = row.id;
+
+  // 0) 自动起名：只覆盖默认标题 'New Maker'，手动标题不动。
+  const draft = await sc.invoke('local-db:sessions:create', { agentKind: 'pi', workspaceKind: 'dialogue', model: 'mock-model', providerId });
+  check('draft session has default title', draft.title === 'New Maker', draft.title);
+  const named = await sc.invoke('maker:auto-title', { sessionId: draft.id, text: '  帮我   写一个快速排序\n然后解释复杂度，并且给出 Python 和 Rust 两种实现以及测试用例  ', agentKind: 'pi', isUserText: true });
+  const draftAfter = await sc.invoke('local-db:sessions:get', draft.id);
+  check('auto-title applied', named.applied && named.done && draftAfter.title === '帮我 写一个快速排序 然后解释复杂度，并且给出 Python 和 Rust 两种', draftAfter.title);
+  const again2 = await sc.invoke('maker:auto-title', { sessionId: draft.id, text: 'second', agentKind: 'pi' });
+  const manual = await sc.invoke('maker:auto-title', { sessionId: sid, text: 'x', agentKind: 'pi' });
+  check('auto-title skips named sessions', !again2.applied && !manual.applied && (await sc.invoke('local-db:sessions:get', sid)).title === 'E2E');
   const createOpts = { agentKind: 'pi', model: 'mock-model', providerId, permissionMode: 'ask', workingDir: row.workingDir, workspaceKind: 'dialogue' };
   // 形状同 renderer 入队的 AgentInputQueuedMessage（shared/agentInputQueue.ts）。
   const queued = (clientId, text) => ({

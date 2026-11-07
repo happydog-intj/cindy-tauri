@@ -310,6 +310,14 @@ export function openLocalDb({ dataDir, ownerId }) {
   };
 }
 
+const DEFAULT_DRAFT_TITLE = 'New Maker';
+const AUTO_TITLE_MAX_CHARS = 40;
+// 与 @cindy/maker-shared/session-title normalizeAutoTitle 逐字一致（renderer 乐观预览用同一算法）。
+function normalizeAutoTitle(text) {
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  return Array.from(normalized).slice(0, AUTO_TITLE_MAX_CHARS).join('').trimEnd();
+}
+
 export function registerLocalDbIpc(db, { isRunning = () => false } = {}) {
   const { sql } = db;
   const I = db._internal;
@@ -333,6 +341,23 @@ export function registerLocalDbIpc(db, { isRunning = () => false } = {}) {
   registerInvoke('local-db:sessions:update', (id, patch) => {
     if (!patch || typeof patch !== 'object' || Array.isArray(patch)) fail('INVALID_PARAMS', 'patch must be an object');
     return I.updateSession(requireString(id, 'id'), patch);
+  });
+  // 自动起名（desktop sessionAutoTitle 的子集）：用首条用户文字截断成标题，条件写
+  // `WHERE title = 'New Maker'`，用户手动改过名就不会被覆盖。暂不调用标题模型。
+  registerInvoke('maker:auto-title', (req) => {
+    if (!req || typeof req !== 'object' || Array.isArray(req)) fail('INVALID_PARAMS', 'auto-title request required');
+    const sessionId = requireString(req.sessionId, 'sessionId');
+    if (typeof req.text !== 'string') fail('INVALID_PARAMS', 'invalid text');
+    const row = sql.prepare('SELECT title FROM sessions WHERE id = ?').get(sessionId);
+    if (!row) return { applied: false, done: false };
+    if (row.title !== DEFAULT_DRAFT_TITLE) return { applied: false, done: true };
+    const title = normalizeAutoTitle(req.text.slice(0, 2000));
+    if (!title || title === DEFAULT_DRAFT_TITLE) return { applied: false, done: false };
+    const res = sql.prepare('UPDATE sessions SET title = ? WHERE id = ? AND title = ?').run(title, sessionId, DEFAULT_DRAFT_TITLE);
+    if (res.changes !== 1) return { applied: false, done: true };
+    emitToRenderer('local-db:sessions:patched', { sessionId, patch: { title } });
+    // 附件合成的描述（isUserText=false）只是占位，等用户打字再换。
+    return { applied: true, done: req.isUserText !== false };
   });
   registerInvoke('local-db:sessions:touchUserSend', (id, atMs) => {
     const at = typeof atMs === 'number' && Number.isFinite(atMs) ? atMs : Date.now();
