@@ -5,7 +5,7 @@
 // 用法：node scripts/session-e2e.mjs   （需要先 npm run sidecar:build；Pi 未装时会自动下载）
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
@@ -208,6 +208,30 @@ try {
   check('history view after restart', view?.version === 1 && view.items.length > 0, `${view.items.length} items, types=${view.items.map((i) => i.type).join(',')}`);
   const interrupted = await sc.invoke('local-db:sessions:interrupted-pending');
   check('no false interrupted alert', !interrupted.includes(sid), interrupted);
+
+  // 4b) 重启后继续对话：上下文要接上，工作目录不能变。renderer 的 createOpts 是建会话时的快照，
+  //     这里故意不带 resumeSessionId、工作目录给一个别的目录，sidecar 必须以存下的为准。
+  const afterRow = await sc.invoke('local-db:sessions:get', sid);
+  check('sdkSessionId persisted for resume', typeof afterRow.sdkSessionId === 'string' && afterRow.sdkSessionId.length > 0, afterRow.sdkSessionId);
+  const stray = path.join(dataDir, 'stray-workdir');
+  rmSync(path.join(row.workingDir, 'mock-ok.txt'), { force: true });
+  const resumeMark = mock.logLines.length;
+  await sc.invoke('maker:input:enqueue', sid, {
+    ...queued('u9', 'MOCK_WRITE_FILE after restart'),
+    workingDir: stray,
+    createOpts: { ...createOpts, workingDir: stray },
+  });
+  const req2 = await sc.waitPush((p) => p.channel === 'maker:interaction-request' && p.args[0]?.sessionId === sid && p.args[0].request.requestId !== request.requestId);
+  await sc.invoke('maker:resolve-interaction', req2.args[0].request.requestId, { kind: 'permission', behavior: 'allow' });
+  const tR = Date.now();
+  while (doneFor(sc, sid) < 1 && Date.now() - tR < 120_000) await new Promise((r) => setTimeout(r, 200));
+  const resumedReq = mock.logLines.slice(resumeMark)
+    .map((l) => { try { return JSON.parse(l.replace(/^\[mock-openai\] /, '')); } catch { return null; } })
+    .find((e) => e?.path?.endsWith('/chat/completions'));
+  const userTurns = (resumedReq?.messages ?? '').split(',').filter((r) => r === 'user').length;
+  check('context resumed after restart', userTurns >= 3, resumedReq?.messages);
+  check('working dir kept after restart', existsSync(path.join(row.workingDir, 'mock-ok.txt')) && !existsSync(path.join(stray, 'mock-ok.txt')),
+    (await sc.invoke('local-db:sessions:get', sid)).workingDir);
 
   // 5) 改端点不带新 key → 旧 key 清掉；重新给 key → 恢复；断开 → 清 key、保留配置。
   await sc.invoke('maker:provider:custom:update', keyedConfig(`http://localhost:${mock.port}/keyed`), {}, {});

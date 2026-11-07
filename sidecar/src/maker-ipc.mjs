@@ -173,6 +173,7 @@ export function registerMakerIpc({ dataDir, db, models, agentManifestDir, host: 
     }
     s.activeTurn = null;
     void upsertRow(sessionId, {});
+    syncSdkSessionId(sessionId);
     pushProjection(sessionId);
     if (s.pendingSelection) {
       const sel = s.pendingSelection;
@@ -229,18 +230,26 @@ export function registerMakerIpc({ dataDir, db, models, agentManifestDir, host: 
     if (creating.has(id)) return creating.get(id);
     const s0 = getState(id);
     const selected = s0.selection;
-    const resumeSessionId = typeof raw.resumeSessionId === 'string' && raw.resumeSessionId
-      ? raw.resumeSessionId
-      : s0.resumeAfterRebuild;
     const task = (async () => {
+      // 重启后重建：renderer 的 createOpts 是建会话那刻的快照，常常不带 resumeSessionId，工作目录也可能是旧值。
+      // 续接以 maker-core 存下的 Pi 会话文件为准（其次是库里的 sdk_session_id），工作目录以库里记的为准。
+      const savedRow = readSessionRow(id);
+      const savedMeta = await maker.getSessionMeta?.(id).catch(() => null) ?? null;
+      const resumeSessionId = (typeof raw.resumeSessionId === 'string' && raw.resumeSessionId)
+        || s0.resumeAfterRebuild
+        || (typeof savedMeta?.sdkSessionId === 'string' && savedMeta.sdkSessionId)
+        || (typeof savedRow?.sdkSessionId === 'string' && savedRow.sdkSessionId)
+        || undefined;
+      const savedWorkingDir = (typeof savedRow?.workingDir === 'string' && savedRow.workingDir)
+        || (typeof savedMeta?.workDir === 'string' && savedMeta.workDir)
+        || null;
       await host.whenModelsReady?.();
       const cfg = selected
         ? host.resolveSessionModel(selected.providerId, selected.model)
         : host.resolveSessionModel(raw.providerId ?? null, raw.model);
       await host.ensurePiInstalled();
-      const workingDir = typeof raw.workingDir === 'string' && raw.workingDir.trim()
-        ? raw.workingDir
-        : dialogueDir(dataDir, id);
+      const workingDir = savedWorkingDir
+        ?? (typeof raw.workingDir === 'string' && raw.workingDir.trim() ? raw.workingDir : dialogueDir(dataDir, id));
       mkdirSync(workingDir, { recursive: true });
       // 权限档原样透传（ask / auto / bypassPermissions），由 maker-core 决定审批行为。
       const opts = {
@@ -267,6 +276,7 @@ export function registerMakerIpc({ dataDir, db, models, agentManifestDir, host: 
       if (s.resumeAfterRebuild === resumeSessionId) s.resumeAfterRebuild = null;
       s.liveRoute = { model: cfg.modelId, providerId: cfg.providerId };
       s.permissionMode = raw.permissionMode;
+      if (resumeSessionId) process.stderr.write(`[maker-ipc] session ${id} resumed from saved Pi history\n`);
       await upsertRow(id, {
         agentKind: 'pi',
         title: raw.title ?? s.row?.title ?? '',
@@ -354,6 +364,19 @@ export function registerMakerIpc({ dataDir, db, models, agentManifestDir, host: 
       return db.getSession(sessionId) ?? null;
     } catch {
       return null;
+    }
+  }
+
+  // Pi 会话文件路径落到 renderer 表的 sdk_session_id（desktop 同口径），变了才写并推 sessions:patched。
+  function syncSdkSessionId(sessionId) {
+    const sdk = maker.getSession(sessionId)?.sdkSessionId;
+    if (typeof sdk !== 'string' || !sdk) return;
+    const row = readSessionRow(sessionId);
+    if (!row || row.sdkSessionId === sdk) return;
+    try {
+      db._internal.updateSession(sessionId, { sdkSessionId: sdk });
+    } catch (err) {
+      process.stderr.write(`[maker-ipc] persist sdkSessionId failed: ${err?.message ?? err}\n`);
     }
   }
 
