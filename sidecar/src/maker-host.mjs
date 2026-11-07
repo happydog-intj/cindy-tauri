@@ -183,7 +183,10 @@ export function createMakerHost({ dataDir, models, agentManifestDir, logger = st
     },
     // 把 renderer 传来的 providerId/model 落到 C 的配置上；缺 providerId 时用当前默认配置。
     resolveSessionModel(providerId, modelId) {
-      const cfg = resolveConfig(providerId, modelId) ?? (providerId ? null : models.getModelConfig());
+      // renderer 选 Cindy AI 模型时 providerId 为空（null = 网关，与 maker-core 同口径）：先按 xd 找这个模型，
+      // 找不到才退回默认模型；不能直接用默认，否则会落到第一个自定义 provider 上。
+      const gatewayHit = !providerId && modelId ? models.resolveModel(XD_PROVIDER_ID, modelId) : null;
+      const cfg = gatewayHit ?? resolveConfig(providerId, modelId) ?? (providerId ? null : models.getModelConfig());
       if (!cfg) throw new Error(`[MODEL_NOT_CONFIGURED] model ${providerId ?? '(default)'}/${modelId ?? ''} is not configured`);
       if (modelId && cfg.modelId !== modelId && providerId) {
         throw new Error(`[MODEL_NOT_CONFIGURED] model ${modelId} not found in provider ${providerId}`);

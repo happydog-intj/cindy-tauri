@@ -103,7 +103,14 @@ export const ipcMethods = {
       bump(missing.invoke, channel);
       throw new Error(`[NOT_IMPLEMENTED] ${channel} is not available in the Tauri build yet`);
     }
-    return encode(await fn(...args(params)));
+    try {
+      return encode(await fn(...args(params)));
+    } catch (err) {
+      // renderer 多半只弹通用提示，这里记下通道和错误码（只取消息首行前 300 字，不含参数）。
+      const msg = String(err?.message ?? err).split('\n', 1)[0].slice(0, 300);
+      process.stderr.write(`[ipc] invoke ${channel} failed: ${msg}\n`);
+      throw err;
+    }
   },
   'ipc.send': async (params) => {
     const channel = channelOf(params);

@@ -5,7 +5,7 @@ import readline from 'node:readline';
 import { format } from 'node:util';
 
 import { execFile } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, renameSync, statSync, writeSync } from 'node:fs';
 import { copyFile, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { agentStatus, installAgent } from './agents.mjs';
@@ -30,6 +30,38 @@ import { registerUpdateIpc } from './update.mjs';
 // stdout 只用于 JSON 协议，其他模块的 console.log/info 改写到 stderr。
 for (const k of ['log', 'info', 'debug']) {
   console[k] = (...a) => process.stderr.write(format(...a) + '\n');
+}
+
+// 打包后 stderr 没人收：同时写一份到 <dataDir>/logs/sidecar.log（「打开日志」目录），超过 5 MB 轮换一份 .1。
+// 各模块的日志本来就不含 token / key。
+{
+  const logDir = path.join(process.env.CINDY_TAURI_DATA_DIR ?? '.cindy-data', 'logs');
+  const logFile = path.join(logDir, 'sidecar.log');
+  let logFd = null;
+  let logBytes = 0;
+  try {
+    mkdirSync(logDir, { recursive: true });
+    try { if (statSync(logFile).size > 5 * 1024 * 1024) renameSync(logFile, `${logFile}.1`); } catch { /* 首次 */ }
+    logFd = openSync(logFile, 'a', 0o600);
+    logBytes = fstatSync(logFd).size;
+  } catch { logFd = null; }
+  const rawWrite = process.stderr.write.bind(process.stderr);
+  process.stderr.write = (chunk, ...rest) => {
+    if (logFd !== null) {
+      try {
+        const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8');
+        const line = text.endsWith('\n') ? text : `${text}\n`;
+        logBytes += writeSync(logFd, `${new Date().toISOString()} ${line}`);
+        if (logBytes > 5 * 1024 * 1024) {
+          closeSync(logFd);
+          renameSync(logFile, `${logFile}.1`);
+          logFd = openSync(logFile, 'a', 0o600);
+          logBytes = 0;
+        }
+      } catch { /* 日志失败不影响主流程 */ }
+    }
+    return rawWrite(chunk, ...rest);
+  };
 }
 
 // 打包后的布局：sidecar.cjs 旁边是 headless/cli.cjs、headless/profiles/ 和 headless/agents/。

@@ -197,6 +197,23 @@ try {
   const forged = await fetch(`${fwdBase}/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-cindy-pi-session-id': row.id, 'x-cindy-pi-session-token': 'forged' }, body: '{}' });
   check('forwarder rejects requests without a registered session token', anon.status === 403 && forged.status === 403 && gateway.logLines.length === gwBefore, [anon.status, forged.status]);
 
+  // renderer 选 Cindy AI 模型时 providerId 为空（null = 网关），sidecar 必须按 xd 解析。
+  const row2 = await sc.invoke('local-db:sessions:create', { agentKind: 'pi', title: 'Gateway null provider', workspaceKind: 'dialogue', model: GW_MODEL, permissionMode: 'ask' });
+  const gwMark2 = gateway.logLines.length;
+  let nullErr = null;
+  try {
+    await sc.invoke('maker:input:enqueue', row2.id, {
+      clientId: 'g2', text: 'hi', persistedContent: JSON.stringify({ text: 'hi' }), model: GW_MODEL, effort: 'medium', permissionMode: 'ask',
+      workingDir: row2.workingDir, chatMessage: { clientId: 'g2', role: 'user', content: 'hi' },
+      createOpts: { agentKind: 'pi', model: GW_MODEL, permissionMode: 'ask', workingDir: row2.workingDir, workspaceKind: 'dialogue' },
+    });
+  } catch (err) { nullErr = String(err.message); }
+  const term2 = nullErr ? null : await waitFor(() => sc.pushes.find((p) => p.channel === 'maker:event' && p.args[0]?.sessionId === row2.id
+    && ['done', 'error'].includes(p.args[0].event.type)), 120_000, 'gateway turn (null provider)');
+  const chats2 = parseLog(gateway.logLines.slice(gwMark2), /^\[mock-openai\] /).filter((e) => e.path?.endsWith('/chat/completions'));
+  check('gateway model with null providerId routes to Cindy AI', !nullErr && term2.args[0].event.type === 'done' && chats2.length > 0 && chats2.every((e) => e.auth === 'ok'),
+    nullErr ?? term2.args[0].event);
+
   // ── 退出 ──
   await sc.invoke('auth:logout');
   const out = await sc.invoke('auth:initialize');
