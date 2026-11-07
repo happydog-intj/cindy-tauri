@@ -36,7 +36,9 @@ let refreshFailCode = null;
 const b64url = (v) => Buffer.from(v).toString('base64url');
 function issueTokens(email) {
   const exp = Math.floor(Date.now() / 1000) + 3600;
-  const access = `${b64url('{"alg":"none"}')}.${b64url(JSON.stringify({ sub: 'u1', exp }))}.${randomBytes(8).toString('base64url')}`;
+  // MOCK_ACCESS_TOKEN_SUFFIX：固定签名段，测试的 mock 中继据此认出这台设备（token 前缀随 exp 变，中继按后缀匹配）。
+  const sig = process.env.MOCK_ACCESS_TOKEN_SUFFIX || randomBytes(8).toString('base64url');
+  const access = `${b64url('{"alg":"none"}')}.${b64url(JSON.stringify({ sub: 'u1', exp }))}.${sig}`;
   const refresh = `rt-${randomBytes(16).toString('hex')}`;
   accessTokens.set(access, email);
   for (const [t, e] of refreshTokens) if (e === email) refreshTokens.delete(t);

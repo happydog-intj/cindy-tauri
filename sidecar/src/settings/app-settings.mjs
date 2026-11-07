@@ -203,7 +203,7 @@ export function registerAppSettingsIpc({ settingsDir, platform = process.platfor
     fail('UNSUPPORTED_CAPABILITY', 'Login startup requires an installed Windows or macOS app');
   });
 
-  // ── 设备互联（只保留本地防休眠）── desktop main/device-link/settings-store.ts + ipc.ts:316-356
+  // ── 设备互联（这里只有防休眠开关；连接与被控在 device-link.mjs）── desktop main/device-link/settings-store.ts + ipc.ts:316-356
   const deviceLinkFile = file('device-link-settings.json');
   const DEVICE_LINK_DEFAULTS = {
     remoteDesktopEnabled: false, remoteControlEnabled: false, keepAwake: false,
@@ -223,26 +223,13 @@ export function registerAppSettingsIpc({ settingsDir, platform = process.platfor
       lastKnownDeviceNames: r.lastKnownDeviceNames && typeof r.lastKnownDeviceNames === 'object' ? r.lastKnownDeviceNames : {},
     };
   };
-  registerInvoke('device-link:get-state', async () => ({
-    remoteControlEnabled: false,
-    keepAwake: readDeviceLink().keepAwake,
-    linkStatus: 'stopped',
-    connectionIssue: null,
-    standby: false,
-    controlledBy: [],
-    revokedControllers: [],
-    disabledControlDeviceIds: [],
-    unresponsiveDeviceIds: [],
-  }));
+  // device-link:get-state / set-enabled / list-devices 等在 device-link.mjs（被控端主机）里注册。
   registerInvoke('device-link:set-keep-awake', async (enabled) => {
     requireBoolean(enabled, 'enabled');
     writeJsonAtomic(deviceLinkFile, { ...readDeviceLink(), keepAwake: enabled });
     emitToRenderer('device-link:keep-awake-changed', { keepAwake: enabled });
     return { keepAwake: enabled };
   });
-  // desktop ipc.ts:1706 gated()：无账号时 requireDeviceLinkCapability 抛 PERMISSION_DENIED；
-  // 这里用允许的错误码表达同一前置条件，renderer 按 listFailed 处理。
-  registerInvoke('device-link:list-devices', async () => fail('PRECONDITION_FAILED', 'Device Link requires a Cindy account.'));
 
   // ── 更新通道 ── desktop main/updateChannelStore.ts + updateService.ts:2386-2450
   const betaSupported = supportsBetaUpdateChannel(platform, arch);

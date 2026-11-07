@@ -146,7 +146,7 @@ export function registerMakerIpc({ dataDir, db, models, agentManifestDir, host: 
 
   function installInteractionListener(session) {
     session.setInteractionListener((req, signal) => new Promise((resolve) => {
-      const entry = { sessionId: session.id, kind: req.kind, request: req, resolve, timer: null };
+      const entry = { sessionId: session.id, kind: req.kind, request: req, resolve, timer: null, persistId: undefined };
       // 先登记再广播，避免 renderer 回得太快时找不到 resolver。
       pending.set(req.requestId, entry);
       if (req.kind === 'permission') {
@@ -160,6 +160,7 @@ export function registerMakerIpc({ dataDir, db, models, agentManifestDir, host: 
       } catch (err) {
         process.stderr.write(`[maker-ipc] persist interaction request failed: ${err?.message ?? err}\n`);
       }
+      entry.persistId = persistId;
       emitToRenderer('maker:interaction-request', { sessionId: session.id, request: req, persistId });
     }));
   }
@@ -629,6 +630,25 @@ export function registerMakerIpc({ dataDir, db, models, agentManifestDir, host: 
     if (s.activeTurn) s.activeTurn = null;
     pushProjection(sid);
     return projection(sid);
+  });
+
+  // 待处理的审批 / 提问快照（desktop GET_PENDING_INTERACTIONS）：手机打开会话、重连时据此重建审批面板。
+  registerInvoke('maker:get-pending-interactions', async (sessionId) => {
+    if (typeof sessionId !== 'string' || !sessionId) return [];
+    return [...pending.values()]
+      .filter((entry) => entry.sessionId === sessionId)
+      .map((entry) => ({ request: entry.request, ...(entry.persistId ? { persistId: entry.persistId } : {}) }));
+  });
+
+  // 直接中止当前回合（desktop ABORT_SESSION）：不动排队，取消待审批。
+  registerInvoke('maker:abort-session', async (sessionId) => {
+    const sid = requireSessionId(sessionId);
+    const s = getState(sid);
+    cancelInteractionsForSession(sid, 'session_aborted');
+    const session = maker.getSession(sid);
+    if (session && s.activeTurn) await session.abort().catch(() => undefined);
+    if (s.activeTurn) s.activeTurn = null;
+    pushProjection(sid);
   });
 
   registerInvoke('maker:input:resume', async (sessionId) => {

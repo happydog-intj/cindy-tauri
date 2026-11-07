@@ -111,6 +111,12 @@ jobs:
       - name: Auth e2e
         run: node scripts/auth-e2e.mjs
 
+      # 设备互联（被控端）：mock 中继 + 上游 DeviceLinkClient 扮演手机，列任务 / 发消息 / 远程审批 / 撤销 / 退出下线。
+      - name: Device link e2e
+        env:
+          CINDY_DIR: .cache/cindy
+        run: node scripts/device-link-e2e.mjs
+
       # 更新签名密钥：v* 标签用仓库 secret 里的正式密钥（和 tauri.conf.json 的 pubkey 配对）；
       # 其余构建用一次性密钥并覆盖 pubkey，正式私钥不进普通 CI。
       - name: Updater signing key

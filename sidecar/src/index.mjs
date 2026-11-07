@@ -12,6 +12,7 @@ import { agentStatus, installAgent } from './agents.mjs';
 import { ipcMethods, setPush } from './ipc.mjs';
 import { registerAuthIpc } from './auth.mjs';
 import { registerModelAccessIpc } from './model-access.mjs';
+import { registerDeviceLinkIpc } from './device-link.mjs';
 import { registerBootStubs } from './boot-stubs.mjs';
 import { initAppSession } from './owner.mjs';
 import { openLocalDb, registerLocalDbIpc } from './local-db/index.mjs';
@@ -255,6 +256,8 @@ const update = registerUpdateIpc({
   readAutoRelaunchOnIdle: settings.readAutoRelaunchOnIdle,
 });
 Object.assign(rustOnly, update.nativeMethods);
+// 设备互联（被控端）：手机 / 别的电脑经中继看任务、发消息、审批。放在所有 IPC 注册之后，远程调用走同一份 handler。
+const deviceLink = registerDeviceLinkIpc({ settingsDir: path.join(dataDir, 'settings') });
 
 const rl = readline.createInterface({ input: process.stdin });
 const pending = new Set();
@@ -294,7 +297,7 @@ async function handleLine(line) {
 rl.on('close', async () => {
   await Promise.allSettled([...pending]);
   update.dispose();
-  auth.dispose(); modelAccess.dispose();
+  deviceLink.dispose(); auth.dispose(); modelAccess.dispose();
   terminal.disposeAll();
   await Promise.resolve(makerIpc.shutdown?.()).catch(() => undefined);
   try { db.close(); } catch { /* 已关闭 */ }

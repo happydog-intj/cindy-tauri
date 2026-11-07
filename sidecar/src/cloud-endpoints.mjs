@@ -1,5 +1,5 @@
 // Cindy 云端地址（global 区，cindy/config/endpoint.global.json 的子集）。
-// 测试可用 CINDY_TAURI_AUTH_BASE_URL / CINDY_TAURI_MODEL_ACCESS_BASE_URL 指到本机 mock，
+// 测试可用 CINDY_TAURI_AUTH_BASE_URL / CINDY_TAURI_MODEL_ACCESS_BASE_URL / CINDY_TAURI_DEVICE_LINK_BASE_URL 指到本机 mock，
 // 只接受 127.0.0.1 的 http 地址，避免环境变量把登录凭据导向外部主机。
 export const AUTH_REGION = 'global';
 
@@ -8,6 +8,7 @@ const GLOBAL = {
   modelAccessApiBaseUrl: 'https://model-access.cindy.app',
   authDesktopCallbackUrl: 'https://auth.cindy.app/api/auth/desktop/callback',
   websiteUrl: 'https://cindy.app',
+  deviceLinkApiBaseUrl: 'https://device-link.cindy.app',
 };
 
 function loopbackOverride(name) {
@@ -25,6 +26,7 @@ function loopbackOverride(name) {
 
 const authOverride = loopbackOverride('CINDY_TAURI_AUTH_BASE_URL');
 const modelAccessOverride = loopbackOverride('CINDY_TAURI_MODEL_ACCESS_BASE_URL');
+const deviceLinkOverride = loopbackOverride('CINDY_TAURI_DEVICE_LINK_BASE_URL');
 
 export function authBaseUrl() {
   return authOverride ?? GLOBAL.authApiBaseUrl;
@@ -36,6 +38,11 @@ export function modelAccessBaseUrl() {
 
 export function authDesktopCallbackUrl() {
   return authOverride ? `${authOverride}/api/auth/desktop/callback` : GLOBAL.authDesktopCallbackUrl;
+}
+
+/** 设备互联：REST 在 <base>/api/device-link/*，中继 ws 在 <base 换成 ws(s)>/api/device-link/ws。 */
+export function deviceLinkBaseUrl() {
+  return deviceLinkOverride ?? GLOBAL.deviceLinkApiBaseUrl;
 }
 
 export function websiteUrl() {

@@ -20,8 +20,17 @@ let pushFn = () => {};
 export function setPush(fn) {
   pushFn = fn;
 }
+// 推送旁路：设备互联把允许转发的推送同时发给远程控制端（desktop broadcast-tap.ts）。
+const pushTaps = new Set();
+export function onRendererPush(fn) {
+  pushTaps.add(fn);
+  return () => pushTaps.delete(fn);
+}
 export function emitToRenderer(channel, ...args) {
   pushFn({ channel, payload: encode(args) });
+  for (const tap of pushTaps) {
+    try { tap(channel, args); } catch (err) { process.stderr.write(`[ipc] push tap failed: ${err?.message ?? err}\n`); }
+  }
 }
 
 const appVersion = process.env.CINDY_TAURI_APP_VERSION ?? '0.0.0';
@@ -73,6 +82,17 @@ export function preferredLocale() {
 
 export function registerInvoke(channel, fn) {
   invokeHandlers[channel] = fn;
+}
+
+export function isInvokeImplemented(channel) {
+  return typeof channel === 'string' && Object.hasOwn(invokeHandlers, channel);
+}
+
+/** 远程控制端的 invoke 走本机同一份 handler（desktop invoke-registry.ts dispatchLocalInvoke）。未注册抛 NOT_IMPLEMENTED。 */
+export async function dispatchLocalInvoke(channel, args) {
+  const fn = Object.hasOwn(invokeHandlers, channel) ? invokeHandlers[channel] : null;
+  if (!fn) throw new Error(`[NOT_IMPLEMENTED] ${channel} is not available in the Tauri build yet`);
+  return fn(...(Array.isArray(args) ? args : []));
 }
 
 export function registerSync(channel, fn) {
