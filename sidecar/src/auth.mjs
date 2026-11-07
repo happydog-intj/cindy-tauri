@@ -760,6 +760,26 @@ function exitLocal() {
 const unsupportedDeletion = async () => ({ success: false, code: 'ACCOUNT_DELETION_UNAVAILABLE' });
 const unsupportedAccounts = async () => { throw ipcError('NOT_SUPPORTED', 'Multiple accounts are not supported in the Tauri build yet'); };
 
+// desktop beginAddAccountLogin：本机模式侧栏的「登录」走 /add-account 页，这里只重置登录流程并返回登录态，
+// 不切换会话模式（登录完成时 completeLogin 才切到云端）。云端模式下加第二个账号是第二批的多账号功能。
+async function beginAddAccount() {
+  if (getAppMode() === 'cloud') await unsupportedAccounts();
+  loginFlowEpoch += 1;
+  cancelBrowser();
+  resetLoginFlowState();
+  return getLoginState();
+}
+
+function cancelAddAccount() {
+  if (commitSealed) {
+    log('info', 'add-account close ignored after accepted login commit began');
+    return;
+  }
+  loginFlowEpoch += 1;
+  cancelBrowser();
+  resetLoginFlowState();
+}
+
 export function registerAuthIpc({ dataDir }) {
   deviceId = loadDeviceId(dataDir);
   registerInvoke('auth:initialize', () => initialize());
@@ -775,8 +795,8 @@ export function registerAuthIpc({ dataDir }) {
   registerInvoke('auth:accounts:list', async () => ({ accounts: [], mutationAllowed: false }));
   registerInvoke('auth:accounts:sync', async () => ({ accounts: [], mutationAllowed: false }));
   registerInvoke('auth:accounts:switch', unsupportedAccounts);
-  registerInvoke('auth:accounts:begin-add', unsupportedAccounts);
-  registerInvoke('auth:accounts:cancel-add', async () => undefined);
+  registerInvoke('auth:accounts:begin-add', () => beginAddAccount());
+  registerInvoke('auth:accounts:cancel-add', async () => { cancelAddAccount(); });
   registerInvoke('auth:account-deletion:get-availability', unsupportedDeletion);
   registerInvoke('auth:account-deletion:request-challenge', unsupportedDeletion);
   registerInvoke('auth:account-deletion:confirm', unsupportedDeletion);

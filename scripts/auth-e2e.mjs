@@ -257,6 +257,18 @@ try {
   let logoutRejected = false;
   try { await sc.invoke('auth:logout'); } catch (err) { logoutRejected = /UNAUTHENTICATED/.test(String(err.message)); }
   check('logout rejected in local mode', logoutRejected);
+  // 本机模式侧栏菜单的「登录」走 /add-account 页：begin-add 要给出登录态，且在本机模式下能直接登录到云端。
+  const ba = await sc.invoke('auth:accounts:begin-add');
+  check('begin-add from local returns login state', ba?.success === true && ba.state?.step === 'identifier', { step: ba?.state?.step });
+  check('begin-add keeps local mode until login completes', (await sc.invoke('auth:initialize')).mode === 'local');
+  await sc.invoke('auth:accounts:cancel-add');
+  await sc.invoke('auth:accounts:begin-add');
+  await sc.invoke('auth:dispatch-login-action', { type: 'request-code', kind: 'email', identifier: email, captchaToken: 'turnstile-ok' });
+  const addLogin = await sc.invoke('auth:dispatch-login-action', { type: 'verify-code', kind: 'email', identifier: email, code: '123456' });
+  const s7 = await sc.invoke('auth:initialize');
+  check('login via add-account page from local → cloud', addLogin.success === true && s7.mode === 'cloud' && s7.isAuthenticated, { mode: s7.mode });
+  await sc.invoke('auth:logout');
+  await sc.invoke('auth:enter-local');
   check('multi-account stub returns empty list', JSON.stringify(await sc.invoke('auth:accounts:list')) === '{"accounts":[],"mutationAllowed":false}');
 
   // ── 日志不含凭据 ──
