@@ -117,6 +117,10 @@ jobs:
           CINDY_DIR: .cache/cindy
         run: node scripts/device-link-e2e.mjs
 
+      # Goal（/goal 自主续跑）：mock 模型按 [Goal] 指令回裁决块，多轮自动跑到 complete / blocked / 上限，暂停恢复，重启接着跑。
+      - name: Goal e2e
+        run: node scripts/goal-e2e.mjs
+
       # 更新签名密钥：v* 标签用仓库 secret 里的正式密钥（和 tauri.conf.json 的 pubkey 配对）；
       # 其余构建用一次性密钥并覆盖 pubkey，正式私钥不进普通 CI。
       - name: Updater signing key

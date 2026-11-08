@@ -81,6 +81,25 @@ const MIGRATIONS = [
   CREATE UNIQUE INDEX IF NOT EXISTS right_sidebar_tabs_bot_artifacts_singleton_idx
     ON right_sidebar_tabs(session_id) WHERE kind = 'bot-artifacts';
   `,
+  // v3：会话目标（Goal 自主续跑）。列名与 desktop localDb/schema.ts 的 session_goals 一致。
+  `
+  CREATE TABLE IF NOT EXISTS session_goals (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    objective TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    budget_tokens INTEGER,
+    max_turns INTEGER,
+    no_progress_limit INTEGER,
+    turns_used INTEGER NOT NULL DEFAULT 0,
+    tokens_used INTEGER NOT NULL DEFAULT 0,
+    no_progress_streak INTEGER NOT NULL DEFAULT 0,
+    usage_reset_at INTEGER,
+    last_reason TEXT,
+    agent_kind TEXT NOT NULL,
+    started_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+  `,
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

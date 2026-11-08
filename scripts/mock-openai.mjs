@@ -9,6 +9,10 @@
 // 环境变量：MOCK_PORT（默认 0 = 随机端口）；MOCK_DUMP=1 时把每个请求体写到 MOCK_DUMP_DIR（默认系统临时目录）。
 // 带 key 路径：/keyed/... 下的同名接口要求 Authorization: Bearer <MOCK_API_KEY>，否则 401。
 // 日志只记 auth: ok / missing / wrong，不记 key 本身。
+// Goal 指令（用户消息里有 "[Goal]"）：按目标里的标记吐裁决块——
+//   MOCK_GOAL_COMPLETE_AFTER=N  第 N 个 Goal 轮回复 complete，之前回复 continue；
+//   MOCK_GOAL_BLOCKED           直接回复 blocked；
+//   没有标记                    一直回复 continue（测轮数上限用）。
 // MOCK_LOG_HEADER_NAMES=1 时聊天请求日志多一个 headers 字段：只有 header 名，没有值（测转发有没有漏内部头）。
 import { createServer } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
@@ -76,6 +80,15 @@ function decide(body) {
   const userText = lastUser >= 0 ? textOf(messages[lastUser].content) : '';
   const hasToolResult = messages.slice(lastUser + 1).some((m) => m?.role === 'tool');
   if (hasToolResult) return { kind: 'text', text: 'done', reason: 'tool-result' };
+  if (userText.includes('[Goal]')) {
+    const goalTurns = messages.filter((m) => m?.role === 'user' && textOf(m.content).includes('[Goal]')).length;
+    const after = /MOCK_GOAL_COMPLETE_AFTER=(\d+)/.exec(userText);
+    let status = 'continue';
+    if (userText.includes('MOCK_GOAL_BLOCKED')) status = 'blocked';
+    else if (after && goalTurns >= Number(after[1])) status = 'complete';
+    const block = '```json\n' + JSON.stringify({ goal_status: status, reason: `mock ${status} at goal turn ${goalTurns}` }) + '\n```';
+    return { kind: 'text', text: `Working on the goal (turn ${goalTurns}).\n\n${block}`, reason: `goal-${status}` };
+  }
   if (userText.includes(TRIGGER)) {
     const tool = pickWriteTool(body.tools);
     if (tool) return { kind: 'tool', ...tool, reason: 'trigger' };

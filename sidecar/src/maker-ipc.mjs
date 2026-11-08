@@ -10,9 +10,11 @@ import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { isTerminalTurnEvent } from '@cindy/maker-core';
 import { buildMakerUserMessage } from '@cindy-desktop-shared/agentInputQueue';
+import { parseGoalCommand } from '@cindy/maker-shared/goal-command';
 
 import { emitToRenderer, registerInvoke } from './ipc.mjs';
 import { createMakerHost } from './maker-host.mjs';
+import { createGoalController } from './goal.mjs';
 
 // desktop schedulePendingPermissionTimeout 同款：permission 10 分钟无人处理按 deny 收尾。
 const PERMISSION_TIMEOUT_MS = 10 * 60 * 1000;
@@ -41,6 +43,8 @@ function dialogueDir(dataDir, sessionId, now = new Date()) {
 }
 
 export function registerMakerIpc({ dataDir, db, models, agentManifestDir, host: injectedHost }) {
+  // Goal 控制器在文件末尾创建，这里先留钩子，回合结束时调用。
+  const goalHooks = { userTurnSettled: null };
   const host = injectedHost ?? createMakerHost({ dataDir, models, agentManifestDir });
   const { maker } = host;
 
@@ -175,6 +179,7 @@ export function registerMakerIpc({ dataDir, db, models, agentManifestDir, host: 
     s.activeTurn = null;
     void upsertRow(sessionId, {});
     syncSdkSessionId(sessionId);
+    goalHooks.userTurnSettled?.(sessionId);
     pushProjection(sessionId);
     if (s.pendingSelection) {
       const sel = s.pendingSelection;
@@ -712,10 +717,133 @@ export function registerMakerIpc({ dataDir, db, models, agentManifestDir, host: 
   };
   registerInvoke('maker:any-session-in-turn', async () => anySessionInTurn());
 
+  // ── Goal（会话内自主续跑，/goal）──────────────────────────────────────────
+  const goal = createGoalController({
+    sql: db.sql,
+    getSession: (sid) => maker.getSession(sid) ?? undefined,
+    ensureSession: async (sid) => {
+      const live = maker.getSession(sid);
+      if (live && live.getStatus() !== 'closed') return live;
+      const row = readSessionRow(sid);
+      if (!row) return undefined;
+      // 重启后目标续跑：按库里记的模型 / 来源 / 工作目录重建，Pi 会话文件由 createSession 续接。
+      return createSession({
+        agentKind: 'pi', id: sid, model: row.model, providerId: row.providerId ?? null,
+        workingDir: row.workingDir ?? undefined, permissionMode: row.permissionMode ?? 'ask',
+        workspaceKind: row.workspaceKind === 'project' ? 'project' : 'dialogue',
+      });
+    },
+    isSessionInTurn: (sid) => inTurn(sid),
+    stopTurn: (sid) => {
+      const session = maker.getSession(sid);
+      cancelInteractionsForSession(sid, 'session_aborted');
+      if (session) void session.abort().catch(() => undefined);
+    },
+    emit: (channel, payload) => emitToRenderer(channel, payload),
+    onTurnEnd: (sid) => { void pump(sid); },
+    log: (level, msg) => process.stderr.write(`[goal] ${level} ${msg}\n`),
+  });
+
+  // 用户输入的回合结束后，active 目标接着跑；目标发起的回合不占用户的输入队列。
+  goalHooks.userTurnSettled = (sid) => goal.noteSessionIdle(sid);
+
+  const requireString = (value, name) => {
+    if (typeof value !== 'string' || !value) fail('INVALID_PARAMS', `${name} required`);
+    return value;
+  };
+  const requireObject = (value, name) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) fail('INVALID_PARAMS', `${name} must be an object`);
+    return value;
+  };
+  const goalCall = async (fn) => {
+    try { return await fn(); } catch (err) {
+      const code = /^\[([A-Z_]+)\]/.exec(String(err?.message))?.[1];
+      if (code) throw err;
+      process.stderr.write(`[goal] unexpected error: ${err?.message ?? err}\n`);
+      throw new Error('[INTERNAL] goal operation failed');
+    }
+  };
+  registerInvoke('maker:goal:set', (input) => goalCall(async () => {
+    const o = requireObject(input, 'goal');
+    const sessionId = requireString(o.sessionId, 'sessionId');
+    const objective = requireString(o.objective, 'objective');
+    let limits;
+    if (o.limits !== undefined) {
+      const l = requireObject(o.limits, 'limits');
+      for (const k of ['maxTurns', 'budgetTokens', 'noProgressLimit']) {
+        if (l[k] !== null && typeof l[k] !== 'number') fail('INVALID_PARAMS', `${k} must be a number or null`);
+      }
+      limits = { maxTurns: l.maxTurns, budgetTokens: l.budgetTokens, noProgressLimit: l.noProgressLimit };
+    }
+    await goal.setGoal({ sessionId, objective, ...(limits ? { limits } : {}) });
+    return { ok: true };
+  }));
+  registerInvoke('maker:goal:clear', (sessionId) => goalCall(async () => { await goal.clearGoal(requireString(sessionId, 'sessionId')); return { ok: true }; }));
+  registerInvoke('maker:goal:pause', (sessionId) => goalCall(async () => { await goal.pauseGoal(requireString(sessionId, 'sessionId')); return { ok: true }; }));
+  registerInvoke('maker:goal:resume', (sessionId) => goalCall(async () => { await goal.resumeGoal(requireString(sessionId, 'sessionId')); return { ok: true }; }));
+  registerInvoke('maker:goal:update', (input) => goalCall(async () => {
+    const o = requireObject(input, 'goal');
+    const sessionId = requireString(o.sessionId, 'sessionId');
+    const raw = requireObject(o.patch, 'patch');
+    const patch = {};
+    if (raw.objective !== undefined) patch.objective = requireString(raw.objective, 'objective');
+    for (const k of ['maxTurns', 'budgetTokens', 'noProgressLimit']) {
+      if (raw[k] === undefined) continue;
+      if (raw[k] !== null && typeof raw[k] !== 'number') fail('INVALID_PARAMS', `${k} must be a number or null`);
+      patch[k] = raw[k];
+    }
+    const updated = await goal.updateGoal(sessionId, patch);
+    if (!updated) fail('GOAL_NOT_FOUND', 'goal not found');
+    return { ok: true };
+  }));
+  registerInvoke('maker:goal:get-status', (sessionId) => goalCall(async () => {
+    const sid = requireString(sessionId, 'sessionId');
+    const status = goal.getStatus(sid);
+    // 打开会话时顺带把没在跑的 active 目标接着跑（desktop resumeOnOpen）。
+    if (status && (status.status === 'active' || status.status === 'usageLimited')) await goal.resumeOnOpen(sid);
+    return goal.getStatus(sid);
+  }));
+
+  // 斜杠命令里的 desktop 命令：这里只有 /goal（其余命令依赖 desktop 独有的功能）。
+  registerInvoke('maker:list-desktop-commands', async () => ({
+    success: true,
+    commands: [{
+      kind: 'desktop', name: 'goal',
+      description: 'Set an autonomous goal — the agent keeps working across turns until it is met, blocked, or the budget runs out. Usage: /goal <condition>. Clear with /goal clear.',
+    }],
+  }));
+  registerInvoke('maker:execute-desktop-command', async (name, ctx) => {
+    if (typeof name !== 'string' || !name) fail('INVALID_PARAMS', 'name required');
+    if (name !== 'goal') return { success: false, error: 'NOT_IMPLEMENTED' };
+    const c = ctx && typeof ctx === 'object' && !Array.isArray(ctx) ? ctx : {};
+    const arg = typeof c.args === 'string' ? c.args.trim() : '';
+    const sessionId = typeof c.sessionId === 'string' ? c.sessionId : undefined;
+    const trigger = (extra) => emitToRenderer('maker:desktop-command-triggered', {
+      command: 'goal', ...(sessionId ? { sessionId } : {}), ...(c.workingDir ? { workingDir: c.workingDir } : {}), ...(arg ? { args: arg } : {}), ...extra,
+    });
+    if (!sessionId) { trigger({ error: 'goal-no-session' }); return { success: true }; }
+    const command = parseGoalCommand(arg);
+    try {
+      if (command.action === 'clear') { await goal.clearGoal(sessionId); trigger({ goalAction: 'cleared' }); }
+      else if (command.action === 'open-dialog') trigger({ goalAction: 'open-dialog' });
+      else { await goal.setGoal({ sessionId, objective: arg }); trigger({ goalAction: 'set' }); }
+    } catch (err) {
+      process.stderr.write(`[goal] /goal failed: ${String(err?.message ?? err).split('\n', 1)[0].slice(0, 200)}\n`);
+      trigger({ error: 'goal-failed' });
+    }
+    return { success: true };
+  });
+
+  // 启动后把还在跑的目标接着跑（等所有 IPC 注册完、模型就绪）。
+  setTimeout(() => {
+    try { const n = goal.resumeActiveGoals(); if (n) process.stderr.write(`[goal] resumed ${n} goal(s) after start\n`); }
+    catch (err) { process.stderr.write(`[goal] resume after start failed: ${err?.message ?? err}\n`); }
+  }, 2_000).unref?.();
+
   return {
     host,
     anySessionInTurn,
     isTurnRunning: (sid) => getState(sid).activeTurn !== null || (maker.getSession(sid)?.isTurnRunning() ?? false),
-    shutdown: () => host.shutdown(),
+    shutdown: () => { goal.dispose(); return host.shutdown(); },
   };
 }
