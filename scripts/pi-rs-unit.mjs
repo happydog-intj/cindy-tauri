@@ -1,0 +1,15 @@
+import assert from 'node:assert/strict';
+import { writeFileSync, mkdtempSync } from 'node:fs';
+import os from 'node:os'; import path from 'node:path';
+import { choosePiBinary, piRsPath } from '../sidecar/src/pi-rs.mjs';
+const tmp = mkdtempSync(path.join(os.tmpdir(), 'pirs-unit-')); const bin = path.join(tmp, 'pi'); writeFileSync(bin, '#!/bin/sh\n');
+assert.equal(piRsPath({}), null);
+assert.equal(piRsPath({ CINDY_PI_RS: '/nonexistent/pi' }), null);
+assert.equal(piRsPath({ CINDY_PI_RS: tmp }), null, 'directory is not a binary');
+assert.deepEqual(choosePiBinary({ original: 'orig', env: {} }), { binary: 'orig', use: false, reason: 'disabled' });
+assert.equal(choosePiBinary({ original: 'orig', env: { CINDY_PI_RS: '/nope' } }).reason, 'pi-rs binary not found');
+assert.deepEqual(choosePiBinary({ original: 'orig', needs: [], env: { CINDY_PI_RS: bin } }), { binary: bin, use: true, reason: 'ok' });
+const r = choosePiBinary({ original: 'orig', needs: ['subagent', 'mcp'], env: { CINDY_PI_RS: bin } });
+assert.equal(r.use, false); assert.equal(r.binary, 'orig'); assert.equal(r.reason, 'needs subagent,mcp');
+assert.equal(choosePiBinary({ original: 'orig', needs: ['unknown-feature'], env: { CINDY_PI_RS: bin } }).use, true);
+console.log('pi-rs-unit ok');

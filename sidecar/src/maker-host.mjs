@@ -10,6 +10,7 @@ import { mkdirSync } from 'node:fs';
 import { Maker, PiAgent } from '@cindy/maker-core';
 
 import { agentStatus, installAgent } from './agents.mjs';
+import { piRsPath } from './pi-rs.mjs';
 import { SqliteSessionStorage } from './maker-storage.mjs';
 import {
   gatewayEndpoint,
@@ -88,6 +89,12 @@ export function createMakerHost({ dataDir, models, agentManifestDir, logger = st
   const piCtx = { manifestDir: agentManifestDir, dataDir };
   // 二进制路径在装好之前就确定（agents.mjs 的固定安装位置）；createSession 前再确保已安装。
   const status = agentStatus('pi', piCtx);
+  // 实验开关：CINDY_PI_RS=<pi-rs 二进制> 让所有会话改用 Rust 版 Pi（内存约 10MB 对 300MB）。
+  // maker-core 在构造 PiAgent 时固定二进制，不能按会话切换，所以这是全局开关，默认关闭。
+  // pi-rs 目前没有 bridge 扩展里的纯文本轮策略、vision、ask_user_question、provider 热刷新、
+  // plan 模式、MCP 和子代理；用到这些的会话请不要打开。
+  const rsBinary = piRsPath();
+  if (rsBinary) logger.warn('using experimental pi-rs runtime', { binary: rsBinary });
   const agentHome = path.join(dataDir, 'pi-agent-home');
   // Pi 原生全局上下文目录也放进数据目录，避免读到用户 ~/.pi/agent 的配置。
   const globalContextHome = path.join(dataDir, 'pi-global-context');
@@ -127,7 +134,7 @@ export function createMakerHost({ dataDir, models, agentManifestDir, logger = st
   const agent = new PiAgent({
     auth,
     runtimeConfig,
-    binaryPath: status.binary,
+    binaryPath: rsBinary ?? status.binary,
     logger: logger.child('pi'),
     resolvePiAgentHome: () => agentHome,
     resolvePiGlobalContextHome: () => globalContextHome,
