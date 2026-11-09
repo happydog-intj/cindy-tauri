@@ -89,12 +89,15 @@ export function createMakerHost({ dataDir, models, agentManifestDir, logger = st
   const piCtx = { manifestDir: agentManifestDir, dataDir };
   // 二进制路径在装好之前就确定（agents.mjs 的固定安装位置）；createSession 前再确保已安装。
   const status = agentStatus('pi', piCtx);
-  // 实验开关：CINDY_PI_RS=<pi-rs 二进制> 让所有会话改用 Rust 版 Pi（内存约 10MB 对 300MB）。
-  // maker-core 在构造 PiAgent 时固定二进制，不能按会话切换，所以这是全局开关，默认关闭。
-  // pi-rs 目前没有 bridge 扩展里的纯文本轮策略、vision、ask_user_question、provider 热刷新、
-  // plan 模式、MCP 和子代理；用到这些的会话请不要打开。
+  // 实验开关：CINDY_PI_RS=<pi-rs 二进制> 让会话改用 Rust 版 Pi（内存约 10MB 对 300MB）。默认关闭。
+  // maker-core 在构造 PiAgent 时固定二进制，不能按会话切换，所以由 pi-rs 自己判断：会话用到它没有的能力
+  // （子代理/其他扩展、skill、MCP、vision、受邀者托管、原生 provider 适配）时，pi-rs 启动即 exec 原版 Pi，
+  // 原版路径经 CINDY_PI_FALLBACK_BINARY 传入。bash 环境剔除密钥、ask_user_question、纯文本轮、分支切换由 pi-rs 自己实现。
   const rsBinary = piRsPath();
-  if (rsBinary) logger.warn('using experimental pi-rs runtime', { binary: rsBinary });
+  if (rsBinary) {
+    process.env.CINDY_PI_FALLBACK_BINARY = status.binary;
+    logger.warn('using experimental pi-rs runtime', { binary: rsBinary, fallback: status.binary });
+  }
   const agentHome = path.join(dataDir, 'pi-agent-home');
   // Pi 原生全局上下文目录也放进数据目录，避免读到用户 ~/.pi/agent 的配置。
   const globalContextHome = path.join(dataDir, 'pi-global-context');

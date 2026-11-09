@@ -1,6 +1,7 @@
 // 可选的 Rust 版 Pi（pi-rs）：用 CINDY_PI_RS=<二进制路径> 开启，默认不启用。
-// pi-rs 只实现 Cindy 常规会话用到的 RPC 子集；会话依赖它没有的能力时一律回退到原版 Pi，
-// 这样打开开关不会让任何功能静默变少。
+// pi-rs 只实现 Cindy 常规会话用到的 RPC 子集。会话依赖它没有的能力时由 pi-rs 自己 exec 原版 Pi
+// （见 pi-rs/src/main.rs fallback_reason，原版路径经 CINDY_PI_FALLBACK_BINARY 传入）。
+// 下面的 choosePiBinary 是宿主侧的同一份判断，供不想依赖 pi-rs 内部逻辑的调用方使用。
 import { existsSync, statSync } from 'node:fs';
 
 // 原版 Pi 带、pi-rs 没有的能力。会话启动时 maker-core 会把这些写进参数/扩展，
