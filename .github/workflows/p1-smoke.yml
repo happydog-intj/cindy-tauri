@@ -80,6 +80,17 @@ jobs:
       - name: Bundle native modules into sidecar
         run: npm run native:fetch -- ${{ matrix.triple }}
 
+      # Pi 是随包的 Rust 实现（pi-rs，源码在 pi-rs/）：编译后放到 sidecar/dist/pi-rs/，随 Tauri 资源打进安装包。
+      # 之后所有会话类 e2e 和冒烟都用它，不再下载原版 Pi。
+      - name: Build pi-rs (Rust Pi)
+        run: npm run pirs:build -- ${{ matrix.triple }}
+
+      - name: pi-rs unit tests
+        run: cargo test --release --locked --manifest-path pi-rs/Cargo.toml
+
+      - name: pi-rs resolution unit test
+        run: node scripts/pi-rs-unit.mjs
+
       # 桌面外壳 IPC（通知 / 角标 / 对话框 / 打开链接 / 关闭行为 / 托盘文案），脚本扮演 Rust 回反向调用。
       # sidecar 启动需要 headless/ 已打包，放在 headless:fetch 之后。
       - name: Desktop shell e2e

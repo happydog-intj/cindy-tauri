@@ -1,0 +1,32 @@
+[package]
+name = "pi-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Cindy 用的 Pi RPC 子集的 Rust 实现（原型）"
+publish = false
+
+[[bin]]
+name = "pi"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std", "process", "sync", "time", "fs"] }
+reqwest = { version = "0.13", default-features = false, features = ["stream", "json", "native-tls", "http2"] }
+futures-util = "0.3"
+uuid = { version = "1", features = ["v7", "v4"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+rand = "0.10"
+regex-lite = "0.1"
+ignore = "0.4"
+globset = "0.4"
+regex = "1.13.1"
+base64 = "0.23.1"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
+panic = "abort"

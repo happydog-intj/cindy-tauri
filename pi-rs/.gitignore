@@ -1,0 +1,5 @@
+target/
+# pi-rs 自己的录制输出，可用 baseline/*.mjs 重新生成；原版的录制（*orig*）是对照基准，要提交
+baseline/rs*.jsonl
+baseline/*-rs.jsonl
+baseline/*-rs.session.jsonl

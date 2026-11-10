@@ -1,0 +1,89 @@
+{
+ "default": {
+  "args": [
+   "--no-context-files"
+  ]
+ },
+ "ctx": {
+  "files": {
+   "AGENTS.md": "ROOT",
+   "sub/CLAUDE.md": "SUB",
+   "sub/deep/AGENTS.md": "DEEP",
+   "GLOBAL/AGENTS.md": "GLOBAL"
+  }
+ },
+ "ctx-override": {
+  "files": {
+   "AGENTS.md": "A",
+   "AGENTS.override.md": "OVR",
+   "CLAUDE.md": "C"
+  }
+ },
+ "ctx-claude-only": {
+  "files": {
+   "sub/CLAUDE.md": "CL"
+  }
+ },
+ "append2": {
+  "args": [
+   "--no-context-files",
+   "--append-system-prompt",
+   "/tmp/app1.txt",
+   "--append-system-prompt",
+   "/tmp/app2.txt"
+  ]
+ },
+ "append-text": {
+  "args": [
+   "--no-context-files",
+   "--append-system-prompt",
+   "literal text here"
+  ]
+ },
+ "tools-ro": {
+  "args": [
+   "--no-context-files",
+   "--tools",
+   "read,grep,find,ls"
+  ]
+ },
+ "tools-bash-ls": {
+  "args": [
+   "--no-context-files",
+   "--tools",
+   "read,bash,grep,find,ls"
+  ]
+ },
+ "tools-wrb": {
+  "args": [
+   "--no-context-files",
+   "--tools",
+   "write,read,bash"
+  ]
+ },
+ "tools-ls-read": {
+  "args": [
+   "--no-context-files",
+   "--tools",
+   "ls,read"
+  ]
+ },
+ "tools-fg": {
+  "args": [
+   "--no-context-files",
+   "--tools",
+   "find,grep"
+  ]
+ },
+ "all-together": {
+  "files": {
+   "AGENTS.md": "R"
+  },
+  "args": [
+   "--tools",
+   "read,bash,edit,write,grep,find,ls",
+   "--append-system-prompt",
+   "/tmp/app1.txt"
+  ]
+ }
+}

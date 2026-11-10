@@ -10,7 +10,6 @@ import { mkdirSync } from 'node:fs';
 import { Maker, PiAgent } from '@cindy/maker-core';
 
 import { agentStatus, installAgent } from './agents.mjs';
-import { piRsPath } from './pi-rs.mjs';
 import { SqliteSessionStorage } from './maker-storage.mjs';
 import {
   gatewayEndpoint,
@@ -89,15 +88,9 @@ export function createMakerHost({ dataDir, models, agentManifestDir, logger = st
   const piCtx = { manifestDir: agentManifestDir, dataDir };
   // 二进制路径在装好之前就确定（agents.mjs 的固定安装位置）；createSession 前再确保已安装。
   const status = agentStatus('pi', piCtx);
-  // 实验开关：CINDY_PI_RS=<pi-rs 二进制> 让会话改用 Rust 版 Pi（内存约 10MB 对 300MB）。默认关闭。
-  // maker-core 在构造 PiAgent 时固定二进制，不能按会话切换，所以由 pi-rs 自己判断：会话用到它没有的能力
-  // （子代理/其他扩展、skill、MCP、vision、受邀者托管、原生 provider 适配）时，pi-rs 启动即 exec 原版 Pi，
-  // 原版路径经 CINDY_PI_FALLBACK_BINARY 传入。bash 环境剔除密钥、ask_user_question、纯文本轮、分支切换由 pi-rs 自己实现。
-  const rsBinary = piRsPath();
-  if (rsBinary) {
-    process.env.CINDY_PI_FALLBACK_BINARY = status.binary;
-    logger.warn('using experimental pi-rs runtime', { binary: rsBinary, fallback: status.binary });
-  }
+  // Pi 是随包的 Rust 实现（pi-rs），没有原版可回退。会话用到 pi-rs 没有的能力（子代理/其他扩展、skill、MCP、
+  // vision、受邀者托管、原生 provider 适配）时，pi-rs 照常运行，这些能力静默缺失；启动日志里会标出
+  // `[pi-rs] session=… runtime=pi-rs unsupported=…`，便于统计哪些功能被用到了。
   const agentHome = path.join(dataDir, 'pi-agent-home');
   // Pi 原生全局上下文目录也放进数据目录，避免读到用户 ~/.pi/agent 的配置。
   const globalContextHome = path.join(dataDir, 'pi-global-context');
@@ -137,7 +130,7 @@ export function createMakerHost({ dataDir, models, agentManifestDir, logger = st
   const agent = new PiAgent({
     auth,
     runtimeConfig,
-    binaryPath: rsBinary ?? status.binary,
+    binaryPath: status.binary,
     logger: logger.child('pi'),
     resolvePiAgentHome: () => agentHome,
     resolvePiGlobalContextHome: () => globalContextHome,
@@ -183,7 +176,7 @@ export function createMakerHost({ dataDir, models, agentManifestDir, logger = st
     piStatus: () => agentStatus('pi', piCtx),
     async ensurePiInstalled() {
       if (agentStatus('pi', piCtx).installed) return;
-      logger.info('pi binary missing, installing on demand', { version: status.version });
+      logger.error('bundled pi-rs missing', { binary: status.binary });
       await installAgent('pi', piCtx);
     },
     // 钥匙串主密钥到位（或确认不可用）后再解析模型，避免启动瞬间带 key 的 provider 被当成未连接。

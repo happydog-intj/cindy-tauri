@@ -1,6 +1,6 @@
 {
   "name": "cindy-tauri",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "private": true,
   "type": "module",
   "scripts": {
@@ -8,6 +8,7 @@
     "node:fetch": "node scripts/fetch-node.mjs",
     "headless:fetch": "node scripts/fetch-headless.mjs",
     "native:fetch": "node scripts/fetch-native.mjs",
+    "pirs:build": "node scripts/build-pi-rs.mjs",
     "tauri": "tauri"
   },
   "devDependencies": {
