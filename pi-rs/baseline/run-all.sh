@@ -1,7 +1,7 @@
 #!/bin/bash
 # 回归入口：编译 pi-rs，然后跑 单元测试、系统提示对照、工具输出对照、export_html 对照。
 # 需要原版 Pi（默认路径见 ORIG），对照 find 时需要 fd（PATH 里没有则 find 的原版结果是报错，会被标出来）。
-# 加 --e2e：再用刚编译的 pi-rs（CINDY_PI_RS）跑 Cindy 的四套 e2e。
+# 加 --e2e：再用刚编译的 pi-rs（CINDY_PI_RS）跑 Cindy 的四套 e2e。加 --real：再对本机 brconnector 网关跑真实模型检查。
 # 对照类测试需要原版 Pi 二进制（只用来对照，不随包；ORIG 可覆盖路径）。没有原版时跳过对照类，只跑 pi-rs 自身的测试。
 set -u
 cd "$(dirname "$0")/.."
@@ -70,7 +70,20 @@ step "bridge behaviour"; (cd $B && PI_BIN="$PI" run 60 node bridge-test.mjs) >$T
 step "stress (3x150 rounds)"; for sd in 1 2 3; do (cd $B && PI_BIN="$PI" SEED=$sd ROUNDS=150 run 250 node stress-test.mjs) >>$T/stress.log 2>&1 || { false; break; }; done; res $? $T/stress.log
 step "per-session fallback"; PI_BIN="$PI" run 60 node $B/fallback-test.mjs >$T/fb.log 2>&1; res $? $T/fb.log
 
-if [ "${1:-}" = "--e2e" ]; then
+# 真实网关检查（需要本机 Cindy 的 brconnector 代理，没有就跳过）。加 --real 才跑，耗时几分钟、会消耗模型额度。
+HAS_REAL=0; HAS_E2E=0; for a in "$@"; do [ "$a" = "--real" ] && HAS_REAL=1; [ "$a" = "--e2e" ] && HAS_E2E=1; done
+if [ $HAS_REAL = 1 ]; then
+  if ! curl -s -m 5 -o /dev/null http://127.0.0.1:30001/brconnector/models; then
+    step "real gateway"; echo "skipped (no gateway at 127.0.0.1:30001)"
+  else
+    step "real: anthropic basics"; (cd $B && PI_BIN="$PI" LEVELS=off,low,high CW=2600 RESERVE=600 KEEP=300 EXTRA=5 run 400 node real-anthropic.mjs) >$T/real1.log 2>&1; res $? $T/real1.log
+    step "real: thinking blocks"; rc=0; for cfg in "anthropic-messages claude-shein-glm-5.3-flashx" "openai-completions claude-shein-deepseek-v4.1-flash"; do set -- $cfg; (cd $B && PI_BIN="$PI" API=$1 MODEL=$2 run 300 node real-think.mjs) >>$T/real2.log 2>&1 || rc=1; done; res $rc $T/real2.log
+    step "real: auto compaction"; (cd $B && PI_BIN="$PI" API=anthropic-messages MODEL=claude-shein-shannon-auto LINES=60 run 400 node real-autocompact.mjs) >$T/real3.log 2>&1; res $? $T/real3.log
+    step "real: overflow recovery"; (cd $B && PI_BIN="$PI" MODEL=claude-shein-shannon-free CHUNK=20000 MSGS=5 run 1500 node real-overflow.mjs) >$T/real4.log 2>&1; res $? $T/real4.log
+  fi
+fi
+
+if [ $HAS_E2E = 1 ]; then
   for n in session goal model-switch settings; do
     step "cindy e2e: $n"; D=$(mktemp -d /tmp/e2e-X.XXXX)
     (cd .. && CINDY_PI_RS="$PI" CINDY_E2E_DATA_DIR=$D run 170 node scripts/$n-e2e.mjs) >$T/e2e-$n.log 2>&1
