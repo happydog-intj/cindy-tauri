@@ -4,6 +4,8 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncReadExt;
 
+/// 没有超时限制时用的秒数：约 31 年。f64::MAX 之类的值转成 Duration 会 panic（整个进程崩溃）。
+const NO_TIMEOUT: f64 = 1.0e9;
 const MAX_LINES: usize = 2000;
 const MAX_BYTES: usize = 50 * 1024;
 
@@ -105,8 +107,8 @@ async fn edit(a: &Value, cwd: &str) -> Result<String, String> {
 async fn bash(a: &Value, cwd: &str, bridge: bool) -> Result<String, String> {
     let cmd = s(a, "command")?;
     let timeout = match &a["timeout"] {
-        Value::Null if !bridge => f64::MAX / 4.0,
-        Value::Number(n) if !bridge => n.as_f64().filter(|t| *t > 0.0).unwrap_or(f64::MAX / 4.0),
+        Value::Null if !bridge => NO_TIMEOUT,
+        Value::Number(n) if !bridge => n.as_f64().filter(|t| t.is_finite() && *t > 0.0).unwrap_or(NO_TIMEOUT).min(NO_TIMEOUT),
         Value::Null => 300.0,
         Value::Number(n) => {
             let t = n.as_f64().unwrap_or(0.0);
@@ -127,7 +129,7 @@ async fn bash(a: &Value, cwd: &str, bridge: bool) -> Result<String, String> {
         a
     };
     let run = async { let o = reader.await; let st = child.wait().await; (o, st) };
-    let res = match tokio::time::timeout(std::time::Duration::from_secs_f64(timeout), run).await {
+    let res = match tokio::time::timeout(std::time::Duration::from_secs_f64(timeout.clamp(0.0, NO_TIMEOUT)), run).await {
         Ok(r) => r,
         Err(_) => return Err(format!("Command timed out after {timeout} seconds")),
     };
@@ -334,4 +336,24 @@ fn scrub_env(c: &mut tokio::process::Command) {
         if names.contains(&k) || (k.starts_with("CINDY_PI_KEY_") && k[13..].chars().all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')) { c.env_remove(&k); }
     }
     if let Ok(home) = std::env::var("CINDY_PI_BASH_PACKAGE_HOME") { if !home.is_empty() { c.env("PI_CODING_AGENT_DIR", home); } }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // 回归：不带 cindy-bridge 时 bash 没有超时，曾因 f64::MAX 转 Duration 而 panic。
+    #[tokio::test]
+    async fn bash_without_timeout_does_not_panic() {
+        for bridge in [false, true] {
+            let (out, err) = run("bash", &json!({"command": "echo hi"}), ".", bridge).await;
+            assert!(!err, "{out}");
+            assert_eq!(out.trim(), "hi");
+        }
+        let (out, err) = run("bash", &json!({"command": "echo hi", "timeout": 1e300}), ".", false).await;
+        assert!(!err && out.trim() == "hi", "{out}");
+        let (out, err) = run("bash", &json!({"command": "sleep 5", "timeout": 0.2}), ".", false).await;
+        assert!(err && out.contains("timed out"), "{out}");
+    }
 }
