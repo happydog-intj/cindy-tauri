@@ -91,10 +91,14 @@ function sessionDetail(result) {
 function findPlaintext(dir, needle, hits = [], base = dir) {
   for (const name of readdirSync(dir)) {
     const p = path.join(dir, name);
-    const st = statSync(p);
+    // 应用刚退出时 SQLite 还在收尾，-wal / -shm 会在 readdir 之后消失；文件没了就没有明文可查，跳过。
+    let st;
+    try { st = statSync(p); } catch (e) { if (e?.code === 'ENOENT') continue; throw e; }
     if (st.isDirectory()) { if (name !== 'agents') findPlaintext(p, needle, hits, base); continue; }
     if (st.size > 20 * 1024 * 1024) continue;
-    if (readFileSync(p).includes(needle)) hits.push(path.relative(base, p));
+    let data;
+    try { data = readFileSync(p); } catch (e) { if (e?.code === 'ENOENT') continue; throw e; }
+    if (data.includes(needle)) hits.push(path.relative(base, p));
   }
   return hits;
 }
