@@ -820,6 +820,23 @@ export function registerMakerIpc({ dataDir, db, models, agentManifestDir, host: 
       description: 'Set an autonomous goal — the agent keeps working across turns until it is met, blocked, or the budget runs out. Usage: /goal <condition>. Clear with /goal clear.',
     }],
   }));
+  // 输入 / 的补全面板：agent 内置命令 + 用户/项目目录里的 skill。失败按空列表处理，不阻塞面板。
+  registerInvoke('maker:list-agent-commands', async (agentKind) => {
+    try {
+      return { success: true, commands: maker.listAgentCommands(String(agentKind)) };
+    } catch (err) {
+      return { success: false, error: String(err?.message ?? err) };
+    }
+  });
+  registerInvoke('maker:list-agent-skills', async (agentKind, params) => {
+    try {
+      const p = params && typeof params === 'object' && !Array.isArray(params) ? params : {};
+      const result = await maker.listAgentSkills(String(agentKind), p);
+      return { success: true, ...result };
+    } catch (err) {
+      return { success: false, error: String(err?.message ?? err) };
+    }
+  });
   registerInvoke('maker:execute-desktop-command', async (name, ctx) => {
     if (typeof name !== 'string' || !name) fail('INVALID_PARAMS', 'name required');
     if (name !== 'goal') return { success: false, error: 'NOT_IMPLEMENTED' };
