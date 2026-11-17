@@ -548,6 +548,14 @@ export function registerMakerIpc({ dataDir, db, models, agentManifestDir, host: 
     }
   });
 
+  // 渲染层换模型时总会先走这个通道。Tauri 版只有 Pi 一个引擎：同引擎 = no-op 成功（带修订号），
+  // 渲染层随后按 same-engine-reselect 自己调用 maker:set-model；跨引擎不支持。
+  registerInvoke('maker:switch-session-agent', async (sessionId, targetAgentKind, model) => {
+    requireSessionId(sessionId);
+    if (targetAgentKind !== 'pi') fail('UNSUPPORTED_CAPABILITY', `agent ${targetAgentKind} is not available in the Tauri build`);
+    return { switched: false, agentKind: 'pi', model, engineReady: true, sameEngineRevision: 0 };
+  });
+
   registerInvoke('maker:set-model', (sessionId, model, providerId, expectedRevision, selection) =>
     setModel(sessionId, model, providerId, expectedRevision, selection));
 

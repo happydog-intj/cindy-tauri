@@ -90,6 +90,7 @@ impl Registry {
                 let api = p.get("api").and_then(Value::as_str).unwrap_or("openai-completions");
                 for m in p.get("models").and_then(Value::as_array).into_iter().flatten() {
                     let Some(id) = m.get("id").and_then(Value::as_str) else { continue };
+                    let base_url = m.get("baseUrl").and_then(Value::as_str).filter(|u| !u.is_empty()).unwrap_or(base_url);
                     if base_url.is_empty() {
                         return Err(format!("Provider {pid}: \"baseUrl\" is required when defining custom models."));
                     }
