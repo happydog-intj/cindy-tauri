@@ -837,6 +837,11 @@ export function registerMakerIpc({ dataDir, db, models, agentManifestDir, host: 
       return { success: false, error: String(err?.message ?? err) };
     }
   });
+  // Tauri 版没有 git 上下文服务：只读查询按「没有 PR / 不在 git 仓库」返回空结果，
+  // 否则渲染层会把 NOT_IMPLEMENTED 当失败，每 2 秒重试 pr-refs:list-all。
+  registerInvoke('git-context:pr-refs:list-all', async () => []);
+  registerInvoke('git-context:pr-refs:list', async () => []);
+  registerInvoke('git-context:get-for-session', async () => ({ workdir: null, head: null, source: null }));
   registerInvoke('maker:execute-desktop-command', async (name, ctx) => {
     if (typeof name !== 'string' || !name) fail('INVALID_PARAMS', 'name required');
     if (name !== 'goal') return { success: false, error: 'NOT_IMPLEMENTED' };
