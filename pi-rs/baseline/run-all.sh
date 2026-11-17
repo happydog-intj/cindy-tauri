@@ -79,7 +79,7 @@ if [ $HAS_REAL = 1 ]; then
     step "real: anthropic basics"; (cd $B && PI_BIN="$PI" LEVELS=off,low,high CW=2600 RESERVE=600 KEEP=300 EXTRA=5 run 400 node real-anthropic.mjs) >$T/real1.log 2>&1; res $? $T/real1.log
     step "real: thinking blocks"; rc=0; for cfg in "anthropic-messages claude-shein-glm-5.3-flashx" "openai-completions claude-shein-deepseek-v4.1-flash"; do set -- $cfg; (cd $B && PI_BIN="$PI" API=$1 MODEL=$2 run 300 node real-think.mjs) >>$T/real2.log 2>&1 || rc=1; done; res $rc $T/real2.log
     step "real: auto compaction"; (cd $B && PI_BIN="$PI" API=anthropic-messages MODEL=claude-shein-shannon-auto LINES=60 run 400 node real-autocompact.mjs) >$T/real3.log 2>&1; res $? $T/real3.log
-    step "real: overflow recovery"; (cd $B && PI_BIN="$PI" MODEL=claude-shein-shannon-free CHUNK=20000 MSGS=5 run 1500 node real-overflow.mjs) >$T/real4.log 2>&1; res $? $T/real4.log
+    step "real: overflow recovery"; (cd $B && PI_BIN="$PI" MODEL=claude-shein-shannon-free CHUNK=20000 MSGS=5 run 3000 node real-overflow.mjs) >$T/real4.log 2>&1; res $? $T/real4.log
   fi
 fi
 

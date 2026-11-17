@@ -13,7 +13,7 @@ writeFileSync(a + '/models.json', JSON.stringify({ providers: { gw: { baseUrl: '
 writeFileSync(a + '/settings.json', JSON.stringify({ retry: { maxRetries: 1, baseDelayMs: 100 }, compaction: { reserveTokens: 20000, keepRecentTokens: 30000 } }));
 const child = spawn(process.env.PI_BIN, ['--mode', 'rpc', '--no-extensions', '--no-skills', '--no-context-files', '--no-prompt-templates', '--session-dir', s, '--provider', 'gw', '--model', MODEL],
   { cwd: w, env: { ...process.env, PI_CODING_AGENT_DIR: a, PI_OFFLINE: '1' }, stdio: ['pipe', 'pipe', 'inherit'] });
-const out = []; let buf = ''; child.stdout.on('data', d => { buf += d; let i; while ((i = buf.indexOf('\n')) >= 0) { out.push(JSON.parse(buf.slice(0, i))); buf = buf.slice(i + 1); } });
+const out = []; let buf = ''; child.stdout.on('data', d => { buf += d; let i; while ((i = buf.indexOf('\n')) >= 0) { { const ev = JSON.parse(buf.slice(0, i)); ev._t = Date.now(); out.push(ev); } buf = buf.slice(i + 1); } });
 const send = o => child.stdin.write(JSON.stringify(o) + '\n');
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const until = async (f, from, ms = 280000) => { const t = Date.now(); while (Date.now() - t < ms) { if (out.slice(from).some(f)) return true; await sleep(100); } return false; };
@@ -25,7 +25,11 @@ const chunk = Array.from({ length: CHUNK }, (_, i) => 'w' + i).join(' ');
 let overflowSeen = false;
 for (let i = 0; i < Number(process.env.MSGS || 4); i++) {
   k = out.length; send({ id: 'm' + i, type: 'prompt', message: `Part ${i}:\n` + chunk + '\n\nReply with exactly: ack' + i });
-  const done = await until(r => r.type === 'agent_settled', k, 400000);
+  // 溢出压缩要摘要约 20 万 token，实测 350s；每轮等 agent_settled，且压缩开始后必须等到 compaction_end，才发下一条。
+  const TURN_MS = Number(process.env.TURN_MS || 1200000);
+  let done = await until(r => r.type === 'agent_settled', k, TURN_MS);
+  const compOpen = () => { const e = out.slice(k); return e.some(r => r.type === 'compaction_start') && !e.some(r => r.type === 'compaction_end'); };
+  if (compOpen()) { await until(r => r.type === 'compaction_end', k, TURN_MS); done = await until(r => r.type === 'agent_settled' && r._t >= out.slice(k).find(x => x.type === 'compaction_end')._t, k, TURN_MS); }
   const evs = out.slice(k);
   const asst = evs.filter(r => r.type === 'message_end' && r.message.role === 'assistant').map(r => r.message);
   const marks = evs.filter(r => /^(compaction_|auto_retry_)/.test(r.type) || r.type === 'agent_end').map(r => r.type + (r.reason ? ':' + r.reason : '') + (r.willRetry !== undefined ? ':willRetry=' + r.willRetry : ''));
@@ -38,6 +42,9 @@ const fin = out.slice(k).filter(r => r.type === 'message_end' && r.message.role 
 const answer = fin?.content?.filter(b => b.type === 'text').map(b => b.text).join('') ?? '';
 const comps = out.filter(r => r.type === 'compaction_end').map(r => ({ reason: r.reason, ok: !!r.result, err: r.errorMessage, willRetry: r.willRetry, before: r.result?.tokensBefore }));
 console.log('compactions:', JSON.stringify(comps)); console.log('answer:', JSON.stringify(answer.slice(0, 100)), 'stop:', fin?.stopReason);
+{ const t0 = out[0]?._t ?? 0; const tl = out.filter(r => /^(compaction_|summarization_retry|auto_retry_)/.test(r.type)).map(r => ({ t: r.type, reason: r.reason, at: Math.round((r._t - t0) / 1000) + 's' }));
+  console.log('TIMELINE', JSON.stringify(tl));
+  for (const st of out.filter(r => r.type === 'compaction_start')) { const en = out.find(r => r.type === 'compaction_end' && r._t >= st._t); console.log('compaction', st.reason, 'took', en ? Math.round((en._t - st._t) / 1000) + 's' : 'no end seen'); } }
 child.kill();
 const ok = overflowSeen && comps.some(c => c.ok && c.reason === 'overflow') && fin?.stopReason === 'stop' && /MANGO-77/.test(answer);
 console.log('RESULT', ok ? 'ok' : 'FAIL'); process.exit(ok ? 0 : 1);
