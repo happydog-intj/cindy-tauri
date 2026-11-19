@@ -679,9 +679,12 @@ fn rust_sessions_stream_approve_persist_authenticate_and_resume_after_restart() 
     assert!(!errored, "带 key 的回合没有报错");
     // 会话存活期间，明文 key 只允许出现在运行目录里的 provider.key，且权限为 0600；关闭会话后整个磁盘上都不该有。
     {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         let hits = dir_contains(&data, KEY);
         assert!(!hits.is_empty() && hits.iter().all(|p| p.file_name().is_some_and(|n| n == "provider.key") && p.to_string_lossy().contains("pi-runtime")), "key 只在运行目录的 key 文件里：{hits:?}");
+        // 0600 只在 Unix 有意义；Windows 靠用户目录 ACL。
+        #[cfg(unix)]
         for p in &hits {
             assert_eq!(std::fs::metadata(p).unwrap().permissions().mode() & 0o777, 0o600, "key 文件权限 0600: {p:?}");
         }
@@ -933,11 +936,13 @@ fn rust_sessions_reach_the_gateway_directly_with_the_real_key_and_no_internal_he
 
     // key 只在运行目录的 0600 文件里；pi-rs 的 models.json 里没有明文。
     {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         let hits = dir_contains(&data, GW_KEY);
         let outside: Vec<_> = hits.iter().filter(|p| !p.to_string_lossy().contains("pi-runtime")).collect();
         assert!(outside.is_empty(), "网关 key 不落在运行目录以外（secrets 文件是加密的）: {outside:?}");
         assert!(!hits.is_empty());
+        #[cfg(unix)]
         for p in &hits {
             assert_eq!(std::fs::metadata(p).unwrap().permissions().mode() & 0o777, 0o600, "{p:?}");
         }
