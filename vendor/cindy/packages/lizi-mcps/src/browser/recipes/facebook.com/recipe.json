@@ -1,0 +1,23 @@
+{
+  "id": "facebook-search",
+  "match": [
+    "facebook.com"
+  ],
+  "description": "Search Facebook for people, pages, or posts",
+  "access": "read",
+  "adapter": "facebook/search",
+  "inputs": {
+    "query": {
+      "required": true,
+      "type": "str",
+      "description": "Search query"
+    },
+    "limit": {
+      "required": false,
+      "type": "int",
+      "default": 10,
+      "description": "Number of results"
+    }
+  },
+  "steps": []
+}

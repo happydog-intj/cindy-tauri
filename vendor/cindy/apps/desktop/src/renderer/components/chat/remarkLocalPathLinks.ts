@@ -1,0 +1,120 @@
+/**
+ * remarkLocalPathLinks — 把回复正文纯文本里"长得像本地文件路径"的 token 切成
+ * mdast `link` 节点,让它复用现有的链接渲染链路(classify → resolve → chip /
+ * 降级纯文本)。
+ *
+ * 背景:
+ *   桌面端聊天渲染器早就能把本地文件路径渲染成可点 chip,但只识别两种入口——
+ *   行内代码 `` `path` `` 和显式 markdown 链接 `[label](path)`。agent 在正文
+ *   里直接写进句子的路径(`见 src/App.tsx`、`改的是 C:\proj\app.ts`)完全当普通
+ *   文字渲染,点不动。本插件补上"正文纯文本"这个缺口。
+ *
+ * 为什么放渲染器侧而不是系统提示词:
+ *   "一条路径要不要变可点"是个确定性判断——能唯一解析到真实文件就可点,否则不
+ *   可点(解析 + stat 存在性校验都在主进程 pathResolver 里)。按仓库规则 16,确
+ *   定性逻辑应落代码而非甩给 prompt。放渲染器侧还顺带救了**已经渲染成纯文本的
+ *   历史消息**(prompt 只能影响未来输出)。
+ *
+ * 匹配策略:
+ *   - 用一条"正向路径正则"在正文里定位 token,而不是按空白切再剥边——后者在中文
+ *     里("src/App.tsx,然后呢"这种路径直接黏着中文)会把尾巴一起吞掉判废。正向
+ *     正则在**扩展名**处收尾,尾随的中文/标点天然落在 match 之外。
+ *   - 只认**带路径分隔符**的形态:相对路径(含 `/` 或 `\` + 扩展名)、`./` `../`
+ *     `~/` 开头、POSIX 绝对、Windows 盘符。裸文件名(`app.tsx`,无分隔符)在正文里
+ *     太歧义,不碰——这点比 inline code 更严(inline code 是作者主动用反引号标注
+ *     的格式信号)。
+ *   - 左边界用负向 lookbehind 卡死:路径前一个字符必须是边界(空白 / 起始 / 标点
+ *     等),不能是另一个路径字符,避免从中文 prose 中间起切。
+ *
+ * 已知限制(CJK 既可能是 prose 也可能是真实目录名 `我的看板`,词法层无法区分,故
+ * 一律当作路径段字符;代价在"无空白边界紧贴中文"时显现,均与现状一致、本就点不动,
+ * 不是回退):
+ *   - 前导紧贴:`见src/x.ts`(中文直接黏在路径前)→ "见"被并入 token,解析不到 →
+ *     纯文本。
+ *   - 中文黏连两条真路径:`a/b.ts和c/d.ts` → 中间的"和"被当成路径段,整串吞成**一个**
+ *     token `a/b.ts和c/d.ts`,解析不到 → 两条真路径**都点不亮**(比前导紧贴影响更大)。
+ *   要救这些只能把 CJK 当分隔符,但那会反过来切断 `docs/设计稿/index.md` 里的中文目录
+ *   名,得不偿失,故不做。
+ *
+ *   - 命中后再用现有 `splitLocalLineSuffix` + `looksLikeFilePath` 复核一遍,与
+ *     inline code / 链接共用同一套谓词,"什么算文件路径"全仓一致;且切出来的 link
+ *     仍走主进程 resolve,解析不到 → 现有链路降级成纯 `<span>`,误匹配天然不会变坏
+ *     chip。
+ *
+ * 只处理 `text` 节点,天然不碰代码:mdast 里 `code` / `inlineCode` 是带 `value`
+ * 的叶子节点,没有 `text` 子节点,扫不到;唯一要跳过的是已经在 `link` 里的 text
+ * (避免嵌套链接)。纯 AST 变换,无 IO、无副作用。
+ *
+ * 手机端对等物:`apps/mobile/src/session/chatPathCandidate.ts` 的
+ * `findBareFilePathMatch`(shared/bareFilePathTokens 的移植,接进
+ * messageMarkdown 的 inline 分词器)。**共享分词器的正则改了要同步过去**,否则两端会
+ * 就"哪些正文路径可点"给出不同结果。
+ */
+
+import type { Plugin } from 'unified';
+import type { Root, Text, Link, PhrasingContent } from 'mdast';
+import { visit, SKIP } from 'unist-util-visit';
+
+import { looksLikeFilePath } from '@/lib/localPathResolver';
+import { splitLocalLineSuffix } from '@/lib/markdownTarget';
+import { findPathMatches, type PathMatch } from '../../../shared/bareFilePathTokens';
+
+/**
+ * 标记属性名:正文裸路径切出的 link 节点带上它,渲染层据此走「只加下划线、不变
+ * 等宽」的分支(见 splitTextNode 里的说明)。与 MarkdownRenderer 共享同一常量,
+ * 避免字面量在两处漂移。
+ */
+export const BARE_PATH_ATTR = 'data-bare-path';
+
+/** 把一个 text 节点按命中的路径区间拆成 [text, link, text, ...]。 */
+function splitTextNode(node: Text, matches: PathMatch[]): PhrasingContent[] {
+  const out: PhrasingContent[] = [];
+  const value = node.value;
+  let cursor = 0;
+  for (const match of matches) {
+    if (match.start > cursor) {
+      out.push({ type: 'text', value: value.slice(cursor, match.start) });
+    }
+    const link: Link = {
+      type: 'link',
+      url: match.value,
+      children: [{ type: 'text', value: match.value }],
+      // 标记「这条 link 是从正文纯文本切出来的」,供渲染层区分作者手写的
+      // `[label](path)`。两者点亮后的形态不同(DESIGN.md §14.5):
+      //   - 作者写的 markdown 链接:label 像文件名 → 等宽 chip(那是作者的排版意图);
+      //   - 正文裸写的路径:保持正文字体,只加下划线 —— 否则同一句里点亮的路径变成
+      //     等宽块、没点亮的仍是正文,字体/底色/下划线三处齐变,跳变无法解释。
+      // hProperties 是 mdast-util-to-hast 的既有通道,会原样落到 <a> 的属性上,
+      // 再由 MarkdownRenderer 的 a 组件读取并从 DOM props 里剥掉。
+      data: { hProperties: { [BARE_PATH_ATTR]: '' } },
+    };
+    out.push(link);
+    cursor = match.end;
+  }
+  if (cursor < value.length) {
+    out.push({ type: 'text', value: value.slice(cursor) });
+  }
+  return out;
+}
+
+const remarkLocalPathLinks: Plugin<[], Root> = () => {
+  return (tree) => {
+    visit(tree, 'text', (node: Text, index, parent) => {
+      if (!parent || index == null) return;
+      // 已在链接里的 text 不动:避免把链接 label 再切成嵌套链接。
+      if (parent.type === 'link') return;
+      // 快速短路:不含任何路径分隔符的文本一定不是带分隔符路径,直接跳过。
+      if (!node.value || (!node.value.includes('/') && !node.value.includes('\\'))) return;
+
+      const matches = findPathMatches(node.value).filter((match) => looksLikeFilePath(splitLocalLineSuffix(match.value).href));
+      if (matches.length === 0) return;
+
+      const replacement = splitTextNode(node, matches);
+      parent.children.splice(index, 1, ...replacement);
+      // 跳过刚插入的节点,避免重复访问。
+      return [SKIP, index + replacement.length];
+    });
+  };
+};
+
+export default remarkLocalPathLinks;

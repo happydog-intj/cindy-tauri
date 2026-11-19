@@ -1,0 +1,29 @@
+{
+  "id": "mdn-search",
+  "match": [
+    "developer.mozilla.org"
+  ],
+  "description": "Search MDN Web Docs by keyword",
+  "access": "read",
+  "adapter": "mdn/search",
+  "inputs": {
+    "query": {
+      "required": true,
+      "type": "str",
+      "description": "Search keyword (e.g. \"fetch\", \"flexbox\", \"Array.prototype.map\")"
+    },
+    "limit": {
+      "required": false,
+      "type": "int",
+      "default": 10,
+      "description": "Max results (1-50)"
+    },
+    "locale": {
+      "required": false,
+      "type": "str",
+      "default": "en-US",
+      "description": "Doc locale (en-US default; de / es / fr / ja / ko / pt-BR / ru / zh-CN / zh-TW)"
+    }
+  },
+  "steps": []
+}

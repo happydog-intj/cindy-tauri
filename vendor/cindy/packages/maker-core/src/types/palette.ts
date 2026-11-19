@@ -1,0 +1,127 @@
+import type { PiRuntimeCapabilityStatus } from './pi-runtime-capabilities.js';
+
+export type SlashCommandSource = 'user' | 'skill';
+
+/**
+ * @internal 仅供 maker-core 内部 scanner 用的中间形状。
+ * 对外消费一律走 AgentSkillCommand (palette refactor 后的统一形状, 多了 kind 判别符)。
+ * 保留是因为 palette-scanner 在 scan→merge 阶段不需要也不该背 kind 字段。
+ */
+export interface AgentSlashCommand {
+  /** Command / skill name without a leading slash. */
+  name: string;
+  description?: string;
+  source: SlashCommandSource;
+  /** Absolute path when the backing agent exposes one (e.g. Codex SKILL.md). */
+  path?: string;
+  scope?: 'global' | 'project' | 'user' | 'repo' | 'system' | 'admin';
+  enabled?: boolean;
+  /** Pi discovery/runtime state; omitted for engines without a runtime truth layer. */
+  runtimeStatus?: PiRuntimeCapabilityStatus;
+  /** Provider command name used for invocation when it differs from the palette label. */
+  runtimeCommandName?: string;
+}
+
+// ── New unified command model (palette refactor) ──────────────────────────
+//
+// Three sources contribute to the chat-input `/` palette:
+//   - 'desktop'       : registered in DesktopCommandRegistry (main process).
+//                       Executed locally in main; never forwarded to agent.
+//                       Old BUILTIN_SLASH_COMMANDS (/help, /clear) live here.
+//   - 'agent-builtin' : hard-coded per-agent whitelist in maker-core
+//                       (e.g. Claude Code's /compact). Executed by being sent
+//                       to the agent as a `/name args` prompt prefix.
+//   - 'agent-skill'   : .md files discovered by scanning ~/.claude or codex
+//                       app-server. Same dispatch as agent-builtin (prompt
+//                       prefix) but rendered/grouped differently in palette.
+//
+// All three flow through the renderer as `UnifiedCommand`. Dispatch picks
+// the route from `kind`. The old `local: boolean` field on the renderer-side
+// `SlashCommand` interface is replaced by this discriminator.
+
+export type CommandKind = 'desktop' | 'agent-builtin' | 'agent-skill';
+
+/** A desktop-side command. Execution is performed in the main process. */
+export interface DesktopCommandMeta {
+  kind: 'desktop';
+  /** Inserted text and identity key. */
+  name: string;
+  description: string;
+  /** Display text when it differs from the inserted `name` (e.g. a hidden `/slug` qualifier). */
+  label?: string;
+  /** Trailing tag in the row, e.g. a plugin's source. */
+  meta?: string;
+}
+
+/** A command baked into the agent (e.g. /compact for Claude Code). */
+export interface AgentBuiltinCommand {
+  kind: 'agent-builtin';
+  name: string;
+  description: string;
+}
+
+/** A user/project skill discovered by scanning the agent's customisation dirs. */
+export interface AgentSkillCommand {
+  kind: 'agent-skill';
+  name: string;
+  description?: string;
+  /** Main-attested Cindy bundle identity; never inferred from user-authored metadata. */
+  builtIn?: boolean;
+  /** Whether the skill came from a user-global or project-local directory. */
+  source: SlashCommandSource;
+  path?: string;
+  /** Package resources need their owning package's management surface. */
+  origin?: 'package';
+  scope?: 'global' | 'project' | 'user' | 'repo' | 'system' | 'admin';
+  enabled?: boolean;
+  /** Pi discovery/runtime state; omitted for engines without a runtime truth layer. */
+  runtimeStatus?: PiRuntimeCapabilityStatus;
+  /** Provider command name used for invocation when it differs from the palette label. */
+  runtimeCommandName?: string;
+}
+
+export type UnifiedCommand = DesktopCommandMeta | AgentBuiltinCommand | AgentSkillCommand;
+
+export interface ListAgentSkillsOptions {
+  /** Omit to list only agent-global skills without a project scope. */
+  workingDir?: string;
+  /**
+   * SSH workspace owner. When present, discovery must run against this host's
+   * native runtime/filesystem and must never fall back to the local machine.
+   */
+  remoteHostId?: string;
+  forceReload?: boolean;
+  /** Host-owned Pi boundary; renderer input must never set this directly. */
+  includeManagedPiPackages?: boolean;
+}
+
+/** Host-only runtime discovery inputs used for security decisions about the live task. */
+export interface ListRuntimeSkillsOptions extends ListAgentSkillsOptions {
+  /** Exact config directory passed to the local runtime process, when it differs from its default. */
+  runtimeConfigDir?: string;
+}
+
+export interface ListAgentSkillsResult {
+  skills: AgentSkillCommand[];
+  errors?: Array<{ path?: string; message: string }>;
+}
+
+export type AtResourceType = 'file' | 'dir' | 'agent';
+
+export interface AtResourceItem {
+  type: AtResourceType;
+  name: string;
+  relPath: string;
+  description?: string;
+}
+
+export interface ScanAtResourcesOptions {
+  workingDir: string;
+  cap?: number;
+  query?: string;
+}
+
+export interface ScanAtResourcesResult {
+  items: AtResourceItem[];
+  truncated: boolean;
+}

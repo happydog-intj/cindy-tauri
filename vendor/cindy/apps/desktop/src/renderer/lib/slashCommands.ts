@@ -1,0 +1,610 @@
+/**
+ * Slash command palette helper —— ChatInput `/` 三源汇总 + dispatch。
+ *
+ * 三源 (palette refactor) :
+ *   - desktop       : main 进程 DesktopCommandRegistry, 通过 IPC 拉取
+ *   - agent-builtin : agent 子类硬编码白名单, 通过 IPC 拉取
+ *   - agent-skill   : agent 用户/项目目录扫描, 通过 IPC 拉取
+ *
+ * 三者合并成 UnifiedCommand[] 给 SlashCommandPalette 渲染。
+ * dispatch 时按 cmd.kind 分流:
+ *   - 'desktop'        → executeDesktopCommand IPC (main 那边广播 DESKTOP_COMMAND_TRIGGERED)
+ *   - 'agent-builtin'  → 当 prompt 前缀 send 给当前 session
+ *   - 'agent-skill'    → 同 agent-builtin
+ *
+ * 模块本身 UI-agnostic, 不依赖 React; SlashCommandPalette / ChatInput / CCAgentSessionView
+ * 各自消费这里的纯函数, 方便单测。
+ */
+
+import type { UnifiedCommand, AgentKind } from '@cindy/maker-core';
+import { leadingSlashInvocation } from '@cindy/maker-shared';
+import type { PiPackageCommandRuntimeStatus } from '@/../shared/piPackages';
+import { isCindyBuiltInSkillMetadata } from '@/../shared/cindyBuiltInSkills';
+import type { BuiltInSkillDraftIntent } from './composerDraftStore';
+
+export { leadingSlashInvocation };
+
+import { createLogger } from '@/lib/logger';
+
+const log = createLogger('SlashCommands');
+const shadowedUnavailableSkillsByCommands = new WeakMap<UnifiedCommand[], Set<string>>();
+
+export type { UnifiedCommand } from '@cindy/maker-core';
+
+export interface HelpCardCommand {
+  name: string;
+  description?: string;
+  source: string;
+  builtIn?: boolean;
+}
+
+/** Preserve Main-attested built-in identity when commands enter a persisted help card. */
+export function commandsForHelpCard(commands: readonly UnifiedCommand[]): HelpCardCommand[] {
+  return commands.map((command) => ({
+    name: command.name,
+    description: 'description' in command ? command.description : undefined,
+    source: command.kind === 'agent-skill' ? command.source : command.kind,
+    ...(command.kind === 'agent-skill' && command.builtIn === true ? { builtIn: true } : {}),
+  }));
+}
+
+export const PI_RUNTIME_SKILL_RETRY_DELAYS_MS = [100, 250, 500, 1_000, 2_000, 4_000] as const;
+
+export function isSlashCommandUnavailable(command: UnifiedCommand): boolean {
+  return command.kind === 'agent-skill'
+    && (
+      (command.scope === 'repo' && command.runtimeStatus === 'discovered')
+      || command.runtimeStatus === 'unknown'
+      || command.runtimeStatus === 'failed'
+    );
+}
+
+export function isCindyOfficialSlashCommand(command: UnifiedCommand): boolean {
+  return command.kind === 'agent-skill' && isCindyBuiltInSkillMetadata(command);
+}
+
+export function hasAvailableSlashCommand(commands: readonly UnifiedCommand[]): boolean {
+  return commands.some((command) => !isSlashCommandUnavailable(command));
+}
+
+export function slashCommandInvocationName(command: UnifiedCommand): string {
+  return command.kind === 'agent-skill' && command.runtimeCommandName
+    ? command.runtimeCommandName
+    : command.name;
+}
+
+/**
+ * Palette / composer keep the human name (`/git`). Rewrite only at dispatch so
+ * Pi receives the runtime alias (`/skill:git`) without leaking it into the UI.
+ */
+export function rewriteAgentSkillInvocationForDispatch(
+  message: string,
+  command: UnifiedCommand | undefined,
+): string {
+  if (
+    !command ||
+    command.kind !== 'agent-skill' ||
+    !command.runtimeCommandName ||
+    isSlashCommandUnavailable(command)
+  ) {
+    return message;
+  }
+  const leading = leadingSlashInvocation(message);
+  if (!leading || leading.name.toLowerCase() !== command.name.toLowerCase()) return message;
+  return `${message.slice(0, leading.start)}/${command.runtimeCommandName}${message.slice(leading.end)}`;
+}
+
+/** Rewrite `/git` → `/skill:git` even when the skill is still `discovered`. */
+export function rewritePiSkillAliasFromCommand(
+  message: string,
+  command: UnifiedCommand | undefined,
+): string {
+  const leading = leadingSlashInvocation(message);
+  if (
+    !leading
+    || command?.kind !== 'agent-skill'
+    || !command.runtimeCommandName
+    || leading.name.toLowerCase() !== command.name.toLowerCase()
+  ) {
+    return rewriteAgentSkillInvocationForDispatch(message, command);
+  }
+  return `${message.slice(0, leading.start)}/${command.runtimeCommandName}${message.slice(leading.end)}`;
+}
+
+/** First-message / worktree send paths that skip SessionView dispatch. */
+export async function rewritePiSkillMessageForSend(params: {
+  agentKind: AgentKind;
+  message: string;
+  workingDir?: string | null;
+  sessionId?: string;
+}): Promise<string> {
+  if (params.agentKind !== 'pi' && params.agentKind !== 'claude-code') return params.message;
+  const leading = leadingSlashInvocation(params.message);
+  if (!leading) return params.message;
+  const commands = await loadAllCommands(params.agentKind, params.workingDir, {
+    ...(params.sessionId ? { sessionId: params.sessionId } : {}),
+  });
+  const hit = commands.find((command) => command.name.toLowerCase() === leading.name.toLowerCase());
+  return params.agentKind === 'pi' ? rewritePiSkillAliasFromCommand(params.message, hit)
+    : rewriteAgentSkillInvocationForDispatch(params.message, hit);
+}
+
+/** Preserve a routed built-in choice when the user changes the draft's engine or computer. */
+export async function rewriteBuiltInSkillDraftForSend(params: {
+  message: string;
+  intent: BuiltInSkillDraftIntent;
+  agentKind: AgentKind;
+  workingDir?: string | null;
+  deviceId?: string;
+  remoteHostId?: string | null;
+}): Promise<string | null> {
+  const leading = leadingSlashInvocation(params.message);
+  if (!leading || leading.name !== params.intent.commandName) return params.message;
+  // SSH has no Cindy built-in catalog. Never resolve that task against local files.
+  if (params.remoteHostId) return null;
+  const commands = await loadAllCommands(params.agentKind, params.workingDir, {
+    forceReload: true,
+  }, params.deviceId);
+  const skill = commands.find((command) => (
+    command.kind === 'agent-skill'
+    && command.builtIn === true
+    && command.enabled !== false
+    && !isSlashCommandUnavailable(command)
+    && (command.name === params.intent.name || command.name === `cindy:${params.intent.name}`)
+  ));
+  if (!skill) return null;
+  return `${params.message.slice(0, leading.start)}/${slashCommandInvocationName(skill)}${params.message.slice(leading.end)}`;
+}
+
+/**
+ * Rebase persisted/render-only inline ranges after the leading slash-command
+ * token grows or shrinks during runtime alias rewriting.
+ */
+export function rebaseInlineRangesAfterSlashCommandRewrite<T extends { start: number; end: number }>(
+  ranges: readonly T[],
+  originalMessage: string,
+  rewrittenMessage: string,
+): T[] {
+  if (originalMessage === rewrittenMessage) return [...ranges];
+  const originalCommand = leadingSlashInvocation(originalMessage);
+  const rewrittenCommand = leadingSlashInvocation(rewrittenMessage);
+  if (!originalCommand || !rewrittenCommand) return [...ranges];
+
+  const boundary = originalCommand.end;
+  const delta = (rewrittenCommand.end - rewrittenCommand.start)
+    - (originalCommand.end - originalCommand.start);
+  if (delta === 0) return [...ranges];
+  return ranges.map((range) => ({
+    ...range,
+    start: range.start >= boundary ? range.start + delta : range.start,
+    end: range.end >= boundary ? range.end + delta : range.end,
+  }));
+}
+
+/** First available command index, or 0 when nothing is available/present. */
+export function firstAvailableSlashCommandIndex(commands: readonly UnifiedCommand[]): number {
+  const index = commands.findIndex((command) => !isSlashCommandUnavailable(command));
+  return index >= 0 ? index : 0;
+}
+
+/** Move with wraparound while skipping unavailable discovered project skills. */
+export function nextAvailableSlashCommandIndex(
+  commands: readonly UnifiedCommand[],
+  current: number,
+  delta: 1 | -1,
+): number {
+  if (commands.length === 0) return current;
+  let index = current;
+  for (let step = 0; step < commands.length; step++) {
+    index = (index + delta + commands.length) % commands.length;
+    if (!isSlashCommandUnavailable(commands[index])) return index;
+  }
+  return current;
+}
+
+export type SlashCommandRosterStatus = 'loading' | 'refreshing' | 'ready' | 'error';
+
+export interface SlashCommandRosterState {
+  contextKey: string;
+  status: SlashCommandRosterStatus;
+  commands: UnifiedCommand[];
+}
+
+/** Stable empty roster for initial and cross-context renders. */
+export const EMPTY_SLASH_COMMANDS: UnifiedCommand[] = [];
+
+export function beginSlashCommandRosterLoad(
+  current: SlashCommandRosterState,
+  contextKey: string,
+): SlashCommandRosterState {
+  if (
+    current.contextKey === contextKey &&
+    (current.status === 'ready' || current.status === 'refreshing')
+  ) {
+    return { ...current, status: 'refreshing' };
+  }
+  return { contextKey, status: 'loading', commands: EMPTY_SLASH_COMMANDS };
+}
+
+export function failSlashCommandRosterLoad(
+  current: SlashCommandRosterState,
+  contextKey: string,
+): SlashCommandRosterState {
+  if (current.contextKey === contextKey && current.status === 'refreshing') {
+    return { ...current, status: 'ready' };
+  }
+  return { contextKey, status: 'error', commands: EMPTY_SLASH_COMMANDS };
+}
+
+export function isSlashCommandRosterReady(
+  state: SlashCommandRosterState,
+  contextKey: string,
+): boolean {
+  return (
+    state.contextKey === contextKey &&
+    (state.status === 'ready' || state.status === 'refreshing')
+  );
+}
+
+// device-link 远程会话下 desktop 命令**全量可用**:业务语义在「会话归属设备」的命令
+// (/goal /learn /cmd)由控制端 main(commands/builtins.ts)按 ctx.deviceId 经隧道路由
+// 到被控端对应 channel(maker:goal:* / learn:* / desktop-cmd:run,均在 REMOTE_INVOKE_ALLOWLIST);
+// 纯控制端 UI 命令(/help /clear /workflows /jump-session /issue)本就与会话归属无关。
+// 正常会话由 agent-skill /learn 覆盖兼容入口；SSH 无法扫描远端 Skill 时保留 Desktop 路由。
+// 历史上这里有一张 DEVICE_LINK_UNAVAILABLE 黑名单(goal/learn,reviewer #354 / Codex #483
+// 时代控制端还没有隧道路由)—— 隧道链路打通后已删除;被控端版本过旧不支持对应 channel 时,
+// main 会广播 error: 'remote-unsupported',renderer toast 提示,不再静默剔除命令。
+
+/**
+ * 合并三源 → UnifiedCommand[]。
+ * 优先级 (同名时谁覆盖谁) : agent-skill > desktop > agent-builtin。
+ *   - agent-skill 排第一;同名时 Main 验证过的 Cindy 内置 Skill 优先。
+ *   - desktop 第二: app 内置功能 (/help, /clear)
+ *   - agent-builtin 兜底: agent 自带 (/compact)
+ *
+ * Skill 类目内 Cindy 内置项优先，其余按 name 字母序；不同类目按上述优先级排。
+ */
+export function mergeCommands(
+  desktop: UnifiedCommand[],
+  agentBuiltin: UnifiedCommand[],
+  agentSkill: UnifiedCommand[],
+): UnifiedCommand[] {
+  const seen = new Set<string>();
+  const result: UnifiedCommand[] = [];
+  const shadowedUnavailableSkills = new Set<string>();
+  const availableSkills = agentSkill.filter((command) => !isSlashCommandUnavailable(command));
+  const unavailableSkills = agentSkill.filter(isSlashCommandUnavailable);
+  const tiers: UnifiedCommand[][] = [
+    availableSkills.sort((a, b) => (
+      Number(isCindyOfficialSlashCommand(b)) - Number(isCindyOfficialSlashCommand(a))
+      || a.name.localeCompare(b.name)
+    )),
+    [...desktop].sort((a, b) => a.name.localeCompare(b.name)),
+    [...agentBuiltin].sort((a, b) => a.name.localeCompare(b.name)),
+    unavailableSkills.sort((a, b) => a.name.localeCompare(b.name)),
+  ];
+  for (const tier of tiers) {
+    for (const cmd of tier) {
+      if (seen.has(cmd.name)) {
+        if (isSlashCommandUnavailable(cmd)) {
+          shadowedUnavailableSkills.add(cmd.name.toLowerCase());
+        } else {
+          log.warn(`Slash command "/${cmd.name}" already provided by higher-priority tier; skipping ${cmd.kind}.`);
+        }
+        continue;
+      }
+      seen.add(cmd.name);
+      result.push(cmd);
+    }
+  }
+  if (shadowedUnavailableSkills.size > 0) {
+    shadowedUnavailableSkillsByCommands.set(result, shadowedUnavailableSkills);
+  }
+  return result;
+}
+
+function hasShadowedUnavailableSkill(
+  commands: UnifiedCommand[],
+  commandName: string,
+): boolean {
+  return shadowedUnavailableSkillsByCommands.get(commands)?.has(commandName.toLowerCase()) ?? false;
+}
+
+export function hasUnavailableProjectSkillPreview(commands: UnifiedCommand[]): boolean {
+  return commands.some(isSlashCommandUnavailable)
+    || (shadowedUnavailableSkillsByCommands.get(commands)?.size ?? 0) > 0;
+}
+
+/**
+ * 包含过滤(case-insensitive); 精确匹配优先,其次是前缀匹配,最后是普通包含匹配。
+ *
+ * `/`、`$` 两类命令都复用这套筛选，输入命令中间的关键词也能命中，
+ * 与 `@` 资源面板的搜索体验保持一致。
+ */
+export function filterSlashCommands(
+  commands: UnifiedCommand[],
+  query: string,
+  limit = 25,
+): UnifiedCommand[] {
+  const q = query.trim().toLowerCase();
+  const rankOf = (text: string): number => {
+    const value = text.toLowerCase();
+    return value === q ? 0 : value.startsWith(q) ? 1 : value.includes(q) ? 2 : -1;
+  };
+  const filtered = commands
+    .map((command, index) => {
+      // 插件指令同名时 name 带隐藏的 `/slug`,菜单只显示 label:按两者中更好的一个排序,
+      // 输入显示名算精确匹配,输入完整限定指令也照常命中。
+      const ranks = [rankOf(command.name)];
+      if (command.kind === 'desktop' && command.label) ranks.push(rankOf(command.label));
+      const matched = ranks.filter((r) => r >= 0);
+      const rank = q ? (matched.length > 0 ? Math.min(...matched) : -1) : 0;
+      const officialPriority = isCindyOfficialSlashCommand(command) ? 0 : 1;
+      return { command, index, rank, officialPriority };
+    })
+    .filter((entry) => entry.rank >= 0)
+    .sort((a, b) => (
+      a.rank - b.rank
+      || a.officialPriority - b.officialPriority
+      || a.index - b.index
+    ))
+    .map((entry) => entry.command);
+  return filtered.length > limit ? filtered.slice(0, limit) : filtered;
+}
+
+type SkillListResult = { success: boolean; skills?: unknown[] };
+const pendingSkillLists = new WeakMap<object, Map<string, Promise<SkillListResult>>>();
+
+/** Share only outstanding reads; edits and activation changes remain live. */
+function loadPendingSkills(
+  key: string | null,
+  forceReload: boolean,
+  load: () => Promise<SkillListResult>,
+): Promise<SkillListResult> {
+  const owner = window.electronAPI;
+  let pending = pendingSkillLists.get(owner);
+  if (!pending) {
+    pending = new Map();
+    pendingSkillLists.set(owner, pending);
+  }
+  if (key !== null && !forceReload) {
+    const existing = pending.get(key);
+    if (existing) return existing;
+  }
+  const request = load().catch(() => ({ success: false })).finally(() => {
+    // An older request must not evict an in-flight forced refresh.
+    if (key !== null && pending.get(key) === request) pending.delete(key);
+  });
+  if (key !== null) pending.set(key, request);
+  return request;
+}
+
+/**
+ * 拉三路 IPC, 合并成 UnifiedCommand[]。
+ *
+ * - 任何一路失败按空列表处理(已在 main 端做 try/catch + 返回 success:false), 不阻塞 palette。
+ * - workingDir 为空时 Claude 仍扫描全局 skills。
+ * - SSH remote 由 opts.skipAgentSkills 显式禁用扫描,避免读取控制端本机 skills。
+ */
+export async function loadAllCommands(
+  agentKind: AgentKind,
+  workingDir: string | null | undefined,
+  opts?: {
+    forceReload?: boolean;
+    skipAgentSkills?: boolean;
+    sessionId?: string;
+    allowManagedPiPackagePreview?: boolean;
+    onPiRuntimeStatus?: (status: PiPackageCommandRuntimeStatus) => void;
+  },
+  deviceId?: string,
+): Promise<UnifiedCommand[]> {
+  const api = window.electronAPI.maker;
+  // 用 unknown[] 收口三源的不同原生形状(隧道返 unknown、本地返各自命令/技能类型),
+  // 末尾统一 `as UnifiedCommand[]`(与改造前同款收口)。
+  type CmdRes = {
+    success: boolean;
+    commands?: unknown[];
+    runtimeStatus?: PiPackageCommandRuntimeStatus;
+  };
+
+  // device-link「以被控端为准」:agent-builtin / agent-skill 是被控端**该会话**的能力,远程时经隧道
+  // 从被控端读(channel 已 allowlist,workingDir 是被控端路径,扫描在被控端跑正确)。
+  // desktop 命令**始终本地** —— 它是控制端 app 的 UI 动作(execute-desktop-command 不可隧道,见 D2)。
+  const desktopP: Promise<CmdRes> = api.listDesktopCommands(
+    deviceId ? { deviceId } : undefined,
+  ).catch(() => ({ success: false }));
+  const builtinP: Promise<CmdRes> = (
+    deviceId
+      ? (window.electronAPI.deviceLink.invoke(deviceId, 'maker:list-agent-commands', [
+          agentKind,
+          ...(
+            opts?.sessionId || opts?.allowManagedPiPackagePreview !== undefined
+              ? [{
+                  ...(opts?.sessionId ? { sessionId: opts.sessionId } : {}),
+                  ...(opts?.allowManagedPiPackagePreview !== undefined
+                    ? { allowManagedPiPackagePreview: opts.allowManagedPiPackagePreview }
+                    : {}),
+                }]
+              : []
+          ),
+        ]) as Promise<CmdRes>)
+      : api.listAgentCommands(agentKind, {
+          ...(opts?.sessionId ? { sessionId: opts.sessionId } : {}),
+          ...(opts?.allowManagedPiPackagePreview !== undefined
+            ? { allowManagedPiPackagePreview: opts.allowManagedPiPackagePreview }
+            : {}),
+        })
+  ).catch(() => ({ success: false }));
+  const shouldLoadSkills = !opts?.skipAgentSkills;
+  const skillParams = {
+    ...(workingDir ? { workingDir } : {}),
+    ...(opts?.forceReload !== undefined ? { forceReload: opts.forceReload } : {}),
+    ...(opts?.sessionId ? { sessionId: opts.sessionId } : {}),
+  };
+  const skillP: Promise<SkillListResult> = shouldLoadSkills
+    ? loadPendingSkills(
+        opts?.sessionId ? JSON.stringify([agentKind, deviceId || null, workingDir || null, opts.sessionId]) : null,
+        opts?.forceReload === true,
+        () => deviceId
+          ? (window.electronAPI.deviceLink.invoke(deviceId, 'maker:list-agent-skills', [
+              agentKind,
+              skillParams,
+            ]) as Promise<SkillListResult>)
+          : api.listAgentSkills(agentKind, skillParams),
+      )
+    : Promise.resolve({ success: true, skills: [] });
+
+  const [desktopRes, builtinRes, skillRes] = await Promise.all([desktopP, builtinP, skillP]);
+  if (agentKind === 'pi' && builtinRes.runtimeStatus) {
+    opts?.onPiRuntimeStatus?.(builtinRes.runtimeStatus);
+  }
+
+  const rawDesktop = (desktopRes.success && desktopRes.commands ? desktopRes.commands : []) as UnifiedCommand[];
+  const agentSkill = (skillRes.success && skillRes.skills ? skillRes.skills : []) as UnifiedCommand[];
+  // Learn 已迁成可开关的官方 Skill。本地/Device Link 能读 Skill 清单时只展示
+  // 实际可用的 agent-skill；SSH 显式跳过扫描、扫描失败或尚未发现 Skill 时，
+  // 保留仍可路由 Learn host 的 Desktop 兼容入口。
+  const hasAvailableLearnSkill = agentSkill.some((command) => (
+    command.name.toLowerCase() === 'learn' && !isSlashCommandUnavailable(command)
+  ));
+  const desktop = shouldLoadSkills && hasAvailableLearnSkill
+    ? rawDesktop.filter((command) => command.name !== 'learn')
+    : rawDesktop;
+  const agentBuiltin = (builtinRes.success && builtinRes.commands ? builtinRes.commands : []) as UnifiedCommand[];
+  return mergeCommands(desktop, agentBuiltin, agentSkill);
+}
+
+/**
+ * A Pi runtime catalog may finish after the palette/dispatch snapshot was
+ * created. Recheck desktop hits before executing them so a newly loaded
+ * same-name project skill keeps command ownership.
+ */
+export async function reconcilePiRuntimeCommandForDispatch(params: {
+  agentKind: AgentKind;
+  sessionId?: string;
+  commandName: string;
+  commands: UnifiedCommand[];
+  reload: () => Promise<UnifiedCommand[]>;
+}): Promise<{ command: UnifiedCommand | undefined; commands: UnifiedCommand[] }> {
+  const findCommand = (commands: UnifiedCommand[]) => commands.find(
+    (command) => command.name.toLowerCase() === params.commandName.toLowerCase(),
+  );
+  const current = findCommand(params.commands);
+  const shouldReload = !current
+    || current.kind === 'desktop'
+    || isSlashCommandUnavailable(current);
+  if (params.agentKind !== 'pi' || !params.sessionId || !shouldReload) {
+    return { command: current, commands: params.commands };
+  }
+  try {
+    const refreshed = await params.reload();
+    const refreshedCommand = findCommand(refreshed);
+    return refreshedCommand || !current
+      ? { command: refreshedCommand, commands: refreshed }
+      : { command: current, commands: params.commands };
+  } catch {
+    return { command: current, commands: params.commands };
+  }
+}
+
+export async function reconcilePiRuntimeCommandForDispatchWithRetry(params: {
+  agentKind: AgentKind;
+  sessionId?: string;
+  commandName: string;
+  commands: UnifiedCommand[];
+  reload: () => Promise<UnifiedCommand[]>;
+  prepareRuntime?: () => Promise<void>;
+  retryDelaysMs?: readonly number[];
+  sleep?: (delayMs: number) => Promise<void>;
+}): Promise<{ command: UnifiedCommand | undefined; commands: UnifiedCommand[] }> {
+  if (params.agentKind !== 'pi' || !params.sessionId) {
+    return reconcilePiRuntimeCommandForDispatch(params);
+  }
+  const retryDelaysMs = params.retryDelaysMs ?? PI_RUNTIME_SKILL_RETRY_DELAYS_MS;
+  const sleep = params.sleep ?? ((delayMs: number) => new Promise<void>(
+    (resolve) => window.setTimeout(resolve, delayMs),
+  ));
+  const current = params.commands.find(
+    (command) => command.name.toLowerCase() === params.commandName.toLowerCase(),
+  );
+  const mayStillBeLoading = params.prepareRuntime !== undefined
+    || (current !== undefined && isSlashCommandUnavailable(current));
+  const shouldPrepareRuntime = !current
+    || current.kind === 'desktop'
+    || isSlashCommandUnavailable(current);
+  if (
+    params.agentKind === 'pi'
+    && params.sessionId
+    && params.prepareRuntime
+    && shouldPrepareRuntime
+  ) {
+    await params.prepareRuntime();
+  }
+  let result = await reconcilePiRuntimeCommandForDispatch(params);
+  for (const delayMs of retryDelaysMs) {
+    const shouldRetry = result.command === undefined
+      ? mayStillBeLoading
+      : isSlashCommandUnavailable(result.command)
+        || (
+          result.command.kind === 'desktop'
+          && hasShadowedUnavailableSkill(result.commands, params.commandName)
+        );
+    if (!shouldRetry) return result;
+    await sleep(delayMs);
+    result = await reconcilePiRuntimeCommandForDispatch({
+      ...params,
+      commands: result.commands,
+    });
+  }
+  return result;
+}
+
+/**
+ * Dispatch context —— 调用方(handleSend)透传 session 上下文给 main。
+ * desktop 命令的 execute 拿到这些信息决定怎么响应。
+ */
+export interface DispatchContext {
+  sessionId?: string;
+  remoteHostId?: string;
+  workingDir?: string;
+  /** `/name args...` 中 name 后面的剩余文本; 没有则空串。 */
+  args?: string;
+  /** device-link 远程会话的归属设备 id(本机会话缺省)。main 侧 /goal /learn /cmd
+   *  据此把业务体经隧道路由到被控端执行。 */
+  deviceId?: string;
+}
+
+/**
+ * Dispatch 一条命中的命令 ——
+ *   - 'desktop'        → executeDesktopCommand IPC, 不 send 给 agent
+ *   - 'agent-builtin'  → 调 sendToAgent 把 `/name args` 当 prompt 前缀发出去
+ *   - 'agent-skill'    → 同 agent-builtin
+ *
+ * 返回 'handled-locally' 表示已处理(调用方应阻止默认 send 行为);
+ * 返回 'forward-to-agent' 表示让调用方继续走默认 send 路径。
+ */
+export type DispatchResult = 'handled-locally' | 'forward-to-agent';
+
+export async function dispatchCommand(
+  cmd: UnifiedCommand,
+  ctx: DispatchContext,
+): Promise<DispatchResult> {
+  if (cmd.kind === 'desktop') {
+    try {
+      await window.electronAPI.maker.executeDesktopCommand(cmd.name, {
+        ...(ctx.sessionId ? { sessionId: ctx.sessionId } : {}),
+        ...(ctx.workingDir ? { workingDir: ctx.workingDir } : {}),
+        ...(ctx.args ? { args: ctx.args } : {}),
+        ...(ctx.deviceId ? { deviceId: ctx.deviceId } : {}),
+        ...(ctx.remoteHostId ? { remoteHostId: ctx.remoteHostId } : {}),
+      });
+    } catch (err) {
+      log.warn(
+        `executeDesktopCommand /${cmd.name} failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    return 'handled-locally';
+  }
+  // agent-builtin / agent-skill —— 让调用方把原文 send 出去, 自己不动
+  return 'forward-to-agent';
+}

@@ -1,0 +1,1514 @@
+import { ErrorNotice } from '@/components/ui/error-notice';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import * as Dialog from '@radix-ui/react-dialog';
+import { Check, FolderOpen, Info, Play, Sparkles, X } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
+
+import { SegmentedControl } from '@/components/ui/segmented-control';
+import { PreRunPluginFields } from './PreRunPluginFields';
+import { cn } from '@/lib/utils';
+import { toast } from '@/lib/toast';
+import * as sessionService from '@/lib/sessionService';
+import { extractIpcError } from '@/utils/ipcError';
+import { parseAgentErrorCode } from '@cindy/maker-shared/error-redaction';
+import { Tip } from '@/components/ui/tooltip';
+import { Button } from '@/components/ui/button';
+import { useAgentCapabilities } from '@/hooks/useAgentCapabilities';
+import { useProviders } from '@/hooks/useProviders';
+import { useDeviceProviders } from '@/hooks/useDeviceProviders';
+import {
+  sessionModelSupportsFastMode,
+} from '@cindy/model-providers';
+import type { UtilityTextAttemptReason, UtilityTextFailure } from '../../../../shared/utilityTextResult';
+import { useFeishuBot } from '@/hooks/useFeishuBot';
+import { useProjectPickerOptions } from '@/hooks/useProjectPickerOptions';
+import { useWecomGroupNotificationSettings } from '@/hooks/useWecomGroupNotificationSettings';
+import type { Schedule, CreateScheduleInput, ScheduleTemplate, UpdateScheduleInput } from '@cindy/maker-scheduler';
+import { applyTemplateParams } from '@cindy/maker-scheduler/template-engine';
+import { ScriptCapabilityMultiSelect } from './ScriptCapabilityMultiSelect';
+
+import {
+  getScheduleDefaultRoute,
+  rememberScheduleFormPrefs,
+  useScheduleForm,
+  deriveRunMode,
+  hasRealBinding,
+} from '../hooks/useScheduleForm';
+import { useSessionReferences } from '../hooks/useSessionReferences';
+import {
+  buildHookCommandForScriptFile,
+  canSubmitSessionBinding,
+  isExplicitScheduleModelUnavailable,
+  missingRequiredTemplateParamLabel,
+  needsBoundSessionGenerationRouteResolution,
+  parsePreRunHookTimeoutMs,
+  resolveScheduleGenerationProviderId,
+  resolveScheduleModelEfforts,
+  usesBoundSessionGenerationModel,
+} from '../lib/scheduleFormLogic';
+import type { RunMode, ScheduleFormState } from '../hooks/useScheduleForm';
+import { BoundSessionCard } from './BoundSessionCard';
+import { TemplateGallery } from './TemplateGallery';
+import { TemplateParamForm } from './TemplateParamForm';
+import {
+  formToProjectConfig,
+  generateProjectScheduleId,
+} from '../lib/projectAutomationConfig';
+import {
+  ModelEffortChip,
+  ProjectChip,
+  ScheduleChip,
+  ScheduleSettingsButton,
+  ThreadPickerInline,
+} from './ScheduleChips';
+
+/** 可直接运行的最小协议示例，帮助用户理解 stdout 的 JSONL 约束。 */
+const SCRIPT_PROTOCOL_PYTHON_EXAMPLE = `import json
+
+print(json.dumps({
+    "protocol": "cindy-script/1",
+    "type": "complete",
+    "resultText": "done"
+}))`;
+
+/** i18n suffix for every credential-safe utility candidate diagnostic. */
+const UTILITY_ATTEMPT_REASON_KEY: Record<UtilityTextAttemptReason, string> = {
+  unsupported_transport: 'unsupportedTransport',
+  agent_unavailable: 'agentUnavailable',
+  model_unavailable: 'modelUnavailable',
+  not_authenticated: 'notAuthenticated',
+  auth_probe_failed: 'authProbeFailed',
+  api_key_missing: 'apiKeyMissing',
+  endpoint_missing: 'endpointMissing',
+  timeout: 'timeout',
+  empty_response: 'emptyResponse',
+  http_error: 'httpError',
+  request_failed: 'requestFailed',
+};
+
+/**
+ * 前置检查相关 IPC 失败的 toast:先走 extractIpcError 剥掉 `[CODE]` 编码前缀
+ * (规则 13:renderer 消费 IPC 错误统一解码,不给用户看协议内码),非 IPC 错误原样展示。
+ */
+function showHookErrorToast(err: unknown): void {
+  const ipc = extractIpcError(err);
+  const message = ipc?.message?.trim()
+    ? ipc.message
+    : err instanceof Error
+      ? err.message
+      : String(err);
+  toast.error(message);
+}
+
+interface Props {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  initial: Schedule | null;
+  /** 从外部推荐卡片进入新建弹窗时，直接把对应模板应用到表单。 */
+  initialTemplate?: ScheduleTemplate | null;
+  /** 外部快捷入口的新建表单覆写；只负责预填，仍须用户主动提交。 */
+  initialValues?: Partial<ScheduleFormState> | null;
+  onSubmit: (input: CreateScheduleInput | UpdateScheduleInput, isEdit: boolean) => Promise<void>;
+  /** 项目分组里"+"按钮的便捷入口：仅预填 workingDir，等同于普通新建（用户级 schedule，
+   *  不写 schedules.json，可继续选模板、改项目）。 */
+  initialWorkingDir?: string | null;
+  /** 编辑 project schedule 时为 true，保存走 schedules.json upsert。 */
+  editProjectSchedule?: boolean;
+  /**
+   * 本次新建面板是由哪个插件请求打开的（agent 槽 schedule 加档）。非空时在标题下
+   * 显示来源标注，让用户看清是谁请求建这条任务 —— 预填内容来自插件，用户必须知道
+   * 自己在替谁保存。仅展示，不影响提交内容。
+   */
+  requestedByGhostName?: string | null;
+}
+
+export function ScheduleFormDialog({
+  open,
+  onOpenChange,
+  initial,
+  initialTemplate = null,
+  initialValues = null,
+  onSubmit,
+  initialWorkingDir = null,
+  editProjectSchedule = false,
+  requestedByGhostName = null,
+}: Props) {
+  const { t, i18n } = useTranslation();
+  const formApi = useScheduleForm(initial);
+  const { form, setField, selectModelConfiguration, setDestination, setRunMode, selectBoundSession, applyTemplateAgentFields, reset, toInput, validate } = formApi;
+  // "运行会话"三态(fresh / persistent / bound)与心跳形态派生值。
+  // hasRealBinding = targetSessionId 为真实会话 id(B 已绑 / C 已选 / MCP 手绑),
+  // 此时目录 / worktree / fastMode 由绑定会话决定,表单隐藏对应字段。
+  const runMode = deriveRunMode(form);
+  const isBound = hasRealBinding(form);
+  const boundSessionIds = useMemo(
+    () => (isBound ? [form.targetSessionId] : []),
+    [isBound, form.targetSessionId],
+  );
+  const boundSessionReferences = useSessionReferences(boundSessionIds);
+  const boundSessionReference = isBound
+    ? boundSessionReferences.get(form.targetSessionId)
+    : undefined;
+  // An explicit automation selection wins; legacy locations only seed fresh runs.
+  const boundAgentDeviceId = boundSessionReference?.agentDeviceId ?? null;
+  const selectedAgentDeviceId = form.modelAgentDeviceId !== undefined
+    ? form.modelAgentDeviceId || null
+    : isBound ? boundAgentDeviceId : form.agentDeviceId || null;
+  const caps = useAgentCapabilities(form.agentKind, selectedAgentDeviceId ?? undefined);
+  const localProviders = useProviders();
+  const deviceProviders = useDeviceProviders(selectedAgentDeviceId ?? undefined);
+  const { providers, loading: providersLoading } = selectedAgentDeviceId ? deviceProviders : localProviders;
+  // Do not calibrate saved choices against a provisional local or loading snapshot.
+  const modelCatalogReady = (!isBound || form.modelAgentDeviceId !== undefined || !!boundSessionReference) && !caps.loading && !providersLoading;
+  const hideWorkspaceFields = runMode === 'bound' || isBound;
+  const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+  useEffect(() => { setSubmitError(null); }, [open, initial]);
+  const showSubmitError = (error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    const code = parseAgentErrorCode(message)?.code;
+    if (code && i18n.exists(`chat.remoteError.${code}`)) {
+      setSubmitError(message);
+      // Save may be below the notice in a scrolled form. The shared alert toast
+      // stays visible above the dialog and announces the localized failure.
+      toast.error(t(`chat.remoteError.${code}`));
+    } else toast.error(message);
+  };
+  const [mode, setMode] = useState<'gallery' | 'form'>('form');
+  // 前置检查「测试运行」状态:结果只在弹窗内展示,不落任何记录。
+  const [hookTesting, setHookTesting] = useState(false);
+  const [hookTestResult, setHookTestResult] = useState<Awaited<
+    ReturnType<typeof window.electronAPI.maker.schedule.testPreRunHook>
+  > | null>(null);
+  // 前置检查「AI 生成」内联面板:用户描述需求 → 生成脚本落盘 → 命令自动回填。
+  const [hookGenOpen, setHookGenOpen] = useState(false);
+  const [hookGenDesc, setHookGenDesc] = useState('');
+  const [hookGenerating, setHookGenerating] = useState(false);
+  const [hookGenPath, setHookGenPath] = useState<string | null>(null);
+  const [hookGenFailure, setHookGenFailure] = useState<UtilityTextFailure | null>(null);
+  // 命令输入框的拖拽悬停态(高亮提示可放置)。
+  const [hookDragOver, setHookDragOver] = useState(false);
+
+  /** 选中/拖入脚本文件 → 按扩展名+平台生成调用命令并回填(纯代码映射,见 scheduleFormLogic)。 */
+  const applyHookScriptFile = useCallback(
+    (filePath: string) => {
+      if (!filePath.trim()) return;
+      const command = buildHookCommandForScriptFile(filePath, {
+        workingDir: form.workingDir,
+        platform: window.electronAPI.platform,
+      });
+      setField('preRunHookCommand', command);
+      setHookTestResult(null);
+      setHookGenPath(null);
+    },
+    [form.workingDir, setField],
+  );
+
+  /** 「浏览」按钮:系统文件选择器选脚本。 */
+  const browseHookScript = useCallback(async () => {
+    try {
+      const result = await window.electronAPI.dialog.showOpenFile({
+        defaultPath: form.workingDir.trim() || undefined,
+        filters: [
+          { name: 'Scripts', extensions: ['mjs', 'js', 'cjs', 'py', 'sh', 'ps1', 'bat', 'cmd', 'exe'] },
+          { name: 'All Files', extensions: ['*'] },
+        ],
+      });
+      if (result.path) applyHookScriptFile(result.path);
+    } catch (err) {
+      showHookErrorToast(err);
+    }
+  }, [form.workingDir, applyHookScriptFile]);
+  const [selectedTemplate, setSelectedTemplate] = useState<ScheduleTemplate | null>(null);
+  const [paramValues, setParamValues] = useState<Record<string, string>>({});
+  const [promptDirty, setPromptDirty] = useState(false);
+  const isEdit = !!initial;
+  // 仅编辑已存在的 project schedule 时才进入"项目自动化"模式（写 schedules.json + 锁项目 + 隐藏模板）；
+  // 普通新建（包括项目分组"+"带 workingDir 预填）一律走用户级路径，UI 与顶部"新建自动化"对齐。
+  const isProjectAutomationMode = editProjectSchedule;
+  const projectWorkingDir = editProjectSchedule ? (initial?.workingDir ?? null) : null;
+  const isTemplateMode = mode === 'gallery' || !!selectedTemplate;
+  // script/agent 双执行模式的唯一判别常量——所有条件渲染共用,避免散拷漂移
+  const isScriptMode = (form.executionMode ?? 'agent') === 'script';
+  // 项目自动化的配置文件不保存插件前置检查(插件装在各自的电脑上),只提供脚本。
+  const usePluginSource = form.preRunSource === 'plugin' && !isProjectAutomationMode;
+  const setPreRunPluginId = useCallback((pluginId: string) => setField('preRunPluginId', pluginId), [setField]);
+  const submitLabel = isEdit
+    ? t('scheduler.editor.promptDialog.save')
+    : t('scheduler.editor.promptDialog.create');
+
+  const initialId = initial?.id;
+  useEffect(() => {
+    if (!open) return;
+    reset(initial, initialValues ?? undefined);
+    setMode('form');
+    setSelectedTemplate(null);
+    setParamValues({});
+    setPromptDirty(false);
+    setHookTesting(false);
+    setHookDragOver(false);
+    setHookTestResult(null);
+    setHookGenOpen(false);
+    setHookGenDesc('');
+    setHookGenerating(false);
+    setHookGenPath(null);
+    setHookGenFailure(null);
+    const prefill = projectWorkingDir ?? initialWorkingDir;
+    if (prefill) {
+      setField('workspaceKind', 'project');
+      setField('workingDir', prefill);
+    }
+  }, [
+    open,
+    initialId,
+    reset,
+    initial,
+    initialValues,
+    isProjectAutomationMode,
+    projectWorkingDir,
+    initialWorkingDir,
+    setField,
+  ]);
+
+  /** 前置检查「AI 生成」:描述 → utility model 生成脚本落盘 → 命令回填输入框。 */
+  const runHookGenerate = useCallback(async () => {
+    const description = hookGenDesc.trim();
+    if (!description || hookGenerating) return;
+    const hasSessionTarget = hasRealBinding(form);
+    // 脚本在本机生成。Agent 在另一台电脑时它的模型与来源只在那台可用,改用本机的
+    // 辅助模型兜底链,不把那台的来源 id 当成本机来源。
+    const remoteAgentLocation = selectedAgentDeviceId;
+    const resolveBoundSessionRoute = !remoteAgentLocation && needsBoundSessionGenerationRouteResolution(form);
+    const inheritsBoundSessionModel = usesBoundSessionGenerationModel(form);
+    const providerId = remoteAgentLocation
+      ? undefined
+      : resolveBoundSessionRoute
+      ? form.providerId.trim() || undefined
+      : resolveScheduleGenerationProviderId({
+        providers,
+        providerId: form.providerId,
+        model: form.model,
+        agentKind: form.agentKind,
+      });
+    if (!remoteAgentLocation && !resolveBoundSessionRoute && !providerId) {
+      toast.warning(t('scheduler.editor.validation.modelUnavailable', { model: form.model }));
+      return;
+    }
+    setHookGenerating(true);
+    setHookGenPath(null);
+    setHookGenFailure(null);
+    try {
+      const result = await window.electronAPI.maker.schedule.generatePreRunHook({
+        description,
+        scheduleName: form.name.trim() || undefined,
+        providerId: providerId ?? undefined,
+        // Remote selections use the existing local utility-model fallback above.
+        modelAgentDeviceId: remoteAgentLocation ? undefined : form.modelAgentDeviceId,
+        // bound 任务的缺省模型/来源维度由 main 按绑定会话补齐；provider/model 的显式
+        // 覆盖仍原样透传。persistent 任务即使已回写 targetSessionId，也按任务级选择生成。
+        agentKind: remoteAgentLocation || (resolveBoundSessionRoute && form.modelAgentDeviceId !== '')
+          ? undefined : form.agentKind,
+        model: inheritsBoundSessionModel || remoteAgentLocation ? undefined : form.model.trim() || undefined,
+        // 绑定会话任务:workingDir 不发(表单残留值可能是改绑前的过期项目目录,
+        // 显式值会压过会话解析),真实 cwd 由 main 按会话 meta.workDir 解析 ——
+        // 落盘目录/自测环境与生产运行一致
+        workingDir: hasSessionTarget ? undefined : form.workingDir.trim() || undefined,
+        targetSessionId: hasSessionTarget ? form.targetSessionId.trim() : undefined,
+        resolveBoundSessionRoute: resolveBoundSessionRoute ? true : undefined,
+        currentCommand: form.preRunHookCommand.trim() || undefined,
+      });
+      if (!result.ok) {
+        setHookGenFailure(result);
+        return;
+      }
+      setField('preRunHookCommand', result.command);
+      // 落盘即自测(installHookScript):直接回显自测结果,无需用户再点「测试」
+      setHookTestResult(result.test);
+      setHookGenPath(result.filePath);
+      setHookGenOpen(false);
+      setHookGenDesc('');
+    } catch (err) {
+      showHookErrorToast(err);
+    } finally {
+      setHookGenerating(false);
+    }
+  }, [
+    hookGenDesc,
+    hookGenerating,
+    providers,
+    form.name,
+    form.providerId,
+    selectedAgentDeviceId,
+    form.modelAgentDeviceId,
+    form.effort,
+    form.agentKind,
+    form.model,
+    form.workingDir,
+    form.targetSessionId,
+    form.persistentSession,
+    form.preRunHookCommand,
+    form.executionMode,
+    setField,
+    t,
+  ]);
+
+  /** 前置检查「测试运行」:立即执行一次脚本并就地回显 exit code / 输出 / 耗时。 */
+  const runHookTest = useCallback(async () => {
+    const command = form.preRunHookCommand.trim();
+    if (!command || hookTesting) return;
+    setHookTesting(true);
+    setHookTestResult(null);
+    try {
+      const result = await window.electronAPI.maker.schedule.testPreRunHook({
+        command,
+        // 定时触发路径未配置 timeoutMs = 不限时;但交互式测试必须有界,否则
+        // 脚本卡死会让 hookTesting 永远不复位、按钮卡死 —— 未配置兜 30s,
+        // 显式值也钳到 5min 诊断上限(MCP 可设小时级超时,不能让按钮锁那么久)。
+        timeoutMs: Math.min(parsePreRunHookTimeoutMs(form.preRunHookTimeoutSec) ?? 30_000, 300_000),
+        // 同 AI 生成:绑定态不发 workingDir(残留值可能过期),交给 main 按会话目录解析
+        workingDir: hasRealBinding(form) ? undefined : form.workingDir.trim() || undefined,
+        targetSessionId: hasRealBinding(form) ? form.targetSessionId.trim() : undefined,
+        scheduleName: form.name.trim() || undefined,
+      });
+      setHookTestResult(result);
+    } catch (err) {
+      showHookErrorToast(err);
+    } finally {
+      setHookTesting(false);
+    }
+  }, [form.preRunHookCommand, form.preRunHookTimeoutSec, form.workingDir, form.targetSessionId, form.name, hookTesting]);
+
+  const applyTemplateToForm = useCallback((template: ScheduleTemplate) => {
+    setSelectedTemplate(template);
+    if (template.name) setField('name', template.name);
+    if (template.prompt !== undefined) setField('prompt', template.prompt);
+    if (template.cronExpr) setField('cronExpr', template.cronExpr);
+    if (template.timezone) setField('timezone', template.timezone);
+    if (template.recurring !== undefined) {
+      setField('recurring', template.recurring);
+      setField('manual', false);
+    }
+    applyTemplateAgentFields(template, localProviders.providers);
+    if (template.useWorktree !== undefined) setField('useWorktree', template.useWorktree);
+    // useWorktree 只在 project workspace 且无会话绑定时会被 buildScheduleInput 保留；
+    // 模板要求 worktree 时把表单切到 project 模式并清掉绑定会话（绑定与 worktree
+    // 互斥，语义同 setDestination('worktree')），否则保存会被静默打回 false，与
+    // 卡片上的「隔离工作区」承诺不符（workingDir 为空时 validate 会要求选目录）。
+    if (template.useWorktree) {
+      setField('workspaceKind', 'project');
+      setField('targetSessionId', '');
+    }
+    if (template.persistentSession !== undefined) setField('persistentSession', template.persistentSession);
+    if (template.silentWhenIdle !== undefined) setField('silentWhenIdle', template.silentWhenIdle);
+    if (template.notify) {
+      setField('notifyDesktop', template.notify.desktop);
+      setField('notifyFeishu', template.notify.feishu);
+      setField('notifyWecomGroup', template.notify.wecomGroup === true);
+    }
+    const initParams: Record<string, string> = {};
+    for (const parameter of template.parameters ?? []) {
+      if (parameter.default !== undefined) initParams[parameter.key] = parameter.default;
+    }
+    setParamValues(initParams);
+    setPromptDirty(false);
+    setMode('form');
+  }, [setField, applyTemplateAgentFields, localProviders.providers]);
+
+  // Must run after the open/reset effect above so template fields override fresh defaults.
+  const appliedInitialTemplate = useRef<string | null>(null);
+  useEffect(() => {
+    if (!open || !initialTemplate || isEdit || isProjectAutomationMode) {
+      appliedInitialTemplate.current = null;
+      return;
+    }
+    // Catalog refreshes may change the callback, but must not replace a user's draft.
+    if (appliedInitialTemplate.current === initialTemplate.id) return;
+    appliedInitialTemplate.current = initialTemplate.id;
+    applyTemplateToForm(initialTemplate);
+  }, [open, initialTemplate, isEdit, isProjectAutomationMode, applyTemplateToForm]);
+
+  useEffect(() => {
+    if (!selectedTemplate || promptDirty) return;
+    try {
+      setField(
+        'prompt',
+        applyTemplateParams(selectedTemplate.prompt ?? '', paramValues, selectedTemplate.parameters),
+      );
+    } catch {
+      // Required params are surfaced on submit; while editing, keep the template prompt visible.
+    }
+  }, [selectedTemplate, paramValues, promptDirty, setField]);
+
+  const feishuBotReady = useFeishuBot().status === 'connected';
+  const wecomGroupSettings = useWecomGroupNotificationSettings();
+  const wecomGroupReady = wecomGroupSettings.configured && wecomGroupSettings.enabled;
+  const navigate = useNavigate();
+  const openReferencedSession = useCallback(
+    async (sessionId: string) => {
+      try {
+        const [reference] = await sessionService.resolveReferences([sessionId]);
+        if (reference?.state !== 'available') {
+          toast.error(t('scheduler.runs.sessionDeleted'));
+          return;
+        }
+        onOpenChange(false);
+        navigate(`/cc-agent/${sessionId}`);
+      } catch {
+        toast.error(t('scheduler.runs.sessionUnavailable'));
+      }
+    },
+    [navigate, onOpenChange, t],
+  );
+  const goConfigFeishuBot = () => {
+    onOpenChange(false);
+    // 飞书机器人在「IM 机器人」页的「个人」分栏,缺省 imGroup 会落到默认的 Cindy 栏
+    navigate('/settings?tab=im-bot&imGroup=personal');
+  };
+  const goConfigWecomGroup = () => {
+    onOpenChange(false);
+    navigate('/settings?tab=im-bot&imGroup=personal');
+  };
+
+  const projectOptions = useProjectPickerOptions();
+
+  const currentModel = useMemo(() => {
+    const list = caps.capabilities?.availableModels ?? [];
+    return form.model ? list.find((m) => m.id === form.model) : undefined;
+  }, [caps.capabilities, form.model]);
+
+  const currentModelEfforts = useMemo(() => {
+    return resolveScheduleModelEfforts({
+      providers,
+      providerId: form.providerId,
+      model: form.model,
+      agentKind: form.agentKind,
+      fallbackEfforts: currentModel?.efforts,
+    });
+  }, [currentModel, form.agentKind, form.model, form.providerId, providers]);
+
+  // form.model 为空时回填默认模型（三级回退,所见即所存）。
+  // 覆盖历史遗留的空 model 任务（编辑打开时回填）；第三级(新建任务默认)要等供应商
+  // 清单到位才能算出,算不出时保持留空,runner 按同一口径实时解析。
+  // ⚠️ heartbeat 跟随模式(targetSessionId 非空且无显式 Harness)必须跳过:
+  // 空 model = "跟随会话"是有效语义,回填会把 MCP 建的跟随任务静默落成
+  // 显式模型,下次 fire runner setModel 反向改掉绑定会话的模型。
+  useEffect(() => {
+    if (form.targetSessionId.trim() && !form.modelAgentKind) return;
+    // Local recent-model preferences do not describe another computer's catalog.
+    if (selectedAgentDeviceId) return;
+    if (form.model) return;
+    // 默认路由限定在表单已选的来源内,模型与来源成对回填(已选来源保持不变)。
+    const route = getScheduleDefaultRoute(
+      form.agentKind,
+      providersLoading ? undefined : providers,
+      form.providerId,
+    );
+    if (!route.model) return;
+    setField('model', route.model);
+    if (route.providerId && !form.providerId.trim()) setField('providerId', route.providerId);
+  }, [form.model, form.modelAgentKind, form.agentKind, form.targetSessionId, form.providerId, setField, providers, providersLoading, selectedAgentDeviceId]);
+
+  // 绑定任务的显式模型属于任务所在电脑的目录。读到任务位置后让表单与之成对,之后切到
+  // 「每次新建任务」时模型与运行位置仍然一致。
+  useEffect(() => {
+    if (!isBound || !boundSessionReference || !form.model.trim() || form.modelAgentDeviceId !== undefined) return;
+    const location = boundSessionReference.agentDeviceId ?? '';
+    if ((form.agentDeviceId ?? '') !== location) setField('agentDeviceId', location);
+  }, [isBound, boundSessionReference, form.model, form.agentDeviceId, form.modelAgentDeviceId, setField]);
+
+  useEffect(() => {
+    if (!modelCatalogReady || form.modelAgentKind || !currentModelEfforts || !form.effort) return;
+    const allowed = currentModelEfforts as readonly string[];
+    if (!allowed.includes(form.effort)) setField('effort', '');
+  }, [modelCatalogReady, form.modelAgentKind, currentModelEfforts, form.effort, setField]);
+
+  // Fast 模式门控：agent 级 hasFastMode × 该 (生效来源, 模型) 的 supportsFastMode（per-provider，
+  // 唯一真相）。生效来源按 form.providerId 解析（空则该模型的默认来源）。Claude 当前 hasFastMode
+  // 虽为 true，但只有模型本身支持 fast 才显示。
+  const showFastModeToggle = Boolean(
+    caps.capabilities?.hasFastMode &&
+      currentModel &&
+      sessionModelSupportsFastMode(providers, form.providerId ?? null, currentModel.id, form.agentKind),
+  );
+
+  // 切到 Claude / 不支持 fast 的模型时，清掉表单里残留的 fast 态，
+  // 杜绝脏值经 toInput 流向 createSession（与上面 effort 失配自动清除同思路）。
+  useEffect(() => {
+    if (modelCatalogReady && !form.modelAgentKind && providers.length > 0 && form.fastMode && !showFastModeToggle) {
+      setField('fastMode', false);
+    }
+  }, [modelCatalogReady, form.modelAgentKind, providers.length, form.fastMode, showFastModeToggle, setField]);
+
+  const handleSubmit = async () => {
+    setSubmitError(null);
+    const err = validate();
+    if (err) {
+      toast.warning(t(err.key, err.values));
+      return;
+    }
+    if (!canSubmitSessionBinding(form.executionMode ?? 'agent', runMode, boundSessionReference)) {
+      toast.warning(t(
+        boundSessionReference?.state === 'available' && boundSessionReference.status === 'archived'
+          ? 'scheduler.editor.thread.archivedBinding'
+          : boundSessionReference
+            ? 'scheduler.editor.thread.deletedBinding'
+            : 'scheduler.runs.sessionUnavailable',
+      ));
+      return;
+    }
+    if (
+      (form.executionMode ?? 'agent') === 'agent'
+      && isExplicitScheduleModelUnavailable(
+        form.model,
+        caps.capabilities?.availableModels,
+      )
+    ) {
+      toast.warning(t('scheduler.editor.validation.modelUnavailable', { model: form.model }));
+      return;
+    }
+    if (isProjectAutomationMode && projectWorkingDir) {
+      const id = initial?.projectConfigId ?? generateProjectScheduleId();
+      const config = formToProjectConfig(form, id);
+      setSubmitting(true);
+      try {
+        await window.electronAPI.maker.projectAutomation.upsertSchedule({
+          workingDir: projectWorkingDir,
+          config,
+        });
+        // 项目自动化保存反馈由 ProjectAutomationNotifyBridge 监听 reconciled 事件统一弹出
+        // （文案含项目名 + 增删改数量），此处不要再弹通用 toast，否则保存一次会出现两条提示。
+        onOpenChange(false);
+      } catch (e) {
+        showSubmitError(e);
+      } finally {
+        setSubmitting(false);
+      }
+      return;
+    }
+    let input = toInput();
+    if (selectedTemplate && !promptDirty) {
+      const missingLabel = missingRequiredTemplateParamLabel(selectedTemplate, paramValues);
+      if (missingLabel) {
+        toast.warning(t('scheduler.editor.validation.templateParamRequired', { label: missingLabel }));
+        return;
+      }
+      try {
+        input = {
+          ...input,
+          prompt: applyTemplateParams(selectedTemplate.prompt ?? '', paramValues, selectedTemplate.parameters),
+        };
+      } catch {
+        toast.warning(t('scheduler.editor.validation.templateApplyFailed'));
+        return;
+      }
+    }
+    setSubmitting(true);
+    try {
+      await onSubmit(input, isEdit);
+      if (!isEdit) rememberScheduleFormPrefs(form);
+      onOpenChange(false);
+    } catch (e) {
+      showSubmitError(e);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <Dialog.Root open={open} onOpenChange={(v) => !submitting && onOpenChange(v)}>
+      <Dialog.Portal>
+        <Dialog.Overlay
+          className={cn(
+            'modal-scrim fixed inset-0 z-[10000]',
+          )}
+          style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+        />
+        <Dialog.Content
+          aria-describedby={undefined}
+          onPointerDownOutside={(e) => e.preventDefault()}
+          onInteractOutside={(e) => e.preventDefault()}
+          onEscapeKeyDown={(e) => submitting && e.preventDefault()}
+          className={cn(
+            'modal-panel fixed left-1/2 top-1/2 z-[10000] -translate-x-1/2 -translate-y-1/2',
+            'flex max-h-[88vh] w-[760px] flex-col overflow-hidden',
+          )}
+          style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+        >
+          <header className="flex h-[72px] shrink-0 items-center gap-4 pt-[22px] pr-4 pb-[14px] pl-6">
+            <div className="flex min-w-0 flex-1 flex-col gap-1">
+              <Dialog.Title className="text-24 font-normal leading-[1.33] text-[var(--msg-assistant-text)]">
+                {isProjectAutomationMode
+                  ? isEdit
+                    ? t('scheduler.editor.promptDialog.titleProjectEdit')
+                    : t('scheduler.editor.promptDialog.titleProjectCreate')
+                  : isEdit
+                    ? t('scheduler.editor.promptDialog.titleEdit')
+                    : t('scheduler.editor.promptDialog.titleCreate')}
+              </Dialog.Title>
+              <p className="text-sm leading-[1.43] text-[var(--cmd-palette-item-meta)]">
+                {requestedByGhostName
+                  ? t('scheduler.editor.promptDialog.subtitleFromGhost', {
+                      name: requestedByGhostName,
+                    })
+                  : t('scheduler.editor.promptDialog.subtitle')}
+              </p>
+            </div>
+            {!isEdit && !isProjectAutomationMode && (
+              <SegmentedControl
+                aria-label={t('scheduler.template.useTemplate')}
+                value={isTemplateMode ? 'gallery' : 'form'}
+                height={34}
+                options={[
+                  { value: 'form', label: t('scheduler.template.blank') },
+                  { value: 'gallery', label: t('scheduler.template.useTemplate') },
+                ]}
+                onValueChange={(next) => {
+                  if (next === 'form') {
+                    setSelectedTemplate(null);
+                    setParamValues({});
+                    setPromptDirty(false);
+                    reset(null);
+                  }
+                  setMode(next);
+                }}
+              />
+            )}
+            <button
+              type="button"
+              onClick={() => onOpenChange(false)}
+              aria-label={t('scheduler.button.close')}
+              disabled={submitting}
+              className={cn(
+                'flex h-8 w-8 shrink-0 items-center justify-center rounded-full',
+                'text-[var(--cmd-palette-item-meta)] transition-colors dark:text-[var(--settings-section-desc)] hover:bg-[var(--confirm-btn-secondary-hover)] dark:hover:bg-[var(--confirm-btn-secondary-hover)]',
+                'disabled:opacity-50',
+              )}
+            >
+              <X size={16} />
+            </button>
+          </header>
+
+          {!isEdit && !isProjectAutomationMode && mode === 'gallery' ? (
+            // 固定高度对齐表单模式"默认(未勾前置检查)"的常态内容高,空白/模板两个 tab 来回切不跳变。
+            // 546 = pt18 + 名称块68(label16+gap8+input44) + gap18 + 计划行34 + gap18 + 运行会话行34
+            //     + gap18 + 前置检查行34 + gap18 + 提示词块264(label16+gap8+编辑框240) + pb22。
+            // 表单新增/删除常驻区块时需同步更新此值;前置检查勾选等临时展开态与画廊的高度差属预期。
+            <div className="h-[546px] min-h-0 overflow-y-auto px-6 pt-[18px] pb-[22px]">
+              <TemplateGallery onSelect={applyTemplateToForm} selectedId={selectedTemplate?.id} />
+            </div>
+          ) : (
+          // overflow-y-auto:内容超过弹窗 max-h 时整体滚动;
+          // 提示词编辑框是固定高度,不会被可展开区块挤压。
+          <div className="flex min-h-0 flex-1 flex-col gap-[18px] overflow-y-auto pt-[18px] pr-6 pb-[22px] pl-6">
+            {submitError && (
+              <ErrorNotice
+                message={t(`chat.remoteError.${parseAgentErrorCode(submitError)?.code}`)}
+                details={submitError}
+              />
+            )}
+            <div className="flex flex-col gap-2">
+              <label className="text-xs leading-[1.33] text-[var(--cmd-palette-item-meta)] dark:text-[var(--settings-section-desc)]">{t('scheduler.editor.fields.title')}</label>
+              <div className="flex h-11 items-center rounded-full border border-[var(--settings-input-border)] bg-[var(--settings-input-bg)] px-4">
+                <input
+                  type="text"
+                  value={form.name}
+                  onChange={(e) => setField('name', e.target.value)}
+                  placeholder={t('scheduler.editor.promptDialog.namePlaceholder')}
+                  className={cn(
+                    'w-full bg-transparent text-sm font-normal outline-none',
+                    'text-[var(--settings-input-text)] placeholder-[var(--settings-input-placeholder)]',
+                    'select-text',
+                  )}
+                />
+              </div>
+            </div>
+
+            {selectedTemplate?.parameters && selectedTemplate.parameters.length > 0 && (
+              <TemplateParamForm
+                parameters={selectedTemplate.parameters}
+                values={paramValues}
+                onChange={setParamValues}
+              />
+            )}
+
+
+            {/* 项目自动化(.cindy/automations/schedules.json)的 config schema 尚无
+                executionMode/scriptConfig 字段,展示切换器会让 script 配置被静默丢弃
+                ——该形态下隐藏,项目自动化对 script 模式的支持另行迭代。 */}
+            {!isProjectAutomationMode && (
+            <div className="flex items-center gap-2.5">
+              <span className="text-xs leading-[1.33] text-[var(--cmd-palette-item-meta)] dark:text-[var(--settings-section-desc)]">
+                {t('scheduler.editor.executionMode.label')}
+              </span>
+              <SegmentedControl
+                aria-label={t('scheduler.editor.executionMode.label')}
+                value={form.executionMode ?? 'agent'}
+                onValueChange={(mode) => setField('executionMode', mode)}
+                height={34}
+                options={(['agent', 'script'] as const).map((mode) => ({
+                  value: mode,
+                  label: t(`scheduler.editor.executionMode.${mode}`),
+                }))}
+              />
+            </div>
+            )}
+
+            {isScriptMode && (
+              <div className="flex flex-col gap-3 rounded-xl border border-[var(--settings-input-border)] bg-[var(--settings-input-bg)] p-4">
+                <div className="flex gap-2 rounded-xl border border-[var(--settings-input-border)] bg-[var(--cmd-palette-bg)] p-3">
+                  <Info className="mt-0.5 h-4 w-4 shrink-0 text-[var(--cmd-palette-item-meta)]" aria-hidden="true" />
+                  <div className="min-w-0 text-xs leading-[1.5] text-[var(--cmd-palette-item-meta)] dark:text-[var(--settings-section-desc)]">
+                    <p>{t('scheduler.editor.script.protocolSummary')}</p>
+                    <p className="mt-1">{t('scheduler.editor.script.protocolCapabilities')}</p>
+                    <details className="mt-2">
+                      <summary className="w-fit cursor-pointer select-none text-[var(--settings-btn-secondary-text)] hover:text-[var(--msg-assistant-text)]">
+                        {t('scheduler.editor.script.protocolExample')}
+                      </summary>
+                      <pre className="mt-2 overflow-x-auto rounded-xl border border-[var(--settings-input-border)] bg-[var(--settings-input-bg)] p-3 font-mono text-11 leading-[1.5] text-[var(--settings-input-text)]">
+                        <code>{SCRIPT_PROTOCOL_PYTHON_EXAMPLE}</code>
+                      </pre>
+                    </details>
+                  </div>
+                </div>
+                <label className="text-xs text-[var(--cmd-palette-item-meta)] dark:text-[var(--settings-section-desc)]">
+                  {t('scheduler.editor.script.command')}
+                </label>
+                <input
+                  type="text"
+                  value={form.scriptCommand ?? ''}
+                  onChange={(e) => setField('scriptCommand', e.target.value)}
+                  placeholder={t('scheduler.editor.script.commandPlaceholder')}
+                  className="h-10 rounded-full border border-[var(--settings-input-border)] bg-transparent px-4 text-sm text-[var(--settings-input-text)] outline-none"
+                />
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-[var(--cmd-palette-item-meta)] dark:text-[var(--settings-section-desc)]">
+                    {t('scheduler.editor.script.project')}
+                  </span>
+                  <ProjectChip
+                    value={form.workingDir}
+                    workspaceKind="project"
+                    onChange={(value) => setField('workingDir', value)}
+                    onChangeWorkspaceKind={() => undefined}
+                    projectOptions={projectOptions}
+                    disabled={isProjectAutomationMode}
+                    onChangeDestination={() => undefined}
+                  />
+                </div>
+                <label className="text-xs text-[var(--cmd-palette-item-meta)] dark:text-[var(--settings-section-desc)]">
+                  {t('scheduler.editor.script.timeout')}
+                </label>
+                <input
+                  type="number"
+                  min="1"
+                  value={form.scriptTimeoutSec ?? ''}
+                  onChange={(e) => setField('scriptTimeoutSec', e.target.value)}
+                  placeholder={t('scheduler.editor.script.timeoutPlaceholder')}
+                  className="h-10 rounded-full border border-[var(--settings-input-border)] bg-transparent px-4 text-sm text-[var(--settings-input-text)] outline-none"
+                />
+                <label className="text-xs text-[var(--cmd-palette-item-meta)] dark:text-[var(--settings-section-desc)]">
+                  {t('scheduler.editor.script.capabilitiesLabel')}
+                </label>
+                <ScriptCapabilityMultiSelect
+                  value={form.scriptCapabilities ?? []}
+                  onChange={(next) => setField('scriptCapabilities', next)}
+                />
+              </div>
+            )}
+
+            <div className="flex items-center gap-2.5">
+              <span className="text-xs leading-[1.33] text-[var(--cmd-palette-item-meta)] dark:text-[var(--settings-section-desc)]">{t('scheduler.editor.fields.schedule')}</span>
+              {/* 自动/手动 pill：把原先"勾一次才出现 Manually"的隐藏路径显式化。
+                  自动 → manual=false,显示 cron chip + Once;手动 → manual=true,cron 保留占位值不参与调度。 */}
+              <SegmentedControl
+                aria-label={t('scheduler.editor.fields.schedule')}
+                value={form.manual ? 'manually' : 'automatic'}
+                height={34}
+                onValueChange={(mode) => {
+                  const isManual = mode === 'manually';
+                  if (form.manual === isManual) return;
+                  setField('manual', isManual);
+                  setField('recurring', !isManual);
+                }}
+                options={(['automatic', 'manually'] as const).map((mode) => ({
+                  value: mode,
+                  label: t(`scheduler.editor.fields.${mode}`),
+                }))}
+              />
+              {/* 自动模式:cron chip + 一次(recurring 反向)。手动模式:两者全部隐藏——cron 占位值仍在 form 里,提交合法。 */}
+              {!form.manual && (
+                <>
+                  <ScheduleChip
+                    cronExpr={form.cronExpr}
+                    intervalMs={form.intervalMs}
+                    onChangeSchedule={(value) => {
+                      setField('cronExpr', value.cronExpr);
+                      setField('intervalMs', value.intervalMs);
+                    }}
+                  />
+                  <button
+                    type="button"
+                    role="checkbox"
+                    aria-checked={!form.recurring}
+                    onClick={() => setField('recurring', !form.recurring)}
+                    className={cn(
+                      'inline-flex h-[34px] items-center gap-2 rounded-md px-1.5',
+                      'text-13 leading-none text-[var(--settings-btn-secondary-text)]',
+                      'transition-colors hover:bg-[var(--surface-hover)]',
+                      'focus:outline-none',
+                    )}
+                  >
+                    <span
+                      className={cn(
+                        'inline-flex h-[14px] w-[14px] shrink-0 items-center justify-center rounded-[3px] border-[1.5px] transition-colors',
+                        !form.recurring
+                          ? 'border-[var(--lightbox-cta-bg)] bg-[var(--lightbox-cta-bg)] text-[var(--lightbox-cta-fg)]'
+                          : 'border-[var(--cmd-palette-item-meta)] bg-transparent dark:border-[var(--settings-section-desc)]',
+                      )}
+                      aria-hidden
+                    >
+                      {!form.recurring && (
+                        <svg
+                          viewBox="0 0 16 16"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth={2.5}
+                          className="h-[10px] w-[10px]"
+                        >
+                          <path d="M3 8l3.5 3.5L13 5" />
+                        </svg>
+                      )}
+                    </span>
+                    {t('scheduler.editor.fields.once')}
+                  </button>
+                </>
+              )}
+            </div>
+
+            {!isScriptMode && (
+            <div className="flex flex-col gap-2.5">
+            <div className="flex flex-wrap items-center gap-2.5">
+              {/* "运行会话"三态:合并了旧 persistentSession 开关与手绑会话两个概念。
+                  fresh = 每次新建;persistent = 持续会话(首次 fire 创建后续绑,归档后恢复原任务);
+                  bound = 绑定已有会话(picker 选,归档后恢复，删除/丢失时自动 pause)。
+                  project 自动化模式只显 fresh/persistent —— schedules.json 没有
+                  targetSessionId 通道,bound 在该模式无法落库。 */}
+              <span className="text-13 leading-none text-[var(--settings-btn-secondary-text)]">
+                {t('scheduler.editor.runSession.label')}
+              </span>
+              <SegmentedControl
+                aria-label={t('scheduler.editor.runSession.label')}
+                value={runMode}
+                onValueChange={setRunMode}
+                height={34}
+                options={(
+                  [
+                    'fresh',
+                    'persistent',
+                    ...(isProjectAutomationMode ? [] : ['bound' as const]),
+                  ] as RunMode[]
+                ).map((mode) => ({ value: mode, label: t(`scheduler.editor.runSession.${mode}`) }))}
+              />
+              <div className="inline-flex h-[34px] items-center gap-1.5">
+                <button
+                  type="button"
+                  role="checkbox"
+                  aria-checked={form.silentWhenIdle}
+                  onClick={() => setField('silentWhenIdle', !form.silentWhenIdle)}
+                  className={cn(
+                    'inline-flex h-full items-center gap-2 rounded-md px-1.5',
+                    'text-13 leading-none text-[var(--settings-btn-secondary-text)]',
+                    'transition-colors hover:bg-[var(--surface-hover)]',
+                    'focus:outline-none',
+                  )}
+                >
+                  <span
+                    className={cn(
+                      'inline-flex h-[14px] w-[14px] shrink-0 items-center justify-center rounded-[3px] border-[1.5px] transition-colors',
+                      form.silentWhenIdle
+                        ? 'border-[var(--lightbox-cta-bg)] bg-[var(--lightbox-cta-bg)] text-[var(--lightbox-cta-fg)]'
+                        : 'border-[var(--cmd-palette-item-meta)] bg-transparent dark:border-[var(--settings-section-desc)]',
+                    )}
+                    aria-hidden
+                  >
+                    {form.silentWhenIdle && (
+                      <Check size={10} strokeWidth={3} aria-hidden />
+                    )}
+                  </span>
+                  {t('scheduler.editor.fields.silentRun')}
+                </button>
+                <Tip
+                  text={t('scheduler.editor.fields.silentRunTooltip')}
+                  side="top"
+                  contentClassName="z-[10020]"
+                >
+                  <span
+                    tabIndex={0}
+                    className={cn(
+                      'inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full',
+                      'text-[var(--cmd-palette-item-meta)] outline-none transition-colors',
+                      'hover:bg-[var(--surface-hover)] hover:text-[var(--msg-assistant-text)]',
+                      'focus:bg-[var(--surface-hover)] focus:text-[var(--msg-assistant-text)]',
+                    )}
+                    aria-label={t('scheduler.editor.fields.silentRunInfoAria')}
+                  >
+                    <Info size={13} />
+                  </span>
+                </Tip>
+              </div>
+              {feishuBotReady ? (
+                <button
+                  type="button"
+                  role="checkbox"
+                  aria-checked={form.notifyFeishu}
+                  onClick={() => setField('notifyFeishu', !form.notifyFeishu)}
+                  className={cn(
+                    'inline-flex h-[34px] items-center gap-2 rounded-md px-1.5',
+                    'text-13 leading-none text-[var(--settings-btn-secondary-text)]',
+                    'transition-colors hover:bg-[var(--surface-hover)]',
+                    'focus:outline-none',
+                  )}
+                >
+                  <span
+                    className={cn(
+                      'inline-flex h-[14px] w-[14px] shrink-0 items-center justify-center rounded-[3px] border-[1.5px] transition-colors',
+                      form.notifyFeishu
+                        ? 'border-[var(--lightbox-cta-bg)] bg-[var(--lightbox-cta-bg)] text-[var(--lightbox-cta-fg)]'
+                        : 'border-[var(--cmd-palette-item-meta)] bg-transparent dark:border-[var(--settings-section-desc)]',
+                    )}
+                    aria-hidden
+                  >
+                    {form.notifyFeishu && (
+                      <svg
+                        viewBox="0 0 16 16"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth={2.5}
+                        className="h-[10px] w-[10px]"
+                      >
+                        <path d="M3 8l3.5 3.5L13 5" />
+                      </svg>
+                    )}
+                  </span>
+                  {t('scheduler.editor.fields.finishSendToFeishu')}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={goConfigFeishuBot}
+                  className={cn(
+                    'inline-flex h-[34px] items-center rounded-md px-2',
+                    'text-13 leading-none text-[var(--settings-btn-secondary-text)]',
+                    'transition-colors hover:bg-[var(--surface-hover)]',
+                    'focus:outline-none underline-offset-2 hover:underline',
+                  )}
+                >
+                  {t('scheduler.editor.fields.configFeishu')}
+                </button>
+              )}
+              {wecomGroupReady ? (
+                <button
+                  type="button"
+                  role="checkbox"
+                  aria-checked={form.notifyWecomGroup === true}
+                  onClick={() => setField('notifyWecomGroup', form.notifyWecomGroup !== true)}
+                  className={cn(
+                    'inline-flex h-[34px] items-center gap-2 rounded-md px-1.5',
+                    'text-13 leading-none text-[var(--settings-btn-secondary-text)]',
+                    'transition-colors hover:bg-[var(--surface-hover)] focus:outline-none',
+                  )}
+                >
+                  <span
+                    className={cn(
+                      'inline-flex h-[14px] w-[14px] shrink-0 items-center justify-center rounded-[3px] border-[1.5px] transition-colors',
+                      form.notifyWecomGroup
+                        ? 'border-[var(--lightbox-cta-bg)] bg-[var(--lightbox-cta-bg)] text-[var(--lightbox-cta-fg)]'
+                        : 'border-[var(--cmd-palette-item-meta)] bg-transparent dark:border-[var(--settings-section-desc)]',
+                    )}
+                    aria-hidden
+                  >
+                    {form.notifyWecomGroup && <Check size={10} strokeWidth={3} aria-hidden />}
+                  </span>
+                  {t('scheduler.editor.fields.finishSendToWecomGroup')}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={goConfigWecomGroup}
+                  className={cn(
+                    'inline-flex h-[34px] items-center rounded-md px-2',
+                    'text-13 leading-none text-[var(--settings-btn-secondary-text)]',
+                    'transition-colors hover:bg-[var(--surface-hover)]',
+                    'focus:outline-none underline-offset-2 hover:underline',
+                  )}
+                >
+                  {t('scheduler.editor.fields.configWecomGroup')}
+                </button>
+              )}
+            </div>
+            {/* bound 态:单行会话选择器(换选即换绑,选择器旁带"打开会话")。
+                不再叠加绑定卡片 —— 标题在 select 里已可见,单独的"解除绑定"
+                也多余(换选 / 切三态即可,且切换非破坏性)。 */}
+            {runMode === 'bound' && (
+              <ThreadPickerInline
+                value={form.targetSessionId}
+                onSelect={selectBoundSession}
+                onOpen={(id) => void openReferencedSession(id)}
+                reference={boundSessionReference}
+              />
+            )}
+            {/* persistent 已绑(runner 回写):无选择器,用卡片展示绑定信息。
+                project 模式不传 onUnbind —— schedules.json 无 targetSessionId
+                通道,解绑保存无法落库,按钮只会制造静默失败。 */}
+            {runMode === 'persistent' && isBound && (
+              <BoundSessionCard
+                sessionId={form.targetSessionId}
+                onUnbind={isProjectAutomationMode ? undefined : () => setRunMode('fresh')}
+                onOpen={() => void openReferencedSession(form.targetSessionId)}
+                reference={boundSessionReference}
+              />
+            )}
+            </div>
+            )}
+
+            {/* 前置检查(Pre-run Hook):触发时先执行脚本,exit 0 放行 / exit 2 跳过本轮
+                (不启动 agent、零 token);报错 / 超时会阻止本轮并记录失败。
+                仅 agent 模式展示——script 模式任务本体就是脚本,再叠一层脚本闸门是套娃。 */}
+            {!isScriptMode && (
+            <div className="flex flex-col gap-2">
+              <div className="flex flex-wrap items-center gap-2.5">
+                <span className="text-13 leading-none text-[var(--settings-btn-secondary-text)]">
+                  {t('scheduler.editor.preRunHook.label')}
+                </span>
+                <button
+                  type="button"
+                  role="checkbox"
+                  aria-checked={form.preRunHookEnabled}
+                  onClick={() => {
+                    setHookTestResult(null);
+                    setField('preRunHookEnabled', !form.preRunHookEnabled);
+                  }}
+                  className={cn(
+                    'inline-flex h-[34px] items-center gap-2 rounded-md px-1.5',
+                    'text-13 leading-none text-[var(--settings-btn-secondary-text)]',
+                    'transition-colors hover:bg-[var(--surface-hover)]',
+                    'focus:outline-none',
+                  )}
+                >
+                  <span
+                    className={cn(
+                      'inline-flex h-[14px] w-[14px] shrink-0 items-center justify-center rounded-[3px] border-[1.5px] transition-colors',
+                      form.preRunHookEnabled
+                        ? 'border-[var(--lightbox-cta-bg)] bg-[var(--lightbox-cta-bg)] text-[var(--lightbox-cta-fg)]'
+                        : 'border-[var(--cmd-palette-item-meta)] bg-transparent dark:border-[var(--settings-section-desc)]',
+                    )}
+                    aria-hidden
+                  >
+                    {form.preRunHookEnabled && <Check size={10} strokeWidth={3} aria-hidden />}
+                  </span>
+                  {t('scheduler.editor.preRunHook.enable')}
+                </button>
+                <Tip
+                  text={t(usePluginSource ? 'scheduler.editor.preRunPlugin.tooltip' : 'scheduler.editor.preRunHook.tooltip')}
+                  side="top"
+                  contentClassName="z-[10020]"
+                >
+                  <span
+                    tabIndex={0}
+                    className={cn(
+                      'inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full',
+                      'text-[var(--cmd-palette-item-meta)] outline-none transition-colors',
+                      'hover:bg-[var(--surface-hover)] hover:text-[var(--msg-assistant-text)]',
+                      'focus:bg-[var(--surface-hover)] focus:text-[var(--msg-assistant-text)]',
+                    )}
+                    aria-label={t('scheduler.editor.preRunHook.infoAria')}
+                  >
+                    <Info size={13} />
+                  </span>
+                </Tip>
+                {form.preRunHookEnabled && !isProjectAutomationMode && (
+                  <SegmentedControl
+                    aria-label={t('scheduler.editor.preRunPlugin.sourceLabel')}
+                    value={form.preRunSource}
+                    height={34}
+                    options={(['script', 'plugin'] as const).map((source) => ({
+                      value: source,
+                      label: t(`scheduler.editor.preRunPlugin.source.${source}`),
+                    }))}
+                    onValueChange={(source) => {
+                      setHookTestResult(null);
+                      setField('preRunSource', source);
+                    }}
+                  />
+                )}
+                {form.preRunHookEnabled && !usePluginSource && (
+                  <span className="text-xs leading-none text-[var(--cmd-palette-item-meta)] dark:text-[var(--settings-section-desc)]">
+                    {t('scheduler.editor.preRunHook.protocol')}
+                  </span>
+                )}
+              </div>
+              {form.preRunHookEnabled && usePluginSource && (
+                <PreRunPluginFields
+                  point="will-schedule-run"
+                  pluginId={form.preRunPluginId}
+                  onFailure={form.preRunPluginOnFailure}
+                  onPluginChange={setPreRunPluginId}
+                  onFailureChange={(action) => setField('preRunPluginOnFailure', action)}
+                />
+              )}
+              {form.preRunHookEnabled && !usePluginSource && (
+                <>
+                  <div className="flex items-center gap-2">
+                    <input
+                      value={form.preRunHookCommand}
+                      onChange={(e) => {
+                        setHookTestResult(null);
+                        // 手动改写命令后"脚本已生成:<path>"标签不再对应当前命令,一并清掉
+                        setHookGenPath(null);
+                        setField('preRunHookCommand', e.target.value);
+                      }}
+                      onDragOver={(e) => {
+                        e.preventDefault();
+                        setHookDragOver(true);
+                      }}
+                      onDragLeave={() => setHookDragOver(false)}
+                      onDrop={(e) => {
+                        e.preventDefault();
+                        setHookDragOver(false);
+                        const file = e.dataTransfer.files[0];
+                        if (!file) return;
+                        try {
+                          applyHookScriptFile(window.electronAPI.getFilePath(file));
+                        } catch (err) {
+                          showHookErrorToast(err);
+                        }
+                      }}
+                      placeholder={t('scheduler.editor.preRunHook.commandPlaceholder')}
+                      spellCheck={false}
+                      className={cn(
+                        'h-[38px] min-w-0 flex-1 rounded-xl border bg-[var(--settings-input-bg)] px-3.5',
+                        'font-mono text-xs text-[var(--settings-input-text)] placeholder-[var(--settings-input-placeholder)]',
+                        'outline-none transition-colors focus:border-[var(--confirm-btn-secondary-border)]',
+                        hookDragOver
+                          ? 'border-[var(--confirm-btn-secondary-border)] bg-[var(--chat-input-chip-bg)]'
+                          : 'border-[var(--settings-input-border)]',
+                      )}
+                    />
+                    <button
+                      type="button"
+                      onClick={() => void browseHookScript()}
+                      title={t('scheduler.editor.preRunHook.browse')}
+                      aria-label={t('scheduler.editor.preRunHook.browse')}
+                      className={cn(
+                        'inline-flex h-[38px] w-[38px] shrink-0 items-center justify-center rounded-full border border-[var(--settings-input-border)]',
+                        'text-[var(--settings-btn-secondary-text)] transition-colors',
+                        'hover:bg-[var(--surface-hover)] focus:outline-none',
+                      )}
+                    >
+                      <FolderOpen size={14} aria-hidden />
+                    </button>
+                        {/* 项目自动化(.cindy/automations/schedules.json)的 config schema 尚无
+                            executionMode/scriptConfig 字段,展示切换器会让 script 配置被静默丢弃
+                            ——该形态下隐藏,项目自动化对 script 模式的支持另行迭代。 */}
+                    <Button
+                      variant={hookGenOpen ? 'primary' : 'secondary'}
+                      size="lg"
+                      compact
+                      type="button"
+                      onClick={() => {
+                        setHookGenOpen((v) => !v);
+                        setHookGenPath(null);
+                        setHookGenFailure(null);
+                      }}
+                      aria-expanded={hookGenOpen}
+                    >
+                      <Sparkles size={12} aria-hidden />
+                      {form.preRunHookCommand.trim()
+                        ? t('scheduler.editor.preRunHook.aiModify')
+                        : t('scheduler.editor.preRunHook.aiCreate')}
+                    </Button>
+                        <Button
+                          variant="secondary"
+                          size="lg"
+                          loading={hookTesting}
+                          type="button"
+                          onClick={() => void runHookTest()}
+                          disabled={hookTesting || !form.preRunHookCommand.trim()}
+                          className="shrink-0"
+                        >
+                          <Play size={12} aria-hidden />
+                          {t('scheduler.editor.preRunHook.test')}
+                        </Button>
+                  </div>
+                  {/* AI 生成内联面板:描述想要的检查条件 → 生成脚本落盘 → 命令回填 */}
+                  {hookGenOpen && (
+                    <div className="flex flex-col gap-2 rounded-xl border border-[var(--settings-input-border)] bg-[var(--settings-input-bg)] p-3">
+                      <textarea
+                        value={hookGenDesc}
+                        onChange={(e) => setHookGenDesc(e.target.value)}
+                        placeholder={t('scheduler.editor.preRunHook.aiPlaceholder')}
+                        rows={2}
+                        autoFocus
+                        className={cn(
+                          'w-full resize-none bg-transparent text-13 leading-[1.5] outline-none',
+                          'text-[var(--settings-input-text)] placeholder-[var(--settings-input-placeholder)]',
+                        )}
+                      />
+                      {hookGenFailure && (
+                        <ErrorNotice
+                          role="alert"
+                          message={t(
+                            `scheduler.editor.preRunHook.aiFailure.${hookGenFailure.reason}`,
+                          )}
+                        >
+                          {hookGenFailure.attempts.length > 0 && (
+                            <div className="mt-2">
+                              <p className="text-11 text-[var(--text-secondary)]">
+                                {t('scheduler.editor.preRunHook.aiFailure.checkedCandidates')}
+                              </p>
+                              <ul className="mt-1 space-y-0.5 text-11 leading-[1.4] text-[var(--text-secondary)]">
+                                {hookGenFailure.attempts.map((attempt, index) => (
+                                  <li key={`${attempt.providerId}:${attempt.model}:${index}`}>
+                                    <span className="font-mono">
+                                      {attempt.providerId} · {attempt.model}
+                                    </span>
+                                    {' — '}
+                                    {t(
+                                      `scheduler.editor.preRunHook.aiFailure.attemptReason.${UTILITY_ATTEMPT_REASON_KEY[attempt.reason]}`,
+                                      attempt.reason === 'http_error'
+                                        ? { status: attempt.httpStatus ?? '?' }
+                                        : undefined,
+                                    )}
+                                  </li>
+                                ))}
+                              </ul>
+                            </div>
+                          )}
+                          <Button
+                            variant="secondary"
+                            size="sm"
+                            compact
+                            type="button"
+                            onClick={() => {
+                              onOpenChange(false);
+                              navigate('/settings?tab=providers');
+                            }}
+                            className="mt-2 select-none"
+                          >
+                            {t('scheduler.editor.preRunHook.aiFailure.openProviders')}
+                          </Button>
+                        </ErrorNotice>
+                      )}
+                      <div className="flex items-center justify-end gap-2">
+                            <Button
+                              variant="secondary"
+                              size="md"
+                              tone="quiet"
+                              compact
+                              type="button"
+                              onClick={() => {
+                                setHookGenOpen(false);
+                                setHookGenDesc('');
+                                setHookGenFailure(null);
+                              }}
+                              disabled={hookGenerating}
+                            >
+                              {t('scheduler.editor.preRunHook.aiCancel')}
+                            </Button>
+                            <Button
+                              variant="cta"
+                              size="md"
+                              compact
+                              loading={hookGenerating}
+                              type="button"
+                              onClick={() => void runHookGenerate()}
+                              disabled={hookGenerating || !hookGenDesc.trim()}
+                            >
+                              {hookGenerating && (
+                                <span
+                                  aria-hidden
+                                  className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-current"
+                                />
+                              )}
+                              {t('scheduler.editor.preRunHook.aiGenerate')}
+                            </Button>
+                      </div>
+                    </div>
+                  )}
+                  {hookGenPath && (
+                    <span className="truncate font-mono text-11 text-[var(--cmd-palette-item-meta)]">
+                      {t('scheduler.editor.preRunHook.aiDone', { path: hookGenPath })}
+                    </span>
+                  )}
+                  {hookTestResult && (
+                    <div className="flex flex-wrap items-center gap-2 rounded-lg bg-[var(--chat-input-chip-bg)] px-3 py-2 dark:bg-[var(--cmd-palette-bg)]">
+                      <span className="text-xs text-[var(--settings-btn-secondary-text)]">
+                        {hookTestResult.status === 'timed_out'
+                          ? t('scheduler.editor.preRunHook.resultTimeout')
+                          : hookTestResult.status === 'skipped'
+                            ? t('scheduler.editor.preRunHook.resultSkip', {
+                                ms: hookTestResult.durationMs,
+                              })
+                            : hookTestResult.status === 'passed'
+                              ? t('scheduler.editor.preRunHook.resultRun', {
+                                  code: hookTestResult.exitCode ?? 0,
+                                  ms: hookTestResult.durationMs,
+                                })
+                              : t('scheduler.editor.preRunHook.resultError', {
+                                  error:
+                                    hookTestResult.error ??
+                                    `exit ${hookTestResult.exitCode ?? '?'}`,
+                                })}
+                      </span>
+                      {(hookTestResult.stdout.trim() || hookTestResult.stderr.trim()) && (
+                        <span className="min-w-0 flex-1 truncate font-mono text-11 text-[var(--cmd-palette-item-meta)]">
+                          {(hookTestResult.stdout.trim() || hookTestResult.stderr.trim()).split('\n')[0]}
+                        </span>
+                      )}
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+            )}
+
+              {/* 项目自动化(.cindy/automations/schedules.json)的 config schema 尚无
+                  executionMode/scriptConfig 字段,展示切换器会让 script 配置被静默丢弃
+                  ——该形态下隐藏,项目自动化对 script 模式的支持另行迭代。 */}
+            {isScriptMode && (
+              <div className="flex shrink-0 justify-end">
+                  <Button
+                    variant="primary"
+                    size="lg"
+                    loading={submitting}
+                    type="button"
+                    aria-label={
+                      isEdit
+                        ? t('scheduler.editor.promptDialog.saveAria')
+                        : t('scheduler.editor.promptDialog.createAria')
+                    }
+                    onClick={() => void handleSubmit()}
+                    disabled={submitting}
+                    className="min-w-[68px] shrink-0"
+                  >
+                    {submitLabel}
+                  </Button>
+              </div>
+            )}
+
+              {/* 项目自动化(.cindy/automations/schedules.json)的 config schema 尚无
+                  executionMode/scriptConfig 字段,展示切换器会让 script 配置被静默丢弃
+                  ——该形态下隐藏,项目自动化对 script 模式的支持另行迭代。 */}
+            {!isScriptMode && (
+            <div className="flex shrink-0 flex-col gap-2">
+              <div className="flex items-center gap-2">
+                <span className="text-xs leading-[1.33] text-[var(--cmd-palette-item-meta)] dark:text-[var(--settings-section-desc)]">{t('scheduler.editor.fields.prompt')}</span>
+              </div>
+              <div className="flex h-[240px] flex-col overflow-hidden rounded-xl border border-[var(--settings-input-border)] bg-[var(--settings-input-bg)]">
+                <div className="min-h-0 flex-1 p-4">
+                  <textarea
+                    value={form.prompt}
+                    onChange={(e) => {
+                      if (selectedTemplate) setPromptDirty(true);
+                      setField('prompt', e.target.value);
+                    }}
+                    placeholder={t('scheduler.editor.promptDialog.promptPlaceholder')}
+                    className={cn(
+                      'h-full w-full resize-none overflow-y-auto bg-transparent text-sm leading-[1.43] outline-none',
+                      'text-[var(--settings-input-text)] placeholder-[var(--settings-input-placeholder)]',
+                      'select-text',
+                    )}
+                  />
+                </div>
+                <div className="flex h-[52px] shrink-0 items-center gap-0 border-t border-[var(--settings-input-border)] px-2.5 py-2">
+                  <div className="flex min-w-0 flex-1 items-center gap-0">
+                    {/* heartbeat 形态(hideWorkspaceFields)下目录 / worktree / fastMode
+                        由绑定会话决定,runner 忽略 schedule 上的值 —— 直接隐藏,不渲染
+                        一排改了也无效的控件。B 态未绑定时仍显示(首次 fire 要用)。 */}
+                    {!hideWorkspaceFields && (
+                      <ProjectChip
+                        value={form.workingDir}
+                        workspaceKind={form.workspaceKind}
+                        onChange={(v) => setField('workingDir', v)}
+                        onChangeWorkspaceKind={(v) => {
+                          setField('workspaceKind', v);
+                          if (v === 'dialogue') setField('useWorktree', false);
+                        }}
+                        projectOptions={projectOptions}
+                        disabled={isProjectAutomationMode}
+                        onChangeDestination={setDestination}
+                      />
+                    )}
+                    {!hideWorkspaceFields && form.workspaceKind === 'project' && (
+                      <>
+                        <div className="w-0.5 shrink-0" aria-hidden />
+                        <ScheduleSettingsButton
+                          cwd={form.workingDir || null}
+                          enabled={form.useWorktree}
+                          onEnabledChange={(v) => setField('useWorktree', v)}
+                        />
+                      </>
+                    )}
+                    <div className="min-w-0 flex-1" />
+                    <ModelEffortChip
+                      onSelect={({ engine, modelId, providerId, effort, fast, agentDevice }) => selectModelConfiguration({
+                        agentKind: engine === 'cc' ? 'claude-code' : engine,
+                        model: modelId, providerId, effort: (effort ?? '') as typeof form.effort,
+                        fastMode: fast,
+                        modelAgentDeviceId: agentDevice?.deviceId ?? '',
+                      })}
+                      onFollowSession={() => selectModelConfiguration(null,
+                        boundSessionReference?.agentKind === 'cc' ? 'claude-code' : boundSessionReference?.agentKind)}
+                      agentKind={form.agentKind}
+                      agentDeviceId={selectedAgentDeviceId ?? undefined}
+                      modelValue={form.model}
+                      onChangeModel={(v) => setField('model', v)}
+                      effortValue={form.effort}
+                      onChangeEffort={(v) => setField('effort', v)}
+                      followSession={isBound}
+                      providerId={form.providerId}
+                      onChangeProviderId={(v) => setField('providerId', v)}
+                      onNavigateToProviders={() => navigate('/settings?tab=providers')}
+                      fastMode={form.fastMode}
+                      onChangeFast={(v) => {
+                        setField('fastMode', v);
+                        // Fast-only edits also make legacy model selections explicit.
+                        if (form.model.trim()) setField('modelAgentKind', form.agentKind);
+                      }}
+                    />
+                  </div>
+                      <Button
+                        variant="primary"
+                        size="lg"
+                        loading={submitting}
+                        type="button"
+                        aria-label={
+                          isEdit
+                            ? t('scheduler.editor.promptDialog.saveAria')
+                            : t('scheduler.editor.promptDialog.createAria')
+                        }
+                        onClick={() => void handleSubmit()}
+                        disabled={submitting}
+                        className="min-w-[68px] shrink-0"
+                      >
+                        {submitLabel}
+                      </Button>
+                </div>
+              </div>
+                  {/* 项目自动化(.cindy/automations/schedules.json)的 config schema 尚无
+                      executionMode/scriptConfig 字段,展示切换器会让 script 配置被静默丢弃
+                      ——该形态下隐藏,项目自动化对 script 模式的支持另行迭代。 */}
+              {isBound && form.model.trim() !== '' && (
+                <p className="px-1 text-11 leading-[1.4] text-[var(--cmd-palette-item-meta)]">
+                  {t('scheduler.editor.runSession.switchModelHint')}
+                </p>
+              )}
+            </div>
+            )}
+          </div>
+          )}
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
+  );
+}

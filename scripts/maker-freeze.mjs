@@ -15,7 +15,8 @@ import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const cindyDir = path.resolve(process.env.CINDY_DIR ?? path.join(root, '..', 'cindy'));
+// translator 对齐上游较新版本，用 vendor/cindy-maker-main 里的依赖闭包（见其 README.md）。
+const cindyDir = path.resolve(process.env.CINDY_DIR ?? path.join(root, 'vendor', 'cindy-maker-main'));
 const piRs = path.join(root, 'pi-rs', 'target', 'release', 'pi');
 const UPDATE = process.argv.includes('--update');
 
@@ -73,6 +74,24 @@ writeFileSync(framesFileFiltered, frames.join('\n') + '\n');
 
 // ── 2. TS 侧：打包 translator 重放器并执行 ──
 const bundle = path.join(tmp, 'translator-replay.cjs');
+// vendor 里没有 pnpm workspace 的 node_modules：按各包 package.json 的 exports 手动解析 @cindy/<pkg>[/sub]。
+function workspaceExportsPlugin(dir) {
+  return {
+    name: 'cindy-workspace-exports',
+    setup(b) {
+      b.onResolve({ filter: /^@cindy\/[^/]+(\/.*)?$/ }, (args) => {
+        const m = /^@cindy\/([^/]+)(\/.*)?$/.exec(args.path);
+        const pkgDir = path.join(dir, 'packages', m[1]);
+        const pj = path.join(pkgDir, 'package.json');
+        if (!existsSync(pj)) return null;
+        const exp = JSON.parse(readFileSync(pj, 'utf8')).exports ?? {};
+        const rel = exp['.' + (m[2] ?? '')];
+        const target = typeof rel === 'string' ? rel : rel?.import ?? rel?.default ?? rel?.types;
+        return target ? { path: path.join(pkgDir, target) } : null;
+      });
+    },
+  };
+}
 await build({
   entryPoints: [path.join(root, 'scripts', 'freeze', 'translator-replay.ts')],
   bundle: true,
@@ -83,6 +102,7 @@ await build({
   nodePaths: [path.join(cindyDir, 'apps', 'cindy-headless', 'node_modules'), path.join(cindyDir, 'apps', 'desktop', 'node_modules'), path.join(cindyDir, 'node_modules')],
   // maker-core 的 exports 不放行深层子路径，直接指到源文件。
   alias: { '@cindy/maker-core/agents/pi/translator': path.join(cindyDir, 'packages/maker-core/src/agents/pi/translator.ts') },
+  plugins: [workspaceExportsPlugin(cindyDir)],
   loader: { '.md': 'text' },
   logLevel: 'silent',
   define: { 'import.meta.url': JSON.stringify(pathToFileUrl(path.join(root, 'scripts', 'freeze'))), 'import.meta.env': '{"VITE_CINDY_AUTH_REGION":"global"}' },

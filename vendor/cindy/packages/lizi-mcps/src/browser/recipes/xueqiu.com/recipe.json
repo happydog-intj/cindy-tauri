@@ -1,0 +1,23 @@
+{
+  "id": "xueqiu-search-stock",
+  "match": [
+    "xueqiu.com"
+  ],
+  "description": "搜索雪球股票（代码或名称）",
+  "access": "read",
+  "adapter": "xueqiu/search",
+  "inputs": {
+    "query": {
+      "required": true,
+      "type": "str",
+      "description": "搜索关键词，如 茅台、AAPL、腾讯"
+    },
+    "limit": {
+      "required": false,
+      "type": "int",
+      "default": 10,
+      "description": "返回数量，默认 10"
+    }
+  },
+  "steps": []
+}

@@ -1,8 +1,8 @@
 // model-config 的 provider 视图：内嵌数据表（完整注册表 + 随包 Pi 目录行）与黄金样例。
 // 黄金：对一批受限配置（pi runtime、openai-chat、无头、无 OAuth）运行上游真实的 buildUserProvider + buildRegistry。
 import { BUNDLED_CATALOG, buildRegistry, buildUserProvider, isModelSelectableForNewRoute, parseModelsListResponse } from '@cindy/model-providers';
-import { PROVIDER_MODEL_CATALOG } from '../../../cindy/packages/model-providers/src/providerModelCatalog.ts';
-import { registryEntryDefaults } from '../../../cindy/packages/model-providers/src/modelMetadataLayers.ts';
+import { PROVIDER_MODEL_CATALOG } from '../../vendor/cindy/packages/model-providers/src/providerModelCatalog.ts';
+import { registryEntryDefaults } from '../../vendor/cindy/packages/model-providers/src/modelMetadataLayers.ts';
 
 const reg: any = BUNDLED_CATALOG.modelRegistry;
 const norm = (v: any) => JSON.parse(JSON.stringify(v === undefined ? null : v));

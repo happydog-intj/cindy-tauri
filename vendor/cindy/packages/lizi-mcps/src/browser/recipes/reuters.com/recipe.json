@@ -1,0 +1,24 @@
+{
+  "id": "reuters-search",
+  "match": [
+    "reuters.com",
+    "www.reuters.com"
+  ],
+  "description": "Reuters 路透社新闻搜索",
+  "access": "read",
+  "adapter": "reuters/search",
+  "inputs": {
+    "query": {
+      "required": true,
+      "type": "str",
+      "description": "Search query"
+    },
+    "limit": {
+      "required": false,
+      "type": "int",
+      "default": 10,
+      "description": "Number of results (1-40)"
+    }
+  },
+  "steps": []
+}

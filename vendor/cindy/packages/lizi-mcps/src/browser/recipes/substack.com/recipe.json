@@ -1,0 +1,36 @@
+{
+  "id": "substack-search",
+  "match": [
+    "substack.com"
+  ],
+  "description": "搜索 Substack 文章和 Newsletter",
+  "access": "read",
+  "adapter": "substack/search",
+  "adapterInputMap": {
+    "query": "keyword"
+  },
+  "inputs": {
+    "query": {
+      "required": true,
+      "type": "str",
+      "description": "搜索关键词"
+    },
+    "type": {
+      "required": false,
+      "type": "str",
+      "default": "posts",
+      "description": "搜索类型（posts=文章, publications=Newsletter）",
+      "choices": [
+        "posts",
+        "publications"
+      ]
+    },
+    "limit": {
+      "required": false,
+      "type": "int",
+      "default": 20,
+      "description": "返回结果数量"
+    }
+  },
+  "steps": []
+}

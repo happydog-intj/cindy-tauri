@@ -1,0 +1,82 @@
+{
+  "id": "xiaohongshu-search",
+  "match": [
+    "xiaohongshu.com"
+  ],
+  "description": "搜索小红书笔记",
+  "access": "read",
+  "adapter": "xiaohongshu/search",
+  "inputs": {
+    "query": {
+      "required": true,
+      "type": "str",
+      "description": "Search keyword"
+    },
+    "limit": {
+      "required": false,
+      "type": "int",
+      "default": 20,
+      "description": "Number of results"
+    },
+    "sort": {
+      "required": false,
+      "type": "string",
+      "default": "comprehensive",
+      "description": "Sort order",
+      "choices": [
+        "comprehensive",
+        "latest",
+        "most-liked",
+        "most-commented",
+        "most-collected"
+      ]
+    },
+    "note-type": {
+      "required": false,
+      "type": "string",
+      "default": "all",
+      "description": "Note type",
+      "choices": [
+        "all",
+        "video",
+        "image"
+      ]
+    },
+    "publish-time": {
+      "required": false,
+      "type": "string",
+      "default": "anytime",
+      "description": "Publish time range",
+      "choices": [
+        "anytime",
+        "day",
+        "week",
+        "half-year"
+      ]
+    },
+    "scope": {
+      "required": false,
+      "type": "string",
+      "default": "all",
+      "description": "Search scope",
+      "choices": [
+        "all",
+        "seen",
+        "unseen",
+        "following"
+      ]
+    },
+    "location": {
+      "required": false,
+      "type": "string",
+      "default": "all",
+      "description": "Location distance",
+      "choices": [
+        "all",
+        "same-city",
+        "nearby"
+      ]
+    }
+  },
+  "steps": []
+}

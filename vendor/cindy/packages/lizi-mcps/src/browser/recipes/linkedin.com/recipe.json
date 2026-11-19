@@ -1,0 +1,65 @@
+{
+  "id": "linkedin-jobs-search",
+  "match": [
+    "linkedin.com"
+  ],
+  "description": "Search LinkedIn jobs",
+  "access": "read",
+  "adapter": "linkedin/search",
+  "inputs": {
+    "query": {
+      "required": true,
+      "type": "string",
+      "description": "Job search keywords"
+    },
+    "location": {
+      "required": false,
+      "type": "string",
+      "description": "Location text such as San Francisco Bay Area"
+    },
+    "limit": {
+      "required": false,
+      "type": "int",
+      "default": 10,
+      "description": "Number of jobs to return (max 100)"
+    },
+    "start": {
+      "required": false,
+      "type": "int",
+      "default": 0,
+      "description": "Result offset for pagination"
+    },
+    "details": {
+      "required": false,
+      "type": "bool",
+      "default": false,
+      "description": "Include full job description and apply URL (slower)"
+    },
+    "company": {
+      "required": false,
+      "type": "string",
+      "description": "Comma-separated company names or LinkedIn company IDs"
+    },
+    "experience-level": {
+      "required": false,
+      "type": "string",
+      "description": "Comma-separated: internship, entry, associate, mid-senior, director, executive"
+    },
+    "job-type": {
+      "required": false,
+      "type": "string",
+      "description": "Comma-separated: full-time, part-time, contract, temporary, volunteer, internship, other"
+    },
+    "date-posted": {
+      "required": false,
+      "type": "string",
+      "description": "One of: any, month, week, 24h"
+    },
+    "remote": {
+      "required": false,
+      "type": "string",
+      "description": "Comma-separated: on-site, hybrid, remote"
+    }
+  },
+  "steps": []
+}

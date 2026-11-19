@@ -1,0 +1,17 @@
+{
+  "id": "instagram-profile",
+  "match": [
+    "instagram.com"
+  ],
+  "description": "Get Instagram user profile info",
+  "access": "read",
+  "adapter": "instagram/profile",
+  "inputs": {
+    "username": {
+      "required": true,
+      "type": "str",
+      "description": "Instagram username"
+    }
+  },
+  "steps": []
+}

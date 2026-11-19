@@ -1,0 +1,34 @@
+{
+  "id": "coupang-search",
+  "match": [
+    "coupang.com"
+  ],
+  "description": "Search Coupang products with logged-in browser session",
+  "access": "read",
+  "adapter": "coupang/search",
+  "inputs": {
+    "query": {
+      "required": true,
+      "type": "str",
+      "description": "Search keyword"
+    },
+    "page": {
+      "required": false,
+      "type": "int",
+      "default": 1,
+      "description": "Search result page number"
+    },
+    "limit": {
+      "required": false,
+      "type": "int",
+      "default": 20,
+      "description": "Max results (max 50)"
+    },
+    "filter": {
+      "required": false,
+      "type": "str",
+      "description": "Optional search filter (currently supports: rocket)"
+    }
+  },
+  "steps": []
+}

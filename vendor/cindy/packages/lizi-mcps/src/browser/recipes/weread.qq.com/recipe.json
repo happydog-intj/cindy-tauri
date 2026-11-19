@@ -1,0 +1,23 @@
+{
+  "id": "weread-search",
+  "match": [
+    "weread.qq.com"
+  ],
+  "description": "Search books on WeRead",
+  "access": "read",
+  "adapter": "weread/search",
+  "inputs": {
+    "query": {
+      "required": true,
+      "type": "str",
+      "description": "Search keyword"
+    },
+    "limit": {
+      "required": false,
+      "type": "int",
+      "default": 10,
+      "description": "Max results"
+    }
+  },
+  "steps": []
+}

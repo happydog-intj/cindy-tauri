@@ -1,0 +1,248 @@
+/**
+ * xdt-helper/index.ts
+ *
+ * Bundle export for the xdt-helper tool family. lizi_xdtHelperMcpServer.ts imports
+ * from here and registers everything in one go (mirrors scheduler/index.ts).
+ *
+ * Note: handoff 工具 send_to_session 注册在 cindy_helper 的 handoff 类目(走 call_tool,essential 常开)。
+ * 协同 team 工具由 cindy_orca server(src/orca/)托管,通过本目录的 register*Tool 注册。
+ */
+
+export { registerGetCapabilitiesTool } from './get_capabilities.js';
+export { registerAppUpdateTools, type AppUpdateCallbacks } from './app_update.js';
+export { registerGrokLoginTools, type GrokLoginCallbacks, type GrokLoginState } from './grok_login.js';
+export { registerInputHandoffTool, type InputHandoffCallbacks, type InputHandoffToolRequest, type InputHandoffToolResult } from './input_handoff.js';
+export { registerSkillhubTools, type SkillhubAgentCallback, type SkillhubAgentRequest } from './skillhub.js';
+export {
+  registerGetCurrentSessionIdTool,
+  type GetCurrentSessionIdDeps,
+} from './get_current_session_id.js';
+export {
+  registerSetCurrentSessionTitleTool,
+  type SetCurrentSessionTitleDeps,
+  type SetCurrentSessionTitleResult,
+} from './set_current_session_title.js';
+export {
+  registerRenameSessionsTool,
+  type RenameSessionChange,
+  type RenameSessionPreviewItem,
+  type RenameSessionsDeps,
+  type RenameSessionsResult,
+} from './rename_sessions.js';
+export {
+  registerSendToSessionTool,
+  type SendToSessionCallback,
+  type SendToSessionDeps,
+} from './send_to_session.js';
+export {
+  registerArchiveSessionsTool,
+  registerUnarchiveSessionsTool,
+  type ArchiveSessionsDeps,
+  type SessionStatus,
+  type SessionStatusChangeItem,
+  type SetSessionsStatusResult,
+  type RemoteSessionsStatusResult,
+} from './archive_sessions.js';
+export {
+  registerSessionImportTools,
+  type SessionImportCallbacks,
+  type SessionImportDeps,
+} from './session_import.js';
+// multi-worker Phase 1 control tools
+export {
+  registerStartTeamTool,
+  type StartTeamDeps,
+} from './start_team.js';
+export {
+  registerCreateWorkerTool,
+  type CreateWorkerDeps,
+} from './create_worker.js';
+export { registerCreateWorkersTool } from './create_workers.js';
+export {
+  registerListWorkersTool,
+  type ListWorkersDeps,
+  type WorkerSummary,
+} from './list_workers.js';
+export {
+  registerSwitchFocusTool,
+  type SwitchFocusDeps,
+} from './switch_focus.js';
+export {
+  registerSendToWorkerTool,
+  type OrcaMessageDelivery,
+  type SendToWorkerDeps,
+  type SteerFallbackReason,
+} from './send_to_worker.js';
+export {
+  registerGetWorkerQueueStatusTool,
+  type GetWorkerQueueStatusDeps,
+  type WorkerQueuedMessageEntry,
+} from './get_worker_queue_status.js';
+export {
+  registerUpdateQueuedMessageTool,
+  type QueuedMessageControlErrorCode,
+  type UpdateQueuedMessageDeps,
+} from './update_queued_message.js';
+export {
+  registerCancelQueuedMessageTool,
+  type CancelQueuedMessageDeps,
+} from './cancel_queued_message.js';
+export {
+  registerMergeQueuedMessagesTool,
+  type MergeQueuedMessagesDeps,
+} from './merge_queued_messages.js';
+export {
+  registerSteerQueuedMessageTool,
+  type QueuedMessageSteerReason,
+  type SteerQueuedMessageDeps,
+} from './steer_queued_message.js';
+export {
+  registerMoveQueuedMessageTool,
+  type MoveQueuedMessageDeps,
+} from './move_queued_message.js';
+export {
+  registerIdleWorkerTool,
+  type IdleWorkerDeps,
+} from './idle_worker.js';
+export {
+  registerEndTeamTool,
+  type EndTeamDeps,
+} from './end_team.js';
+export {
+  registerArchiveWorkerTool,
+  type ArchiveWorkerDeps,
+} from './archive_worker.js';
+export {
+  registerUpdateWorkerTool,
+  type UpdateWorkerDeps,
+} from './update_worker.js';
+export {
+  registerListAvailableModelsTool,
+  type ListAvailableModelsDeps,
+  type ModelDescriptor,
+} from './list_available_models.js';
+// history tools (split out from xdt-helper but kept exports here)
+export { registerHistoryDevicesTool, historyPayload } from './_history_devices.js';
+export type { HistoryRemoteDeps, HistoryDevice, HistoryQueryTool } from './_history_devices.js';
+export {
+  registerListWorkdirsTool,
+  type ListWorkdirsToolDeps,
+} from './list_workdirs.js';
+export {
+  registerListSessionsTool,
+  type ListSessionsToolDeps,
+} from './list_sessions.js';
+export {
+  registerListSessionQueueTool,
+  type SessionQueueDeps,
+  type SessionQueuedMessageEntry,
+} from './list_session_queue.js';
+export {
+  registerUpdateSessionQueuedMessageTool,
+  registerCancelSessionQueuedMessageTool,
+  registerSteerSessionTool,
+  registerSteerSessionQueuedMessageTool,
+  registerMoveSessionQueuedMessageTool,
+  registerStopSessionTurnTool,
+  registerGetSessionRuntimeTool,
+  registerSetSessionRuntimeTool,
+  type SessionControlDeps,
+  type SessionQueueControlErrorCode,
+  type SessionQueueSteerReason,
+  type SessionRuntimeProfile,
+  type SessionRuntimeSnapshot,
+  type SessionSteerErrorCode,
+  type SessionStopErrorCode,
+} from './session_control.js';
+export {
+  registerGetChatHistoryTool,
+  type GetChatHistoryToolDeps,
+} from './get_chat_history.js';
+export {
+  registerSearchChatHistoryTool,
+  type SearchChatHistoryToolDeps,
+} from './search_chat_history.js';
+export {
+  registerBotSkillTools,
+  type BotSkillCallbacks,
+  type BotSkillSummaryWire,
+  type BotSkillToolDeps,
+} from './bot_skills.js';
+export {
+  registerBotWorkbenchTools,
+  glanceForModel,
+  WORKBENCH_MESSAGE_MAX_CHARS,
+  type BotGlanceWire,
+  type BotWorkbenchCallbacks,
+  type BotWorkbenchToolDeps,
+  type GlanceKindWire,
+  type GlanceRowWire,
+  type WorkbenchTranscriptWire,
+} from './bot_workbench.js';
+export {
+  registerGetTaskDigestTool,
+  boundTaskDigest,
+  TASK_DIGEST_MAX_BYTES,
+  TASK_DIGEST_TEXT_MAX,
+  type GetTaskDigestToolDeps,
+  type TaskDigestPhase,
+  type TaskDigestRoute,
+  type TaskDigestWire,
+} from './get_task_digest.js';
+export {
+  registerCreateTeammateTool,
+  type CreateTeammateCallbacks,
+} from './create_teammate.js';
+export {
+  registerTeammateHomeTools,
+  type TeammateHomeCallbacks,
+  type TeammateHomeComputerWire,
+} from './teammate_home.js';
+export {
+  registerBotCapabilityTools,
+  buildFindBotCapabilitiesDescription,
+  withCindyGatedBotToolDescriptions,
+  type BotCapabilityCallbacks,
+} from './bot_capabilities.js';
+export {
+  registerSubmitGithubIssueTool,
+  type SubmitGithubIssueDeps,
+  type SubmitGithubIssueHostResult,
+  type SubmitGithubIssueHostOk,
+  type SubmitGithubIssueHostErr,
+  type SubmitGithubIssueHostErrorCode,
+} from './submit_github_issue.js';
+export {
+  registerStartSkillLearningTool,
+  type AuthorizedSkillLearningContext,
+  type AuthorizeSkillLearningCallback,
+  type StartSkillLearningCallback,
+  type StartSkillLearningParams,
+} from './start_skill_learning.js';
+export type {
+  XdtHelperHistoryDeps,
+  HistoryAgentKind,
+  HistoryOrder,
+  HistoryReadErrorCode,
+  HistoryRole,
+  HistoryCursor,
+  HistoryPage,
+  HistoryWorkdir,
+  HistorySession,
+  HistoryCompanion,
+  HistoryMessage,
+  ListWorkdirsArgs,
+  ListSessionsArgs,
+  GetMessagesArgs,
+  SearchChatHistoryArgs,
+  SearchChatHistoryHit,
+  SearchChatHistoryContextMessage,
+  SearchChatHistorySessionMeta,
+  SearchChatHistoryResult,
+} from './_history_types.js';
+export {
+  CAPABILITIES,
+  findCapability,
+  listCapabilityIndex,
+} from './capabilities.js';
+export type { CapabilityEntry } from './capabilities.js';

@@ -1,12 +1,12 @@
 // 生成 src-tauri/src/main_strings.json：托盘 / 通知 / 原生对话框用的主进程文案。
 // 从 cindy renderer 的 locale JSON 里按 scripts/main-strings/keys.json 抽取；上游改文案后重跑并提交。
-// 用法：node scripts/gen-main-strings.mjs [cindy 仓库目录]，默认读 CINDY_DIR 或 ../cindy。
+// 用法：node scripts/gen-main-strings.mjs [cindy 仓库目录]，默认读 CINDY_DIR 或 vendor/cindy。
 import { readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const cindyDir = path.resolve(process.argv[2] ?? process.env.CINDY_DIR ?? path.join(root, '..', 'cindy'));
+const cindyDir = path.resolve(process.argv[2] ?? process.env.CINDY_DIR ?? path.join(root, 'vendor', 'cindy'));
 const localesDir = path.join(cindyDir, 'apps', 'desktop', 'src', 'renderer', 'i18n', 'locales');
 const LOCALES = ['zh-CN', 'zh-TW', 'en', 'ja', 'ko', 'es', 'fr', 'de', 'pt-PT', 'pt-BR', 'zh-Hant-x-lzh', 'zh-Hans-x-lzh'];
 const keys = JSON.parse(readFileSync(path.join(root, 'scripts', 'main-strings', 'keys.json'), 'utf8'));

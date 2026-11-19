@@ -1,0 +1,30 @@
+"$schema" = "../gen/schemas/desktop-schema.json"
+
+[[permission]]
+identifier = "allow-get-status"
+description = "Allow the UI to read the current installer status."
+commands.allow = ["get_status"]
+
+[[permission]]
+identifier = "allow-open-log-dir"
+description = "Allow the UI to open the log directory in the OS file explorer."
+commands.allow = ["open_log_dir"]
+
+[[permission]]
+identifier = "allow-quit-now"
+description = "Allow the UI to terminate the updater process."
+commands.allow = ["quit_now"]
+
+[[permission]]
+identifier = "allow-retry-update"
+description = "Allow the UI to start a user-requested update retry."
+commands.allow = ["retry_update"]
+
+[default]
+description = "All commands the cindy-updater UI needs."
+permissions = [
+  "allow-get-status",
+  "allow-open-log-dir",
+  "allow-quit-now",
+  "allow-retry-update",
+]

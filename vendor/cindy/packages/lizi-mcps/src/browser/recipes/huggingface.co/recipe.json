@@ -1,0 +1,37 @@
+{
+  "id": "hf-model-search",
+  "match": [
+    "huggingface.co"
+  ],
+  "description": "Top Hugging Face models (downloads / likes / trending / freshness).",
+  "access": "read",
+  "adapter": "hf/models",
+  "adapterInputMap": {
+    "query": "search"
+  },
+  "inputs": {
+    "sort": {
+      "required": false,
+      "type": "string",
+      "default": "downloads",
+      "description": "Sort key: downloads, likes, trending, created_at, last_modified"
+    },
+    "query": {
+      "required": false,
+      "type": "string",
+      "description": "Optional name/owner substring filter (e.g. \"llama\", \"mistralai/\")"
+    },
+    "pipeline": {
+      "required": false,
+      "type": "string",
+      "description": "Filter by pipeline tag (e.g. text-generation, image-classification)"
+    },
+    "limit": {
+      "required": false,
+      "type": "int",
+      "default": 20,
+      "description": "Max models (max 100; one API page)."
+    }
+  },
+  "steps": []
+}

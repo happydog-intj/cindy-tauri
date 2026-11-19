@@ -1,0 +1,56 @@
+/**
+ * @cindy/mcps
+ *
+ * Reusable MCP server factories plus provider helpers. Hosts inject their own
+ * auth, storage, media, and transport adapters instead of this package reaching
+ * back into a concrete desktop app.
+ */
+
+export const VERSION = '0.0.0';
+
+export * from './types.js';
+export * from './providers.js';
+export type { ToolCallAuthorization, ToolCallAuthorizer } from './tool-call-authority.js';
+
+// feishu/ OpenAPI MCP 模块已于 2026-07-22 整体退役:能力早已迁入插件
+// xd-feishu(2026-07-16 摘壳),其直通面生成器 + vendored OpenAPI 数据源也已
+// 迁入独立插件包。活着的飞书 bot 走 lizi_feishuBot*
+// + @cindy/@cindy/im,与本已删模块无关。
+
+export * from './cindy_feishuBotMcpServer.js';
+export * from './cindy_wechatMcpServer.js';
+export * from './cindy_feishuBotToolRegistry.js';
+
+export * from './cindy_schedulerMcpServer.js';
+export * from './cindy_schedulerToolRegistry.js';
+export * from './scheduler/index.js';
+
+export * from './cindy_sshMcpServer.js';
+export * from './ssh/registry.js';
+export * from './ssh/index.js';
+
+export * from './lizi_xdtHelperMcpServer.js';
+export * from './lizi_xdtHelperToolRegistry.js';
+export * from './xdt-helper/index.js';
+
+export { createCindyDocsMcpServer } from './cindy_docsMcpServer.js';
+export * from './cindy_docsToolRegistry.js';
+export * from './cindy-docs/index.js';
+
+export * from './orca/index.js';
+
+export * from './session-context.js';
+export * from './session-path-auth.js';
+
+export * from './lsp/index.js';
+
+export * from './android/index.js';
+export * from './browser/index.js';
+export * from './computer/index.js';
+
+
+export { TEAMMATE_CONTROL_GUIDANCE, BOT_CONTROL_GUIDANCE, type BotControlState, type TeammateCapabilityKind } from './xdt-helper/bot_capabilities.js';
+export {
+  TEAMMATE_SYSTEM_SKILL_IDS, TEAMMATE_SYSTEM_SKILLS, TEAMMATE_SYSTEM_SKILL_TOOLS, TEAMMATE_CORE_TOPICS,
+  teammateDeniedTools, teammateSystemSkillsOff, type TeammateSystemSkillId,
+} from './xdt-helper/teammate_skills.js';

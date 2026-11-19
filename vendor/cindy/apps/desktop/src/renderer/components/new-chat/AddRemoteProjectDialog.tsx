@@ -1,0 +1,743 @@
+import { Button } from '@/components/ui/button';
+/**
+ * AddRemoteProjectDialog — pick a folder on a connected remote target.
+ *
+ * device-link 接入后,「远程目标」统一两类(顶部下拉 optgroup 区分):
+ *   - SSH 远程主机(`remoteSsh.list()` 的 ready hosts)
+ *   - device-link 同账号被控设备(`online && remoteControlEnabled && !isSelf`)
+ * 选谁决定走哪套浏览适配器(见 remoteBrowseAdapters.ts);弹窗 UI 只认统一接口,
+ * 导航一律用 entry.childPath / ListResult.parent,两类来源的路径差异封装在适配器里
+ * (device-link 被控端可能是 Windows → 用 handler 回传的 native 路径,renderer 不拼接)。
+ *
+ * 工作流:
+ *   1. 打开 → 拉 SSH ready hosts + 可控设备 → 默认选第一个目标,默认路径 `~`
+ *   2. 路径变 / 目标变 → adapter.listDir(远端 ls / 隧道 fs:list-dir),渲染子目录
+ *   3. 双击 entry → cd 进(用 entry.childPath);「返回上级」用 ListResult.parent
+ *   4. 「添加项目」→ adapter.statPath 校验 → existing dir 直接 onProjectAdded(带 kind);
+ *      missing → confirm 提示,同意则 adapter.mkdirP,失败 toast
+ */
+
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import * as Dialog from '@radix-ui/react-dialog';
+import { X, Folder, FolderSymlink, ChevronLeft, RotateCw } from 'lucide-react';
+
+import { cn } from '@/lib/utils';
+import type { MakerVendor } from '@/lib/ccAgent.types';
+import { Spinner } from '@/components/ui/spinner';
+import { SegmentedControl } from '@/components/ui/segmented-control';
+import { toast } from '@/lib/toast';
+import { useConfirmDialog } from '@/components/ui/confirm-dialog-provider';
+import { mapIpcErrorToI18nKey } from '@/utils/ipcError';
+import {
+  SshModelSelectionError,
+  sshModelSelectionErrorKeys,
+} from '@/features/cc-agent/sshSessionModelSelection';
+import { useControllableDevices } from '@/hooks/useControllableDevices';
+import { useCCSessions } from '@/hooks/useCCSessions';
+import {
+  sshBrowseAdapter,
+  deviceLinkBrowseAdapter,
+  type RemoteBrowseAdapter,
+  type BrowseEntry,
+  type BrowseListResult,
+} from './remoteBrowseAdapters';
+import {
+  sshExistingProjects,
+  loadDeviceLinkExistingProjects,
+  type ExistingRemoteProject,
+} from './remoteExistingProjects';
+
+/** 用户最终确认添加的远程项目,带来源 kind —— 调用方据此决定立即建会话(SSH)还是进草稿(device-link)。 */
+export type RemoteProjectTarget =
+  | { kind: 'ssh'; hostId: string; path: string }
+  | { kind: 'device-link'; deviceId: string; deviceName: string; path: string };
+
+/** 下拉里的一个可选远程目标(SSH 主机 / 被控设备)。 */
+type RemoteTarget =
+  | { key: string; kind: 'ssh'; hostId: string; label: string }
+  | { key: string; kind: 'device'; deviceId: string; deviceName: string; label: string };
+
+interface Props {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  /**
+   * 打开本弹窗的设备。**指名了就只认这一台**:它不在可选目标里(离线 / 撤销被控)时选中项留空,
+   * 不回落到别的目标 —— 静默换机器会让用户在以为是 A 的界面里把项目建到 B 上。
+   * 未指名(从通用入口打开)时才由用户自己在下拉里选。
+   */
+  initialDeviceId?: string | null;
+  fixedDeviceId?: string;
+  title?: string;
+  confirmText?: string;
+  errorText?: string;
+  /**
+   * 当前 draft 选中的 agent(由父层的 VendorSegmentedSwitcher 决定,dialog 不选 vendor)。
+   * 轮 35 CRITICAL:Pi 已支持 SSH 远端(startSession 全量支持 remoteHostId)——
+   * 不再按 vendor 过滤 SSH 主机。device-link 不受影响:被控端跑自己的本地 Pi 进程。
+   */
+  agentVendor?: MakerVendor;
+  /** vendor 不在 dialog 里选 —— 由父层根据当前 draft / segmented switcher 决定。 */
+  onProjectAdded: (target: RemoteProjectTarget) => void | Promise<void>;
+}
+
+export function AddRemoteProjectDialog({
+  open,
+  onOpenChange,
+  initialDeviceId,
+  fixedDeviceId,
+  title,
+  confirmText,
+  errorText,
+  agentVendor,
+  onProjectAdded,
+}: Props) {
+  const { t } = useTranslation();
+  const { confirm } = useConfirmDialog();
+  // 打开时把焦点交给主输入(目标选择器),不落在关闭 X 上(DESIGN §14.2)。
+  const targetSelectRef = useRef<HTMLSelectElement>(null);
+
+  // 可控设备走 live hook;SSH ready hosts 在打开时拉一次。
+  const devices = useControllableDevices();
+  const [sshHosts, setSshHosts] = useState<RemoteHostSnapshot[]>([]);
+  // SSH「已有项目」数据源:本地 active 会话(按 host 过滤,见 sshExistingProjects)。
+  const { sessions } = useCCSessions();
+
+  // 轮 35 CRITICAL 移除:Pi 已支持 SSH 远端 —— 不再排除 SSH 主机。
+  const excludeSsh = false;
+  const targets = useMemo<RemoteTarget[]>(() => {
+    const ssh: RemoteTarget[] = excludeSsh
+      ? []
+      : sshHosts.map((h) => {
+          const displayName = h.config.displayName?.trim() || h.config.id;
+          const identity = displayName === h.config.id
+            ? h.config.id
+            : `${displayName} (${h.config.id})`;
+          return {
+            key: `ssh:${h.config.id}`,
+            kind: 'ssh' as const,
+            hostId: h.config.id,
+            label: `${identity} (${h.config.user}@${h.config.hostname})`,
+          };
+        });
+    const dev: RemoteTarget[] = devices.map((d) => ({
+      key: `device:${d.deviceId}`,
+      kind: 'device',
+      deviceId: d.deviceId,
+      deviceName: d.name,
+      label: d.name,
+    }));
+    return fixedDeviceId
+      ? dev.filter(target => target.kind === 'device' && target.deviceId === fixedDeviceId)
+      : [...ssh, ...dev];
+  }, [excludeSsh, sshHosts, devices, fixedDeviceId]);
+
+  const sshTargets = useMemo(() => targets.filter((tg) => tg.kind === 'ssh'), [targets]);
+  const deviceTargets = useMemo(() => targets.filter((tg) => tg.kind === 'device'), [targets]);
+
+  const [selectedKey, setSelectedKey] = useState<string | null>(null);
+  const selectedTarget = useMemo(
+    () => targets.find((tg) => tg.key === selectedKey) ?? null,
+    [targets, selectedKey],
+  );
+
+  // 默认「已有项目」模式,「浏览文件夹」为次要;切目标 / 重开都重置回 existing。
+  const [mode, setMode] = useState<'existing' | 'browse'>('existing');
+  const [deviceExisting, setDeviceExisting] = useState<ExistingRemoteProject[]>([]);
+  const [existingLoading, setExistingLoading] = useState(false);
+  // path 初始空 —— existing 模式下「添加」靠选中项目填充;进 browse 模式才置 `~` 并 ls。
+  const [path, setPath] = useState<string>('');
+  const [parent, setParent] = useState<string | null>(null);
+  const [entries, setEntries] = useState<BrowseEntry[]>([]);
+  const [drives, setDrives] = useState<NonNullable<BrowseListResult['drives']>>([]);
+  const [loadingList, setLoadingList] = useState(false);
+  const [busy, setBusy] = useState(false);
+  // refreshList 请求序号 —— 快速切目标 / 双击进目录时旧请求晚到不得覆盖当前状态。
+  const requestSeqRef = useRef(0);
+
+  // 选中目标 → 取对应浏览适配器。key 变才重建(同 key 引用稳定,不触发浏览 effect 抖动)。
+  const adapter = useMemo<RemoteBrowseAdapter | null>(() => {
+    if (!selectedTarget) return null;
+    return selectedTarget.kind === 'ssh'
+      ? sshBrowseAdapter(selectedTarget.hostId)
+      : deviceLinkBrowseAdapter(selectedTarget.deviceId);
+  }, [selectedTarget?.key]);
+  const currentBrowseRef = useRef({ open, adapter });
+  currentBrowseRef.current = { open, adapter };
+  useEffect(() => {
+    currentBrowseRef.current = { open, adapter };
+    requestSeqRef.current += 1;
+    return () => {
+      currentBrowseRef.current = { open: false, adapter: null };
+      requestSeqRef.current += 1;
+    };
+  }, [open, adapter]);
+
+  // SSH 已有项目:本地会话里该 host 的 project 会话去重(同步,随 sessions 实时重算);
+  // device-link 已有项目走隧道异步拉(deviceExisting)。existing 列表取二者之一。
+  const sshExisting = useMemo<ExistingRemoteProject[] | null>(() => {
+    if (!selectedTarget || selectedTarget.kind !== 'ssh') return null;
+    return sshExistingProjects(sessions, selectedTarget.hostId);
+  }, [selectedTarget, sessions]);
+  const existingProjects = sshExisting ?? deviceExisting;
+
+  // 打开时拉 SSH ready hosts;重置选中(配置可能在设置里改过,不保留上次状态)。
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await window.electronAPI.remoteSsh.list();
+        if (cancelled) return;
+        setSshHosts(res.hosts.filter((h) => h.status === 'ready'));
+      } catch {
+        if (!cancelled) setSshHosts([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [open]);
+
+  // 默认选中:打开时 / 目标集变化后若当前选中已失效,落到第一个可用目标。
+  useEffect(() => {
+    if (!open) {
+      setSelectedKey(null);
+      return;
+    }
+    if (selectedKey && targets.some((tg) => tg.key === selectedKey)) return;
+    const preferredKey = initialDeviceId ? `device:${initialDeviceId}` : null;
+    if (preferredKey) {
+      // 调用方**指名**了设备(从该设备的工作区 picker 点进来的)。此时绝不能回落到别的目标:
+      // targets 只含在线设备,被指名的那台一旦离线就匹配不到,静默落到 targets[0](可能是某台
+      // SSH 主机或另一台设备)会让用户以为在浏览 A、实际把 B 的路径加进草稿,把草稿切到意外的机器。
+      // 匹配不到就保持未选中,由目标选择器显示空态 —— 宁可让用户自己再选一次。
+      setSelectedKey(targets.some((target) => target.key === preferredKey) ? preferredKey : null);
+      return;
+    }
+    setSelectedKey(targets[0]?.key ?? null);
+  }, [open, targets, selectedKey, initialDeviceId]);
+
+  /**
+   * 调用方指名了设备、但它不在可选目标里(离线 / 撤销被控)。用于给「未选中」这个状态一个解释 ——
+   * 上一轮刻意不回落到别的目标,代价就是必须把原因说出来。
+   */
+  const requestedDeviceUnavailable =
+    initialDeviceId != null && !targets.some((tg) => tg.key === `device:${initialDeviceId}`);
+
+  const refreshList = useCallback(
+    async (browseApi: RemoteBrowseAdapter, targetPath: string) => {
+      const mySeq = ++requestSeqRef.current;
+      const isCurrent = () => mySeq === requestSeqRef.current && currentBrowseRef.current.open
+        && currentBrowseRef.current.adapter === browseApi;
+      setLoadingList(true);
+      try {
+        let res = await browseApi.listDir(targetPath);
+        if (!isCurrent()) return;
+        setParent(res.parent);
+        setEntries(res.entries);
+        setDrives(res.drives ?? []);
+        if (res.resolvedPath) setPath(current => current === targetPath ? res.resolvedPath : current);
+        setLoadingList(false);
+        for (let attempt = 0; res.drivesPending && attempt < 3; attempt += 1) {
+          try { res = await browseApi.listDir(res.resolvedPath); }
+          catch { return; }
+          if (!isCurrent()) return;
+          setDrives(res.drives ?? []);
+        }
+      } catch (err) {
+        if (!isCurrent()) return;
+        toast.error(t(mapIpcErrorToI18nKey(err, { fallback: 'newChat.addRemoteProject.toast.listFailed' })));
+        setEntries([]);
+      } finally {
+        if (mySeq === requestSeqRef.current) setLoadingList(false);
+      }
+    },
+    [t],
+  );
+
+  // 切目标 / 打开:重置回「已有项目」模式 + 清浏览态(浏览的 ls 等进入 browse 模式才惰性触发)。
+  useEffect(() => {
+    if (!open) return;
+    setMode('existing');
+    setPath('');
+    setEntries([]);
+    setDrives([]);
+    setParent(null);
+  }, [open, selectedTarget?.key]);
+
+  // device-link「已有项目」:隧道拉被控端 recent_workdirs(SSH 走同步 memo,不进这里)。
+  // 用局部 cancelled 作废旧请求,不动 requestSeqRef(那是 browse 的 ls 序号)。
+  useEffect(() => {
+    if (!open || !selectedTarget || selectedTarget.kind !== 'device') {
+      setDeviceExisting([]);
+      setExistingLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setExistingLoading(true);
+    setDeviceExisting([]);
+    void (async () => {
+      try {
+        const projects = await loadDeviceLinkExistingProjects(selectedTarget.deviceId);
+        if (!cancelled) setDeviceExisting(projects);
+      } catch {
+        if (!cancelled) setDeviceExisting([]);
+      } finally {
+        if (!cancelled) setExistingLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [open, selectedTarget?.key]);
+
+  // 进入 browse 模式才 ls(惰性,省一次无谓远端往返)。bump seq 作废未落地的旧请求。
+  useEffect(() => {
+    if (!open || mode !== 'browse' || !adapter) return;
+    requestSeqRef.current += 1;
+    setEntries([]);
+    setParent(null);
+    setPath('~');
+    void refreshList(adapter, '~');
+  }, [open, mode, adapter, refreshList]);
+
+  const handleEntryClick = useCallback((entry: BrowseEntry) => {
+    // 单击 = 选中(把路径填进输入框),不进入。
+    setPath(entry.childPath);
+  }, []);
+
+  const handleEntryDouble = useCallback(
+    (entry: BrowseEntry) => {
+      setPath(entry.childPath);
+      if (adapter) void refreshList(adapter, entry.childPath);
+    },
+    [adapter, refreshList],
+  );
+
+  const isEntrySelected = useCallback((entry: BrowseEntry): boolean => path === entry.childPath, [path]);
+
+  const handleParent = useCallback(() => {
+    if (parent == null || !adapter) return;
+    setPath(parent);
+    void refreshList(adapter, parent);
+  }, [parent, adapter, refreshList]);
+
+  const handleAddProject = useCallback(async (explicitPath?: string) => {
+    if (!selectedTarget || !adapter) return;
+    const dir = (explicitPath ?? path).trim();
+    if (!dir) {
+      toast.error(t('newChat.addRemoteProject.toast.pathEmpty'));
+      return;
+    }
+    setBusy(true);
+    const generation = requestSeqRef.current;
+    const isCurrent = () => generation === requestSeqRef.current && currentBrowseRef.current.open
+      && currentBrowseRef.current.adapter === adapter;
+    try {
+      const stat = await adapter.statPath(dir);
+      if (!isCurrent()) return;
+      let finalPath = stat.resolvedPath;
+      if (stat.kind === 'file') {
+        toast.error(t('newChat.addRemoteProject.toast.pathIsFile', { path: finalPath }));
+        return;
+      }
+      if (stat.kind === 'missing') {
+        const ok = await confirm({
+          title: t('newChat.addRemoteProject.confirmCreate.title'),
+          description: t('newChat.addRemoteProject.confirmCreate.description', {
+            path: finalPath,
+            hostId: selectedTarget.label,
+          }),
+          confirmText: t('newChat.addRemoteProject.confirmCreate.ok'),
+          cancelText: t('newChat.addRemoteProject.confirmCreate.cancel'),
+        });
+        if (!ok || !isCurrent()) return;
+        const mk = await adapter.mkdirP(dir);
+        if (!isCurrent()) return;
+        finalPath = mk.resolvedPath;
+      }
+      if (selectedTarget.kind === 'ssh') {
+        await onProjectAdded({ kind: 'ssh', hostId: selectedTarget.hostId, path: finalPath });
+      } else {
+        await onProjectAdded({
+          kind: 'device-link',
+          deviceId: selectedTarget.deviceId,
+          deviceName: selectedTarget.deviceName,
+          path: finalPath,
+        });
+      }
+      if (isCurrent()) onOpenChange(false);
+    } catch (err) {
+      if (!isCurrent()) return;
+      toast.error(errorText ?? t(
+        err instanceof SshModelSelectionError
+          ? sshModelSelectionErrorKeys[err.reason]
+          : mapIpcErrorToI18nKey(err, { fallback: 'newChat.addRemoteProject.toast.addFailed' }),
+      ));
+    } finally {
+      setBusy(false);
+    }
+  }, [selectedTarget, adapter, path, confirm, onProjectAdded, onOpenChange, t, errorText]);
+
+  const noTargets = targets.length === 0;
+  // Pi 过滤掉 SSH 后无任何可用目标时,通用空态提示「加个 SSH 主机」是误导(Pi 用不了 SSH)。
+  // 轮 36:excludeSsh 恒 false(Pi 支持 SSH 远端), 该分支已不可达 —— 保留
+  // 变量为 false 简化下游(空态文案只走通用 empty)。
+  const emptyIsPiSshFiltered = false;
+
+  return (
+    <Dialog.Root open={open} onOpenChange={busy ? undefined : onOpenChange}>
+      <Dialog.Portal>
+        <Dialog.Overlay
+          className="modal-scrim fixed inset-0 z-50"
+        />
+        <Dialog.Content
+          onPointerDownOutside={(event) => event.preventDefault()}
+          className="modal-panel fixed left-1/2 top-1/2 z-50 flex w-[560px] max-w-[92vw] -translate-x-1/2 -translate-y-1/2 flex-col"
+          style={{
+            // Keep the centered shell still across mode changes and async list loading.
+            height: noTargets ? undefined : 660,
+            maxHeight: '88vh',
+          }}
+          onEscapeKeyDown={busy ? (e) => e.preventDefault() : undefined}
+          onInteractOutside={busy ? (e) => e.preventDefault() : undefined}
+          onOpenAutoFocus={(e) => {
+            // Radix 默认聚焦内容区首个可聚焦元素(这里是关闭 X)。覆盖成聚焦目标选择器,
+            // 让焦点落在主输入上;无目标(select 未渲染)时保留默认行为。
+            if (targetSelectRef.current) {
+              e.preventDefault();
+              targetSelectRef.current.focus();
+            }
+          }}
+        >
+          {/* Header */}
+          <div
+            className="flex shrink-0 flex-col gap-1 px-5 py-4"
+            style={{ borderBottom: '1px solid var(--border-default, #d4d4d4)' }}
+          >
+            <div className="flex items-center justify-between">
+              <Dialog.Title
+                className="text-15 font-medium"
+                style={{ color: 'var(--text-primary)' }}
+              >
+                {title ?? t('newChat.addRemoteProject.title')}
+              </Dialog.Title>
+              <Dialog.Close asChild disabled={busy}>
+                <button
+                  type="button"
+                  disabled={busy}
+                  aria-label={t('newChat.addRemoteProject.cancel')}
+                  className="flex h-6 w-6 items-center justify-center rounded-md transition-colors hover:bg-[var(--surface-chip)] disabled:opacity-40"
+                  style={{ color: 'var(--text-secondary)' }}
+                >
+                  <X size={16} />
+                </button>
+              </Dialog.Close>
+            </div>
+            <p className="text-12" style={{ color: 'var(--text-tertiary)' }}>
+              {t('newChat.addRemoteProject.hint')}
+            </p>
+          </div>
+
+          {/* Body */}
+          <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-5 py-4">
+            {noTargets ? (
+              <div className="text-13 py-8 text-center" style={{ color: 'var(--text-secondary)' }}>
+                {t(emptyIsPiSshFiltered
+                  ? 'newChat.addRemoteProject.emptyPiSshFiltered'
+                  : 'newChat.addRemoteProject.empty')}
+              </div>
+            ) : (
+              <>
+                {/* Target selector — optgroup 区分 SSH 主机 / 我的设备 */}
+                <label className="flex shrink-0 flex-col gap-1">
+                  <span
+                    className="text-12 font-medium"
+                    style={{ color: 'var(--text-secondary)' }}
+                  >
+                    {t('newChat.addRemoteProject.host')}
+                  </span>
+                  <select
+                    ref={targetSelectRef}
+                    value={selectedKey ?? ''}
+                    onChange={(e) => setSelectedKey(e.target.value || null)}
+                    disabled={busy}
+                    className="h-9 rounded-lg border bg-transparent px-2 text-13 outline-none"
+                    style={{
+                      borderColor: 'var(--border-default)',
+                      color: 'var(--text-primary)',
+                    }}
+                  >
+                    {/* 未选中时必须有一个 value="" 的项供受控 select 显示(Codex review P1)。
+                        缺了它,浏览器会去显示第一个真实 option,而 selectedTarget 仍是 null ——
+                        「添加」保持 disabled;若只有一个备选目标,点那个已显示的项也不产生 change
+                        事件,弹窗就此卡死。disabled 让它只能被显示、不能被重新选回。
+                        这个空态是上一轮「指名设备离线时不静默回落到别的目标」带来的,得配一个占位。 */}
+                    {selectedKey === null && (
+                      <option value="" disabled>
+                        {t('newChat.addRemoteProject.selectTargetPlaceholder')}
+                      </option>
+                    )}
+                    {sshTargets.length > 0 && (
+                      <optgroup label={t('newChat.addRemoteProject.sourceGroupSsh')}>
+                        {sshTargets.map((tg) => (
+                          <option key={tg.key} value={tg.key}>
+                            {tg.label}
+                          </option>
+                        ))}
+                      </optgroup>
+                    )}
+                    {deviceTargets.length > 0 && (
+                      <optgroup label={t('newChat.addRemoteProject.sourceGroupDevice')}>
+                        {deviceTargets.map((tg) => (
+                          <option key={tg.key} value={tg.key}>
+                            {tg.label}
+                          </option>
+                        ))}
+                      </optgroup>
+                    )}
+                  </select>
+                  {/* 指名的设备不在可选目标里(离线 / 撤销被控)→ 说明原因,否则用户只看到一个
+                      未选中的下拉,不知道为什么要自己重选。 */}
+                  {selectedKey === null && requestedDeviceUnavailable && (
+                    <span className="text-12" style={{ color: 'var(--text-secondary)' }}>
+                      {t('newChat.addRemoteProject.requestedDeviceUnavailable')}
+                    </span>
+                  )}
+                </label>
+
+                {/* Mode toggle — 默认「已有项目」,「浏览文件夹」为次要入口 */}
+                <SegmentedControl
+                  className="shrink-0"
+                  aria-label={title ?? t('newChat.addRemoteProject.title')}
+                  value={mode}
+                  disabled={busy}
+                  fullWidth
+                  onValueChange={(next) => {
+                    setMode(next);
+                    if (next === 'existing') setPath('');
+                  }}
+                  options={[
+                    { value: 'existing', label: t('newChat.addRemoteProject.tabExisting') },
+                    { value: 'browse', label: t('newChat.addRemoteProject.tabBrowse') },
+                  ]}
+                />
+
+                {mode === 'existing' ? (
+                  /* 已有项目列表 — 单击选中、双击直接添加;空则给「浏览文件夹」兜底入口 */
+                  <div
+                    className="min-h-0 flex-1 overflow-y-auto rounded-lg border"
+                    style={{ borderColor: 'var(--border-default)' }}
+                  >
+                    {existingLoading ? (
+                      <div className="text-12 py-8 text-center" style={{ color: 'var(--text-tertiary)' }}>
+                        {t('newChat.addRemoteProject.existingLoading')}
+                      </div>
+                    ) : existingProjects.length === 0 ? (
+                      <div className="flex flex-col items-center gap-2 py-8">
+                        <span className="text-12 text-center px-4" style={{ color: 'var(--text-tertiary)' }}>
+                          {t('newChat.addRemoteProject.existingEmpty')}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => setMode('browse')}
+                          className="text-12 font-medium underline-offset-2 hover:underline"
+                          style={{ color: 'var(--text-secondary)' }}
+                        >
+                          {t('newChat.addRemoteProject.tabBrowse')}
+                        </button>
+                      </div>
+                    ) : (
+                      existingProjects.map((project) => {
+                        const selected = path === project.path;
+                        return (
+                          <button
+                            key={project.path}
+                            type="button"
+                            onClick={() => setPath(project.path)}
+                            onDoubleClick={() => void handleAddProject(project.path)}
+                            title={project.path}
+                            disabled={busy}
+                            className={cn(
+                              'flex w-full items-center gap-2 px-3 py-2 text-left text-13 transition-colors',
+                              !selected && 'hover:bg-[var(--surface-chip)]',
+                              busy && 'cursor-not-allowed opacity-60',
+                            )}
+                            style={{
+                              color: 'var(--text-primary)',
+                              ...(selected ? { backgroundColor: 'var(--settings-menu-bg-selected)' } : {}),
+                            }}
+                          >
+                            <Folder size={14} className="shrink-0" style={{ color: 'var(--text-tertiary)' }} />
+                            <span className="flex min-w-0 flex-col">
+                              <span className="truncate">{project.name}</span>
+                              <span
+                                className="truncate text-11"
+                                style={{
+                                  color: 'var(--text-tertiary)',
+                                  fontFamily: 'var(--app-font-code, var(--app-font-code-default))',
+                                }}
+                              >
+                                {project.path}
+                              </span>
+                            </span>
+                          </button>
+                        );
+                      })
+                    )}
+                  </div>
+                ) : (
+                  <>
+                    {/* Path bar */}
+                    <label className="flex shrink-0 flex-col gap-1">
+                      <span
+                        className="text-12 font-medium"
+                        style={{ color: 'var(--text-secondary)' }}
+                      >
+                        {t('newChat.addRemoteProject.path')}
+                      </span>
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={handleParent}
+                          disabled={busy || loadingList || parent == null}
+                          title={t('newChat.addRemoteProject.parent')}
+                          className={cn(
+                            'flex h-9 w-9 items-center justify-center rounded-lg border',
+                            (busy || loadingList || parent == null) && 'cursor-not-allowed opacity-60',
+                          )}
+                          style={{ borderColor: 'var(--border-default)', color: 'var(--text-secondary)' }}
+                        >
+                          <ChevronLeft size={14} />
+                        </button>
+                        <input
+                          type="text"
+                          value={path}
+                          onChange={(e) => setPath(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter' && !e.nativeEvent.isComposing && adapter) {
+                              void refreshList(adapter, path);
+                            }
+                          }}
+                          disabled={busy}
+                          placeholder="~/projects/my-repo"
+                          className="flex-1 h-9 rounded-lg border bg-transparent px-2 text-13 outline-none"
+                          style={{
+                            borderColor: 'var(--border-default)',
+                            color: 'var(--text-primary)',
+                            fontFamily: 'var(--app-font-code, var(--app-font-code-default))',
+                          }}
+                        />
+                        <button
+                          type="button"
+                          onClick={() => adapter && void refreshList(adapter, path)}
+                          disabled={busy || loadingList}
+                          title={t('newChat.addRemoteProject.refresh')}
+                          className={cn(
+                            'flex h-9 w-9 items-center justify-center rounded-lg border',
+                            (busy || loadingList) && 'cursor-not-allowed opacity-60',
+                          )}
+                          style={{ borderColor: 'var(--border-default)', color: 'var(--text-secondary)' }}
+                        >
+                          {loadingList ? <Spinner size={14} /> : <RotateCw size={14} />}
+                        </button>
+                      </div>
+                    </label>
+
+                    {drives.length > 1 ? <div className="flex shrink-0 flex-wrap gap-2" role="group" aria-label={t('newChat.addRemoteProject.path')}>
+                      {drives.map(drive => <Button key={drive.path} variant="secondary" size="sm"
+                        type="button" disabled={busy || loadingList} aria-pressed={drive.current}
+                        onClick={() => { setPath(drive.path); if (adapter) void refreshList(adapter, drive.path); }}>
+                        {drive.name}
+                      </Button>)}
+                    </div> : null}
+                    {/* Entries list */}
+                    <div
+                      className="min-h-0 flex-1 overflow-y-auto rounded-lg border"
+                      style={{ borderColor: 'var(--border-default)' }}
+                    >
+                      {entries.length === 0 ? (
+                        <div
+                          className="text-12 py-8 text-center"
+                          style={{ color: 'var(--text-tertiary)' }}
+                        >
+                          {loadingList
+                            ? t('newChat.addRemoteProject.loading')
+                            : t('newChat.addRemoteProject.noSubdirs')}
+                        </div>
+                      ) : (
+                        entries.map((entry) => {
+                          const selected = isEntrySelected(entry);
+                          return (
+                            <button
+                              key={entry.childPath}
+                              type="button"
+                              onClick={() => handleEntryClick(entry)}
+                              onDoubleClick={() => handleEntryDouble(entry)}
+                              title={t('newChat.addRemoteProject.doubleClickHint')}
+                              disabled={busy}
+                              className={cn(
+                                'flex w-full items-center gap-2 px-3 py-2 text-left text-13 transition-colors',
+                                !selected && 'hover:bg-[var(--surface-chip)]',
+                                busy && 'cursor-not-allowed opacity-60',
+                              )}
+                              style={{
+                                color: 'var(--text-primary)',
+                                ...(selected ? { backgroundColor: 'var(--settings-menu-bg-selected)' } : {}),
+                              }}
+                            >
+                              {entry.kind === 'symlink' ? (
+                                <FolderSymlink size={14} style={{ color: 'var(--text-tertiary)' }} />
+                              ) : (
+                                <Folder size={14} style={{ color: 'var(--text-tertiary)' }} />
+                              )}
+                              <span className="truncate">{entry.name}</span>
+                            </button>
+                          );
+                        })
+                      )}
+                    </div>
+                  </>
+                )}
+              </>
+            )}
+          </div>
+
+          {/* 未选中时必须有一个 value="" 的项供受控 select 显示(Codex review P1)。
+              缺了它,浏览器会去显示第一个真实 option,而 selectedTarget 仍是 null ——
+              「添加」保持 disabled;若只有一个备选目标,点那个已显示的项也不产生 change
+              事件,弹窗就此卡死。disabled 让它只能被显示、不能被重新选回。
+              这个空态是上一轮「指名设备离线时不静默回落到别的目标」带来的,得配一个占位。 */}
+          <div
+            className="flex shrink-0 justify-end gap-2.5 px-5 py-3"
+            style={{ borderTop: '1px solid var(--border-default)' }}
+          >
+            <Dialog.Close asChild disabled={busy}>
+              <Button
+                variant="secondary"
+                size="lg"
+                type="button"
+                disabled={busy}
+                className="min-w-[96px]"
+              >
+                {t('newChat.addRemoteProject.cancel')}
+              </Button>
+            </Dialog.Close>
+            <Button
+              variant="cta"
+              size="lg"
+              loading={busy}
+              type="button"
+              onClick={() => void handleAddProject()}
+              disabled={busy || noTargets || !selectedTarget || !path.trim()}
+              className="min-w-[96px]"
+            >
+              {confirmText ?? t('newChat.addRemoteProject.add')}
+            </Button>
+          </div>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
+  );
+}

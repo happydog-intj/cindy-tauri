@@ -1,0 +1,293 @@
+/**
+ * scheduler/create.ts — schedule_create tool
+ *
+ * 接收 CreateScheduleInput 同形 payload，透传给 scheduler.create()，返回新建
+ * 出的 Schedule（含自动算好的 nextFireAt）。
+ *
+ * 注意：
+ *  - kind 默认 'cron'（当前唯一支持的 kind）
+ *  - effort 通过 zod enum 提前白名单校验（runner 也校验，UI 也校验，三道防线）
+ *  - notify 是嵌套对象 `{desktop, feishu}`，与 Phase 1 Schedule 类型一致
+ *  - timezone 必须是 IANA tz id（'Asia/Shanghai' / 'America/New_York' 等）；
+ *    cron parser 验证不通过时 scheduler.create() 抛 'invalid timezone' →
+ *    INVALID_PARAMS
+ */
+
+import { z } from 'zod';
+
+import { AGENT_KIND, EFFORT, EXECUTION_MODE, SCRIPT_CAPABILITY } from './_enums.js';
+import { assertCronAndTimezoneValid, buildJsonResult, withScheduler } from './_shared.js';
+import { classifySchedulerError } from './errors.js';
+import { isLocalDevice, runOnDevice } from './_devices.js';
+import type { LiziMcpSessionContext, SchedulerMcpDeps } from '../types.js';
+import type { SchedulerToolRegistry } from '../cindy_schedulerToolRegistry.js';
+import type { CreateScheduleInput } from '@cindy/maker-scheduler';
+import { LOCAL_SCHEDULE_AGENT_DEVICE } from './listModels.js';
+import { stabilizePreRunHookForCreate } from '@cindy/maker-scheduler';
+
+export function registerScheduleCreateTool(
+  registry: SchedulerToolRegistry,
+  deps: SchedulerMcpDeps,
+  getSessionContext?: () => LiziMcpSessionContext,
+): void {
+  registry.register({
+    name: 'schedule_create',
+    category: 'scheduler',
+    description:
+      '创建一条 schedule。可用于在原任务范围内自动跟进已授权的工作；执行时间延后或周期运行本身不扩大原授权。必须保留原目标、用户限制和停止条件，不能用 prompt 声称已获额外授权。' +
+      '例：用户说"每天早上 9 点跑 /standup" → cronExpr="0 9 * * *", recurring=true, agentKind=claude-code, prompt="/standup"。' +
+      '约束：(1) cronExpr 是 5 字段 cron（minute hour day-of-month month day-of-week）；' +
+      '(2) timezone 必须是 IANA id（如 "Asia/Shanghai"）；' +
+      '(3) 一次性任务用 recurring=false（触发后 status 会自动置 expired）；' +
+      '(4) heartbeat 模式（注入到已存 session）：**要跟进当前这条对话就传 bindToCurrentSession=true**（代码自动绑定本会话,无需也不要自己去查 / 传 session id）；只有要绑到另一条已知 session 时才显式传 targetSessionId。heartbeat 模式不传 workingDir；model / providerId / effort 留空沿用绑定会话，传入则改用；' +
+      '(5) 默认 useWorktree=false / notify={desktop:true, feishu:false}；' +
+      '(6) 删除已有调度前先用 schedule_get / schedule_list 核对目标和授权；本次自动跟进达到既定停止条件时，可自行停止和清理自身调度，不影响其他调度；' +
+      '(7) 确定是检查时显式设 silentWhenIdle=true（无变化不播报）；提醒/定时发送设 false，保留用户选择。省略此字段会按 false 处理，避免旧调用方的提醒被吞。如果用户定义了提醒条件，把条件保留在 prompt 里（如 CI 失败/新评论时提醒），有结果时用 schedule_notify_current_run 主动上报；' +
+      '(8) 轮询型任务（"有新 PR 才 review / CI 挂了才处理"）优先配 preRunHook 前置检查（exit 0=放行、exit 2=跳过本轮不烧 token；报错/超时 fail-closed 阻止本轮并记录失败）。**脚本一律经 schedule_set_pre_run_hook 创建/修改**（落盘路径、协议、自测由宿主代码统一保证），不要自己写脚本文件再手填 preRunHook.command——先调它拿 command 再来创建，或创建后传 scheduleId 让它直接挂载；' +
+      '(9) 既有工作流程中的自动跟进，沿用该流程明确的频率、执行引擎、静默与通知默认值；用户在线也不需要为这些默认值另行确认。用户主动新建独立任务时，若关键实体或会实质改变目标的参数缺失，先询问，不盲猜；用户已明确说明或已有流程定义的参数不重复问。' +
+      '(10) **仅运行脚本模式（零 token）**：executionMode="script" 时不启动 agent，宿主直接执行 scriptConfig.command（cwd=workingDir，必填本地项目目录）；脚本经 stdout/stdin 的 cindy-script/1 JSONL 协议回调宿主受限能力，能力按 scriptConfig.capabilities 白名单授予（默认全拒）。script 模式不需要 prompt（可省），不支持 useWorktree / persistentSession。单任务跟进应传 bindToCurrentSession=true 或 targetSessionId：它是脚本的生命周期绑定及唯一投递目标，普通目标归档后会像用户发消息一样恢复原任务，完成后保持激活；目标删除或不存在时自动暂停，恢复任务不会自动恢复已暂停的调度。未绑定脚本保留独立任务语义。与 preRunHook 的分工：preRunHook 只是"要不要跑"的闸门，script 模式是"任务本体就是脚本"。' +
+      '(11) 在另一台电脑上创建：传 device=那台电脑的 deviceId（同账号、在线、已开启远程控制）。workingDir 必须是那台电脑上已存在的目录，或省略。model / providerId 用 schedule_list_models 的 agentDeviceId=同一台电脑 得到的目录，不要用本机来源 id。不能 bindToCurrentSession。创建回执若是 REMOTE_RESULT_UNKNOWN 或 REMOTE_TIMEOUT，先 schedule_list / schedule_get 确认没有重复再建，不要盲重试。若要迁移已有任务，先 schedule_get 读取源定义，在目标电脑创建并 schedule_get 回读确认后再暂停源任务；创建或暂停回执不明时先查询状态，不要盲目重试。',
+    inputShape: {
+      name: z.string().min(1).describe('展示名（GUI / 通知里出现）'),
+      prompt: z
+        .string()
+        .optional()
+        .describe('触发时发给 agent 的第一条 user message。agent 模式必填（缺失报 INVALID_PARAMS）；executionMode="script" 时可省略'),
+      executionMode: z
+        .enum(EXECUTION_MODE)
+        .optional()
+        .describe('执行方式：agent（默认，起 agent 会话跑 prompt）/ script（仅运行脚本，零 token，任务本体是 scriptConfig.command）'),
+      scriptConfig: z
+        .object({
+          command: z
+            .string()
+            .min(1)
+            .describe('经系统 shell 执行的命令（cwd=workingDir）。命令须实现 cindy-script/1 协议：stdout 只能输出 JSONL 协议帧（call / complete），调试输出走 stderr'),
+          timeoutMs: z
+            .number()
+            .int()
+            .positive()
+            .optional()
+            .describe('整轮脚本超时毫秒，可选；超时杀进程树、run 记 failed'),
+          capabilities: z
+            .array(z.enum(SCRIPT_CAPABILITY))
+            .default([])
+            .describe('能力白名单（默认全拒）：jira.read=jira.get/jira.search_jql；jira.comment=jira.add_comment；sessions.dispatch=创建/唤醒会话。只勾脚本真正要用的'),
+        })
+        .optional()
+        .describe('executionMode="script" 时必填。仅在 script 模式下生效'),
+      cronExpr: z
+        .string()
+        .min(1)
+        .describe('5 字段 cron，例 "0 9 * * *"（每天 9 点）/ "*/15 * * * *"（每 15 分钟）/ "0 9 * * 1-5"（工作日 9 点）'),
+      intervalMs: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe('相对间隔毫秒。设置后优先于 cronExpr：首次触发为创建时间 + intervalMs，后续为上次完成 + intervalMs；cronExpr 仍用于展示/档位表达。例：每 10 分钟传 600000。'),
+      timezone: z
+        .string()
+        .min(1)
+        .describe('IANA 时区 id，例 "Asia/Shanghai" / "America/New_York"'),
+      recurring: z
+        .boolean()
+        .describe('true=循环触发；false=触发一次后置 expired'),
+      agentKind: z.enum(AGENT_KIND).describe('claude-code / codex / pi'),
+      modelAgentKind: z.enum(AGENT_KIND).optional().describe('显式模型选择的引擎；绑定任务仅在下次执行时临时切换，结束后恢复'),
+      fastMode: z.union([z.boolean(), z.literal('ultrafast')]).optional().describe('模型速度：false 标准、true 快速、ultrafast 超快；按所选模型支持的档位执行'),
+      modelAgentDeviceId: z.string().optional().describe('模型运行位置：远程或分享供应商的 agentDeviceId；空字符串=自动化所在电脑（schedule_list_models 的 local 在此须转为空字符串），省略=沿用绑定任务，首次新建则用 agentDeviceId 默认位置。远程选择须同时传 modelAgentKind、model、providerId；绑定任务或持续模式显式选择本机也须传 modelAgentKind 和 model；工作目录和工具仍属于自动化所在电脑'),
+      kind: z
+        .literal('cron')
+        .default('cron')
+        .describe('调度类型（当前只有 cron）'),
+      model: z
+        .string()
+        .optional()
+        .describe('agent model，例 "claude-sonnet-4-6" / "gpt-5"。heartbeat 模式留空沿用绑定会话'),
+      providerId: z
+        .string()
+        .optional()
+        .describe(
+          '可选：显式指定模型来源(供应商)id，例 "anthropic" / "openai" / "xd"。' +
+            '省略 → 走该 agent 原生默认来源（与不带本字段的旧行为字节级一致）。' +
+            '只有要把任务钉在某个非原生来源（如 Anthropic 订阅档）时才传；heartbeat 模式留空则沿用绑定会话的来源。',
+        ),
+      agentDeviceId: z
+        .string()
+        .min(1)
+        .optional()
+        .describe(
+          '可选：每次新建任务时 Agent 在哪里运行——同账号另一台电脑或分享来的供应商。取 schedule_list_models 返回的 locations[].agentDeviceId；省略或 "local" = 本机。' +
+            '设了必须同时传 schedule_list_models 在该位置列出的 model（建议连同 providerId）。绑定已有任务（targetSessionId / bindToCurrentSession 且非 persistentSession）时运行位置跟随该任务，不能设。',
+        ),
+      effort: z
+        .enum(EFFORT)
+        .optional()
+        .describe('codex effort 档位；非白名单值会被 INVALID_ARGS 拦下。heartbeat 模式留空沿用绑定会话'),
+      workingDir: z
+        .string()
+        .optional()
+        .describe('agent 工作目录（绝对路径）。heartbeat 模式忽略此字段'),
+      useWorktree: z
+        .boolean()
+        .default(false)
+        .describe('true 时给本次触发开 ephemeral git worktree；session.close 时自动清'),
+      targetSessionId: z
+        .string()
+        .optional()
+        .describe('heartbeat 模式：把 prompt 注入到已存 session（id 必须存在且 status=active）。跟进**当前对话**请改用 bindToCurrentSession,不要自己查 / 抄 session id。'),
+      bindToCurrentSession: z
+        .boolean()
+        .optional()
+        .describe('true → 由代码把 targetSessionId 自动绑定为**当前调用方会话**(跟进"这条对话"的标准用法)。设了它就别再传 targetSessionId,也无需调 get_current_session_id —— 避免 agent 复用上下文里过期的 session id 绑错会话。无法识别当前会话时本工具报错而非绑错。'),
+      persistentSession: z
+        .boolean()
+        .optional()
+        .describe('true → 第一次 fire 后自动把新建 session 的 id 回写到 targetSessionId,后续 fire 持续在同一 session 中运行（拥有完整上下文）。默认 false。'),
+      silentWhenIdle: z
+        .boolean()
+        .optional()
+        .describe('静默运行:true → 成功 run 默认不通知、不产生未读红点;任务 prompt 可自行说明哪些条件需要提醒,agent 满足条件时调用 schedule_notify_current_run 主动上报。失败轮仍会通知。确定的检查任务显式设 true；提醒/定时发送设 false。省略时默认 false，避免吞掉旧调用方的提醒。'),
+      preRunPlugin: z
+        .object({
+          pluginId: z.string().min(1).max(512),
+          onFailure: z.enum(['allow', 'skip', 'block']),
+        })
+        .nullable()
+        .optional()
+        .describe('插件前置检查：每次触发先问用户选定的插件要不要运行（插件只能放行、跳过本次或停止，不能替用户批准）。pluginId 用 ghost_list 返回的插件 id；插件必须已启用、声明了「自动化运行前检查」且用户已在安装/更新确认里允许。onFailure = 插件没回应、出错或不可用时：allow 照常运行 / skip 跳过本次 / block 停止并记为失败。可与 preRunHook 并存（先问插件再跑脚本）。'),
+      preRunHook: z
+        .object({
+          command: z
+            .string()
+            .min(1)
+            .describe('经系统 shell 执行的命令（cwd=任务工作目录）。exit 0 放行本轮；exit 2 跳过本轮（不启动 agent、零 token，run 记 skipped）；其它异常/超时阻止本轮并将 run 记 failed。Windows 写显式解释器（node x.mjs）。'),
+          timeoutMs: z
+            .number()
+            .int()
+            .positive()
+            .optional()
+            .describe('超时毫秒，可选；未配置则不限时（脚本卡死会阻塞该轮触发）；超时会阻止本轮并将 run 记 failed'),
+        })
+        .optional()
+        .describe('前置检查脚本（Pre-run Hook）。轮询型任务用它把"要不要跑"判断放到脚本里，空转轮次直接跳过不烧 token。建议流程：先写脚本→自测 exit code→再挂到任务上。'),
+      notify: z
+        .object({
+          desktop: z.boolean().describe('完成时弹桌面通知'),
+          feishu: z.boolean().describe('完成时发飞书消息（当前 desktop notifier 飞书分支只 log，详见 Phase 3 changelog L1296）'),
+        })
+        .describe('通知开关，必填；典型默认 {desktop:true, feishu:false}'),
+      expireAt: z
+        .number()
+        .int()
+        .optional()
+        .describe('Unix ms 截止时间戳（可选）；超过后 scheduler 不再触发'),
+      device: z
+        .string()
+        .min(1)
+        .optional()
+        .describe('local（默认，本机）或要存放这条自动化的电脑 deviceId。闹钟保存在那台电脑上，对方关机则不会触发。workingDir 必须是那台电脑上已存在的目录，或省略。'),
+    },
+    handler: async (args) => {
+      const { bindToCurrentSession, device, ...rest } = args as CreateScheduleInput & {
+        bindToCurrentSession?: boolean;
+        device?: string;
+      };
+      if (!isLocalDevice(device)) {
+        try {
+        if (bindToCurrentSession) {
+          throw new Error('invalid request: 在其它电脑上创建不能绑定当前会话');
+        }
+        let input = rest as CreateScheduleInput;
+        if (input.agentDeviceId === LOCAL_SCHEDULE_AGENT_DEVICE) {
+          const { agentDeviceId: _local, ...localInput } = input;
+          input = localInput;
+        }
+        if (input.targetSessionId?.includes('::')) {
+          const split = input.targetSessionId.indexOf('::');
+          const owner = input.targetSessionId.slice(0, split);
+          const localId = input.targetSessionId.slice(split + 2);
+          if (owner !== device || !localId || localId.includes('::')) {
+            throw new Error('invalid request: targetSessionId 必须是目标电脑上的任务');
+          }
+          input = { ...input, targetSessionId: localId };
+        }
+        if ((input.executionMode ?? 'agent') === 'script') {
+          if (!input.scriptConfig?.command?.trim() || !(input.workingDir ?? '').trim()) {
+            throw new Error('invalid request: executionMode="script" 需要 scriptConfig.command 和目标电脑上已存在的 workingDir');
+          }
+        } else if (!input.prompt?.trim()) {
+          throw new Error('invalid request: prompt 不能为空(agent 模式必填)');
+        }
+        if (input.intervalMs !== undefined) assertCronAndTimezoneValid(input.cronExpr, input.timezone);
+        return runOnDevice(deps, device, async () => {
+          throw new Error('invalid device: remote create must not use the local scheduler');
+        }, { op: 'create', args: [input] });
+        } catch (err) {
+          const classified = classifySchedulerError(err);
+          return buildJsonResult({ ok: false, ...classified }, true);
+        }
+      }
+      return withScheduler(deps, async (scheduler) => {
+        let input = rest as CreateScheduleInput;
+        if (input.agentDeviceId === LOCAL_SCHEDULE_AGENT_DEVICE) {
+          const { agentDeviceId: _local, ...localInput } = input;
+          input = localInput;
+        }
+        if (input.agentDeviceId && (bindToCurrentSession || input.targetSessionId) && !input.persistentSession) {
+          throw new Error('invalid request: 绑定已有任务时运行位置跟随该任务，不能设 agentDeviceId');
+        }
+        // script 模式工具层前置校验(引擎也校验,这里保证报错落 INVALID_PARAMS 且
+        // 消息可直接指导模型自纠;agent 模式则补回 prompt 非空校验——schema 里
+        // prompt 已放宽为 optional 以兼容 script 模式)。
+        if ((input.executionMode ?? 'agent') === 'script') {
+          if (!input.scriptConfig?.command?.trim()) {
+            throw new Error('invalid request: executionMode="script" 需要 scriptConfig.command');
+          }
+          if (!(input.workingDir ?? '').trim()) {
+            throw new Error('invalid request: executionMode="script" 需要 workingDir(本地项目绝对路径)');
+          }
+          if (input.useWorktree || input.persistentSession) {
+            throw new Error(
+              'invalid request: script 模式不支持 useWorktree / persistentSession',
+            );
+          }
+          input = { ...input, prompt: input.prompt ?? '', workspaceKind: 'project' };
+        } else if (!input.prompt?.trim()) {
+          throw new Error('invalid request: prompt 不能为空(agent 模式必填)');
+        }
+        if (input.intervalMs !== undefined) {
+          // intervalMs 模式下引擎不解析 cronExpr / timezone,工具层补回这道校验,
+          // 避免非法 cron / timezone 被静默落库(详见 assertCronAndTimezoneValid)。
+          assertCronAndTimezoneValid(input.cronExpr, input.timezone);
+        }
+        if (bindToCurrentSession) {
+          // 代码确定地把"跟进当前对话"翻成 targetSessionId,杜绝 agent 复用上下文里
+          // 过期的 session id 绑错会话(fork / 接管场景尤其容易踩)。识别不到当前会话
+          // 时报错(消息含 "invalid" → INVALID_PARAMS)而非静默绑错。
+          const sessionId = getSessionContext?.().sessionId;
+          if (!sessionId) {
+            throw new Error(
+              'invalid request: bindToCurrentSession 无法解析当前会话(没有可用的 session 上下文);如确需绑定,请改用显式 targetSessionId',
+            );
+          }
+          input = { ...input, targetSessionId: sessionId };
+        }
+        if (input.preRunHook?.command?.trim()) {
+          if (!deps.hookScript?.stabilizeCommand) {
+            throw new Error(
+              'invalid request: 当前 host 未提供 pre-run hook 路径稳定化服务，拒绝持久化可能随 cwd 漂移的脚本命令',
+            );
+          }
+          input = await stabilizePreRunHookForCreate(input, {
+            resolveSessionWorkDir:
+              deps.hookScript.resolveSessionWorkDir ?? (async () => undefined),
+            stabilizeCommand: deps.hookScript.stabilizeCommand,
+          });
+        }
+        return scheduler.create(input);
+      });
+    },
+  });
+}

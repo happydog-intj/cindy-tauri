@@ -1,0 +1,24 @@
+{
+  "id": "stackoverflow-search",
+  "match": [
+    "stackoverflow.com",
+    "api.stackexchange.com"
+  ],
+  "description": "Search Stack Overflow questions",
+  "access": "read",
+  "adapter": "stackoverflow/search",
+  "inputs": {
+    "query": {
+      "required": true,
+      "type": "string",
+      "description": "Search query"
+    },
+    "limit": {
+      "required": false,
+      "type": "int",
+      "default": 10,
+      "description": "Max number of results"
+    }
+  },
+  "steps": []
+}

@@ -1,12 +1,12 @@
 // device-link 被控端的纯协议部分：允许列表（数据）+ 黄金样例（运行上游 allowlist/topics/transport）。
-import { REMOTE_INVOKE_ALLOWLIST, PUSH_FORWARD_ALLOWLIST, computeAllowlistHash } from '../../../cindy/packages/device-link/src/allowlist.ts';
-import { encodeModelSpeedPayload } from '../../../cindy/packages/device-link/src/sessionListTransport.ts';
-import { topicForPush } from '../../../cindy/packages/device-link/src/topics.ts';
+import { REMOTE_INVOKE_ALLOWLIST, PUSH_FORWARD_ALLOWLIST, computeAllowlistHash } from '../../vendor/cindy/packages/device-link/src/allowlist.ts';
+import { encodeModelSpeedPayload } from '../../vendor/cindy/packages/device-link/src/sessionListTransport.ts';
+import { topicForPush } from '../../vendor/cindy/packages/device-link/src/topics.ts';
 import {
   encodeReliableFrames, parseTransportPayload, makeTransportAck, parseTransportAck, makeTransportSkipPayload,
   reliableRetryDelayMs, retransmitBaseMs, updateRetransmitEstimate, updateDeliveryEstimate, byteLength,
   MAX_TRANSPORT_CHUNK_BYTES,
-} from '../../../cindy/packages/device-link/src/transport.ts';
+} from '../../vendor/cindy/packages/device-link/src/transport.ts';
 
 const norm = (v: any) => JSON.parse(JSON.stringify(v === undefined ? null : v));
 const run = (fn: () => unknown) => { try { return { ok: true, v: norm(fn()) }; } catch (e: any) { return { ok: false, v: String(e?.message ?? e) }; } };

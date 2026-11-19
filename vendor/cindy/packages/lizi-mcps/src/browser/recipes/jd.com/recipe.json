@@ -1,0 +1,23 @@
+{
+  "id": "jd-item",
+  "match": [
+    "jd.com"
+  ],
+  "description": "京东商品详情（价格、店铺、规格参数、主图、详情图）",
+  "access": "read",
+  "adapter": "jd/item",
+  "inputs": {
+    "sku": {
+      "required": true,
+      "type": "str",
+      "description": "商品 SKU ID（如 100291143898）"
+    },
+    "images": {
+      "required": false,
+      "type": "int",
+      "default": 200,
+      "description": "图片数量上限（默认200）"
+    }
+  },
+  "steps": []
+}

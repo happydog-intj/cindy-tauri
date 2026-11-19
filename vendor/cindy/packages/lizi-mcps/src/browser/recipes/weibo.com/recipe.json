@@ -1,0 +1,18 @@
+{
+  "id": "weibo-hot",
+  "match": [
+    "weibo.com"
+  ],
+  "description": "微博热搜",
+  "access": "read",
+  "adapter": "weibo/hot",
+  "inputs": {
+    "limit": {
+      "required": false,
+      "type": "int",
+      "default": 30,
+      "description": "Number of items (max 50)"
+    }
+  },
+  "steps": []
+}

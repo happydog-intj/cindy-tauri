@@ -1,0 +1,295 @@
+/**
+ * scheduler/update.ts — schedule_update tool
+ *
+ * Patch 形态：UpdateScheduleInput = Partial<CreateScheduleInput>。
+ * 改 cronExpr / timezone 时 scheduler 自动重算 nextFireAt。
+ */
+
+import { z } from 'zod';
+
+import { AGENT_KIND, EFFORT, EXECUTION_MODE, SCRIPT_CAPABILITY } from './_enums.js';
+import { assertCronAndTimezoneValid, buildJsonResult, withScheduler } from './_shared.js';
+import { isLocalDevice, runOnDevice, writeDeviceShape } from './_devices.js';
+import { LOCAL_SCHEDULE_AGENT_DEVICE } from './listModels.js';
+import type { LiziMcpSessionContext, SchedulerMcpDeps } from '../types.js';
+import type { SchedulerToolRegistry } from '../cindy_schedulerToolRegistry.js';
+import { stabilizePreRunHookForUpdate, type UpdateScheduleInput } from '@cindy/maker-scheduler';
+
+export function registerScheduleUpdateTool(
+  registry: SchedulerToolRegistry,
+  deps: SchedulerMcpDeps,
+  getSessionContext?: () => LiziMcpSessionContext,
+): void {
+  registry.register({
+    name: 'schedule_update',
+    category: 'scheduler',
+    description:
+      '修改一条定时任务的部分字段（patch 形态）。默认改本机的；其它电脑上的任务传 device（此时不支持 bindToCurrentSession；null 可清空 intervalMs，以及支持模型位置选择的目标电脑上的 modelAgentDeviceId / modelAgentKind / model / providerId / effort，其它字段暂不支持；改 preRunHook 必须显式带 timeoutMs（数值，或 null 表示不限时）；targetSessionId 可传该电脑的 deviceId::sessionId 或其本机 id，不能指向别的电脑）。改 cronExpr / timezone 时 nextFireAt 会自动重算。要暂停 / 恢复请用 schedule_pause / schedule_resume，不要直接 patch status。把任务改成跟进**当前对话**的 heartbeat 请传 bindToCurrentSession=true（代码自动绑定本会话,无需也不要自己查 / 传 session id）。' +
+      '**目标值缺失时先问用户，禁止盲猜**：用户指令模糊（如"改一下时间"没说改到几点、"换个模型"没说换哪个）时，先用 AskUserQuestion（或一句话追问）确认目标值再 patch；只改用户点名的字段，不要顺手"优化"其它字段。',
+    inputShape: {
+      id: z.string().min(1).describe('Schedule id'),
+      name: z.string().min(1).optional(),
+      prompt: z.string().min(1).optional(),
+      cronExpr: z.string().min(1).optional(),
+      intervalMs: z
+        .number()
+        .int()
+        .positive()
+        .nullable()
+        .optional()
+        .describe('相对间隔毫秒。设置后优先于 cronExpr。省略 = 不修改（真 partial：只改 prompt / cronExpr 不会动它）；传 null = 清空，调度回到 cronExpr 壁钟槽位语义。'),
+      timezone: z.string().min(1).optional(),
+      recurring: z.boolean().optional(),
+      agentKind: z.enum(AGENT_KIND).optional(),
+      modelAgentKind: z.enum(AGENT_KIND).nullable().optional().describe('显式模型选择的引擎；null 清除覆盖'),
+      fastMode: z.union([z.boolean(), z.literal('ultrafast')]).optional().describe('模型速度：false 标准、true 快速、ultrafast 超快；省略不修改'),
+      modelAgentDeviceId: z.string().nullable().optional().describe('模型运行位置：远程或分享供应商的 agentDeviceId；空字符串=自动化所在电脑（schedule_list_models 的 local 在此须转为空字符串），null=恢复沿用绑定任务及首次新建的 agentDeviceId 默认位置，省略=不修改。远程选择须同时指定 modelAgentKind、model、providerId；绑定任务或持续模式切回本机也须有 modelAgentKind 和 model，可沿用已保存的完整选择'),
+      kind: z.literal('cron').optional(),
+      model: z
+        .string()
+        .nullable()
+        .optional()
+        .describe('传 null = 清空,回到所选 agentKind 的默认模型路由;省略 = 不修改。换 agentKind 时上一引擎的 model 会被引擎自动丢弃,无需手动清。'),
+      providerId: z
+        .string()
+        .nullable()
+        .optional()
+        .describe('传 null = 清空(同 model 一起回到默认路由);省略 = 不修改。'),
+      agentDeviceId: z
+        .string()
+        .min(1)
+        .nullable()
+        .optional()
+        .describe('每次新建任务时 Agent 的运行位置，语义见 schedule_create 同名字段（schedule_list_models 查位置与模型）。传 null 或 "local" = 回到本机；省略 = 不修改，但本次改了 agentKind / model / providerId 时会回到本机（来源与位置成对），要留在原处须一并重传。仅本机定时任务可设。'),
+      effort: z
+        .enum(EFFORT)
+        .nullable()
+        .optional()
+        .describe('传 null = 清空(按模型默认档);省略 = 不修改。'),
+      workingDir: z
+        .string()
+        .nullable()
+        .optional()
+        .describe('传 null = 清空(回到绑定会话 / 对话工作区语义);省略 = 不修改。'),
+      useWorktree: z.boolean().optional(),
+      targetSessionId: z
+        .string()
+        .min(1)
+        .nullable()
+        .optional()
+        .describe('显式绑定到某条已存 session。跟进**当前对话**请改用 bindToCurrentSession,不要自己查 / 抄 session id。传 null = 解绑；省略 = 不修改。script 模式同样可绑定，绑定为生命周期归属及唯一投递目标，归档或删除后停止。'),
+      bindToCurrentSession: z
+        .boolean()
+        .optional()
+        .describe('true → 由代码把 targetSessionId 改绑为**当前调用方会话**(跟进"这条对话"的标准用法)。设了它就别再传 targetSessionId,也无需调 get_current_session_id —— 避免 agent 复用上下文里过期的 session id 绑错会话。无法识别当前会话时本工具报错而非绑错。'),
+      persistentSession: z.boolean().optional(),
+      silentWhenIdle: z
+        .boolean()
+        .optional()
+        .describe('静默运行开关,语义见 schedule_create 同名字段'),
+      executionMode: z
+        .enum(EXECUTION_MODE)
+        .optional()
+        .describe('执行方式：agent / script（仅运行脚本，零 token），语义见 schedule_create 同名字段。切到 script 时任务须已有（或本次 patch 同时带）scriptConfig，且 workingDir 是本地项目目录、未开 worktree 或 persistentSession，否则报 INVALID_PARAMS'),
+      scriptConfig: z
+        .object({
+          command: z.string().min(1),
+          timeoutMs: z.number().int().positive().optional(),
+          capabilities: z.array(z.enum(SCRIPT_CAPABILITY)).default([]),
+        })
+        .nullable()
+        .optional()
+        .describe('script 模式的脚本配置，语义见 schedule_create 同名字段。传 null = 清空（先/同时把 executionMode 切回 agent）；省略 = 不修改'),
+      preRunPlugin: z
+        .object({
+          pluginId: z.string().min(1).max(512),
+          onFailure: z.enum(['allow', 'skip', 'block']),
+        })
+        .nullable()
+        .optional()
+        .describe('插件前置检查，语义见 schedule_create 同名字段。传 null = 关闭；省略 = 不修改。只支持本机的定时任务。'),
+      preRunHook: z
+        .object({
+          command: z.string().min(1),
+          timeoutMs: z
+            .number()
+            .int()
+            .positive()
+            .nullable()
+            .optional()
+            .describe('省略 = 沿用任务现有 timeoutMs(只改 command 不用重传超时);传 null = 显式清除超时(不限时)。'),
+        })
+        .nullable()
+        .optional()
+        .describe('前置检查脚本,语义见 schedule_create 同名字段。传 null = 关闭前置检查(清空);省略 = 不修改。**新建/改写脚本请走 schedule_set_pre_run_hook**(统一落盘+自测),本字段只用于关闭或挂载已知命令。'),
+      notify: z
+        .object({
+          desktop: z.boolean(),
+          feishu: z.boolean(),
+        })
+        .optional(),
+      expireAt: z.number().int().optional(),
+      ...writeDeviceShape,
+    },
+    handler: async ({ id, bindToCurrentSession, device, ...patch }) => {
+      const expected = deps.getApprovedScheduleGuard?.();
+      if (!isLocalDevice(device)) {
+        // 对方电脑的 IPC 入口自己做校验与 hook 路径稳定化;这里只拦跨 JSON 边界
+        // 表达不了、或只对本机有意义的写法,明确报错而不是写出与意图不符的任务。
+        // 绑定任务 id 只在那台电脑上有效：带本设备前缀的去掉前缀，指向别的电脑的拒绝。
+        // 带 `::` 的只接受「本设备前缀 + 非空、不再含 `::` 的任务 id」。
+        const target = (patch as { targetSessionId?: string | null }).targetSessionId;
+        let targetInvalid = false;
+        if (typeof target === 'string' && target.includes('::')) {
+          const split = target.indexOf('::');
+          const localId = target.slice(split + 2);
+          targetInvalid = target.slice(0, split) !== device || !localId || localId.includes('::');
+          if (!targetInvalid) (patch as { targetSessionId?: string }).targetSessionId = localId;
+        }
+        const unsupported = bindToCurrentSession
+          ? 'bindToCurrentSession 只能绑定本机的当前任务'
+          : targetInvalid
+            ? 'targetSessionId 必须是目标定时任务所在电脑上的任务（deviceId::sessionId 或该电脑的任务 id）'
+          : patch.preRunHook
+              && typeof (patch.preRunHook as { timeoutMs?: unknown }).timeoutMs !== 'number'
+              && (patch.preRunHook as { timeoutMs?: unknown }).timeoutMs !== null
+            // 对方入口整对象替换 preRunHook:省略超时会把它清成不限时,与本机「省略 = 沿用」
+            // 语义相反;先读后写又会覆盖别处同时改的超时。要求调用方显式给出:数值或
+            // null(不限时),由一次写入完成。
+            ? '改其它电脑上的 preRunHook 必须显式传 timeoutMs(数值,或 null 表示不限时;先用 schedule_get 读到当前值)'
+          : (patch as { preRunPlugin?: unknown }).preRunPlugin !== undefined
+            ? '插件前置检查只能在本机设置（插件装在各自的电脑上）'
+          : (patch as { agentDeviceId?: string | null }).agentDeviceId !== undefined
+            ? '其它电脑上的定时任务不能设运行位置 agentDeviceId'
+          : Object.entries(patch).some(([key, value]) => value === null
+              && !['intervalMs', 'modelAgentDeviceId', 'modelAgentKind', 'model', 'providerId', 'effort'].includes(key))
+            ? '其它电脑上的定时任务只支持用 null 清空间隔和模型选择字段'
+            : null;
+        if (unsupported) {
+          return buildJsonResult(
+            { ok: false, code: 'INVALID_PARAMS', message: `invalid request: ${unsupported}` },
+            true,
+          );
+        }
+        try {
+          assertCronAndTimezoneValid(patch.cronExpr, patch.timezone);
+        } catch (err) {
+          return buildJsonResult(
+            { ok: false, code: 'INVALID_PARAMS', message: (err as Error).message },
+            true,
+          );
+        }
+        const hook = patch.preRunHook as { command: string; timeoutMs?: number | null } | undefined;
+        // 不限时在对方入口的表达就是不带 timeoutMs 的整对象。
+        // Model-selection nulls must survive JSON; the receiving IPC clears them.
+        const remotePatch = hook?.timeoutMs === null
+          ? { ...patch, preRunHook: { command: hook.command } }
+          : patch;
+        return runOnDevice(deps, device, async () => undefined, {
+          op: 'update',
+          args: expected ? [id, remotePatch, expected] : [id, remotePatch],
+        });
+      }
+      return withScheduler(deps, async (scheduler) => {
+        let input = patch as UpdateScheduleInput;
+        if ((patch as { targetSessionId?: string | null }).targetSessionId === null) {
+          // JSON 边界的"解绑"表达:null → 归一成 undefined 但保留 key(storage patch
+          // 按 hasOwnProperty 判定,key 在且 undefined = 清列 NULL,同 preRunHook 约定)。
+          // 没有这条翻译,已绑定的任务经 MCP 永远拼不出"解绑 + 切 script"的合法 patch
+          // (schema 只收 string 或缺省,而缺省 = 不修改)。
+          input = { ...input, targetSessionId: undefined };
+        }
+        if ((patch as { intervalMs?: number | null }).intervalMs === null) {
+          // 同 targetSessionId:null → 带 key 的 undefined = 显式清空,调度回到
+          // cronExpr 壁钟槽位语义。引擎遵循真 partial 契约(没带 key 就不动),
+          // 这是 JSON 边界唯一的清空表达。
+          input = { ...input, intervalMs: undefined };
+        }
+        // 同上:model / providerId / effort / workingDir 的 null 也翻成带 key 的
+        // undefined(storage 按 hasOwnProperty 判定 → 清列 NULL)。此前 schema 只收
+        // string,agent 想把任务从一个引擎的模型路由上摘下来(如伙伴接管期用 Codex
+        // 模型跑过、再改回 Claude Code)只能报 INVALID_ARGS,陈旧路由永远清不掉。
+        const agentDeviceId = (patch as { agentDeviceId?: string | null }).agentDeviceId;
+        if (agentDeviceId === null || agentDeviceId === LOCAL_SCHEDULE_AGENT_DEVICE) {
+          input = { ...input, agentDeviceId: undefined };
+        }
+        for (const key of ['model', 'providerId', 'effort', 'workingDir', 'modelAgentKind', 'modelAgentDeviceId'] as const) {
+          if ((patch as Record<string, unknown>)[key] === null) {
+            input = { ...input, [key]: undefined };
+          }
+        }
+        const clearsWorkingDir = (patch as { workingDir?: string | null }).workingDir === null;
+        if (clearsWorkingDir) {
+          // 清目录 = 回到对话工作区语义(与 create 缺省目录时的推断、引擎「给了真实
+          // 目录翻成 project」对称),否则 workspaceKind 仍是 project 却无目录。
+          input = { ...input, workspaceKind: 'dialogue' };
+        }
+        // 无条件校验本次 patch 显式带的 cronExpr / timezone(函数对缺省字段是
+        // no-op)。不能只在 patch 带 intervalMs 数值时校验:任务已有 intervalMs、
+        // patch 只改 cronExpr 时,真 partial 语义保留原 interval,引擎按
+        // now + intervalMs 重排、全程不解析 cron——无效表达式会被静默写入,等
+        // 切回 cron 模式才爆(codex review 发现)。
+        assertCronAndTimezoneValid(input.cronExpr, input.timezone);
+        if (bindToCurrentSession) {
+          // 与 schedule_create 对称:把"改绑当前对话"翻成 targetSessionId,杜绝 agent
+          // 复用上下文里过期的 session id。识别不到当前会话时报 INVALID_PARAMS,不静默绑错。
+          const sessionId = getSessionContext?.().sessionId;
+          if (!sessionId) {
+            throw new Error(
+              'invalid request: bindToCurrentSession 无法解析当前会话(没有可用的 session 上下文);如确需绑定,请改用显式 targetSessionId',
+            );
+          }
+          input = { ...input, targetSessionId: sessionId };
+        }
+        return scheduler.updateFromCurrent(id, async (existing) => {
+          // worktree 模式以 workingDir 为基仓(workdir-resolver 会拒绝无目录的 worktree
+          // 任务,每次 fire 都失败)。清目录时若任务仍开着 useWorktree 且本次没关,
+          // 明确拒绝而不是写出一条跑不动的任务(codex review)。
+          const nextUseWorktree = Object.prototype.hasOwnProperty.call(input, 'useWorktree')
+            ? input.useWorktree
+            : existing.useWorktree;
+          if (clearsWorkingDir && nextUseWorktree) {
+            throw new Error(
+              'invalid request: workingDir 传 null 清空时任务仍开启 useWorktree(worktree 需要 workingDir 作为基仓);请同时传 useWorktree:false,或改传新的 workingDir',
+            );
+          }
+          // preRunHook.timeoutMs 的真 partial 表达:只改 command 时沿用任务现有超时
+          // (此前整对象替换会把省略的 timeoutMs 静默清成"不限时");传 null 才显式清除。
+          // null 在进入引擎前剥掉 —— 引擎/storage 只认 number | undefined。
+          const rawHook = (patch as { preRunHook?: { command: string; timeoutMs?: number | null } | null })
+            .preRunHook;
+          if (rawHook && typeof rawHook === 'object') {
+            if (rawHook.timeoutMs === null) {
+              input = { ...input, preRunHook: { command: rawHook.command } };
+            } else if (
+              // 「没提供」= 缺 key 或值为 undefined:MCP 走 JSON 表达不出带 key 的
+              // undefined,但进程内调用能;两种形态都视作缺省沿用现有超时,只有
+              // null 是清除(copilot review 指出带 key undefined 会漏进清空分支)。
+              rawHook.timeoutMs === undefined &&
+              existing.preRunHook?.timeoutMs !== undefined
+            ) {
+              input = {
+                ...input,
+                preRunHook: { command: rawHook.command, timeoutMs: existing.preRunHook.timeoutMs },
+              };
+            }
+          }
+          const nextHook = Object.prototype.hasOwnProperty.call(input, 'preRunHook')
+            ? input.preRunHook
+            : existing.preRunHook;
+          if (!nextHook?.command?.trim()) return input;
+          if (!deps.hookScript?.stabilizeCommand) {
+            throw new Error(
+              'invalid request: 当前 host 未提供 pre-run hook 路径稳定化服务，拒绝更新带 hook 的任务',
+            );
+          }
+          return stabilizePreRunHookForUpdate(existing, input, {
+            resolveSessionWorkDir:
+              deps.hookScript.resolveSessionWorkDir ?? (async () => undefined),
+            stabilizeCommand: deps.hookScript.stabilizeCommand,
+          });
+        }, expected);
+      });
+    },
+  });
+}

@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { build } from 'esbuild';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const cindyDir = path.resolve(root, process.env.CINDY_DIR ?? '../cindy');
+const cindyDir = path.resolve(root, process.env.CINDY_DIR ?? 'vendor/cindy');
 const [relayPort, token] = process.argv.slice(2);
 const tmp = mkdtempSync(path.join(os.tmpdir(), 'dl-phone-'));
 const bundle = path.join(tmp, 'phone-client.mjs');

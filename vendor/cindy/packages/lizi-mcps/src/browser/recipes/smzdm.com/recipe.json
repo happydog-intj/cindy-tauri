@@ -1,0 +1,24 @@
+{
+  "id": "smzdm-search",
+  "match": [
+    "smzdm.com",
+    "search.smzdm.com"
+  ],
+  "description": "什么值得买搜索好价",
+  "access": "read",
+  "adapter": "smzdm/search",
+  "inputs": {
+    "query": {
+      "required": true,
+      "type": "str",
+      "description": "Search keyword"
+    },
+    "limit": {
+      "required": false,
+      "type": "int",
+      "default": 20,
+      "description": "Number of results"
+    }
+  },
+  "steps": []
+}

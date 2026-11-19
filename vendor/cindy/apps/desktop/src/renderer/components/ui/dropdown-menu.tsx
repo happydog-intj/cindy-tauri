@@ -1,0 +1,312 @@
+import * as React from 'react';
+import * as DropdownMenuPrimitive from '@radix-ui/react-dropdown-menu';
+
+import { cn } from '@/lib/utils';
+
+import {
+  MENU_OWN_HIGHLIGHT_ATTR,
+  MENU_PANEL_ATTR,
+  MENU_ROW_ATTR,
+  hasOwnHighlight,
+} from './dropdown-menu-highlight';
+import {
+  MENU_DANGER_TEXT,
+  MENU_ROW_MOTION,
+  MENU_ROW_OWN_WEIGHT,
+  MENU_ROW_TEXT,
+  MENU_ROW_WEIGHT,
+  MenuHighlightLayer,
+  useMenuPanel,
+  withMenuLabels,
+} from './menu-row';
+
+// Menu text, weight, width reservation and the glide highlight live in menu-row.tsx
+// (DESIGN §4 Select & Dropdown), shared with the composer panels that keep their own shell.
+const ROW_BASE = `relative flex select-none items-center rounded-lg py-1.5 outline-none ${MENU_ROW_TEXT} ${MENU_ROW_MOTION} data-[disabled]:pointer-events-none data-[disabled]:opacity-50`;
+// Per-row focus fill (the transitioned background-color above), used only when the
+// panel's glide highlight is off or the caller styles its own highlight.
+const ROW_FOCUS_FILL = 'focus:bg-sidebar-item-hover';
+
+/** True inside a panel whose single glide highlight replaces per-row focus fills. */
+const MenuHighlightContext = React.createContext(false);
+
+function useRowHighlight(className: string | undefined) {
+  const glide = React.useContext(MenuHighlightContext);
+  const ownHighlight = hasOwnHighlight(className);
+  return {
+    fill: glide && !ownHighlight ? '' : ROW_FOCUS_FILL,
+    weight: MENU_ROW_OWN_WEIGHT.test(className ?? '') ? '' : MENU_ROW_WEIGHT,
+    attrs: { [MENU_ROW_ATTR]: '', ...(ownHighlight ? { [MENU_OWN_HIGHLIGHT_ATTR]: '' } : {}) },
+  };
+}
+
+type PanelHighlightProps = {
+  /** Shared glide highlight between rows (default on). Turn off to keep per-row focus fills. */
+  hoverHighlight?: boolean;
+};
+
+const DropdownMenu = DropdownMenuPrimitive.Root;
+
+const DropdownMenuTrigger = DropdownMenuPrimitive.Trigger;
+
+const DropdownMenuGroup = DropdownMenuPrimitive.Group;
+
+const DropdownMenuPortal = DropdownMenuPrimitive.Portal;
+
+const DropdownMenuSub = DropdownMenuPrimitive.Sub;
+
+const DropdownMenuRadioGroup = DropdownMenuPrimitive.RadioGroup;
+
+const DropdownMenuSubTrigger = React.forwardRef<
+  React.ComponentRef<typeof DropdownMenuPrimitive.SubTrigger>,
+  React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.SubTrigger> & {
+    inset?: boolean;
+  }
+>(({ className, inset, children, ...props }, ref) => {
+  const row = useRowHighlight(className);
+  return (
+    <DropdownMenuPrimitive.SubTrigger
+      ref={ref}
+      {...row.attrs}
+      className={cn(
+        ROW_BASE,
+        row.weight,
+        'cursor-default px-2',
+        row.fill && `${row.fill} data-[state=open]:bg-sidebar-item-hover`,
+        inset && 'pl-8',
+        className,
+      )}
+      {...props}
+    >
+      {withMenuLabels(children)}
+    </DropdownMenuPrimitive.SubTrigger>
+  );
+});
+DropdownMenuSubTrigger.displayName = DropdownMenuPrimitive.SubTrigger.displayName;
+
+// SubContent 必须走 Portal 挂到 body,不能作为父 Content 的 DOM 后代原地渲染。
+// Radix 默认不给 SubContent 套 Portal,但我们的菜单 surface(共享默认与 MENU_CONTENT_CLASS
+// 都是 bg-[var(--cmd-palette-bg)])在 CINDY 毛玻璃主题下会拿到 `backdrop-filter: blur`
+// (globals.css 的 E4D 毛玻璃规则)。`backdrop-filter` 非 none 会让父 Content 成为
+// fixed 定位后代的 containing block,于是子菜单的 Popper wrapper(position:fixed)不再
+// 逃逸到外层 popper wrapper,而是被父 Content 的 `overflow-hidden` 裁掉 —— 表现为
+// 「点了移动到项目/子菜单没反应」。Portal 到 body(无 filter、无 overflow 裁剪)可根治,
+// 与 DropdownMenuContent 自身已 Portal 的做法一致。删除此 Portal 会让子菜单在毛玻璃
+// 主题下重新消失。
+const DropdownMenuSubContent = React.forwardRef<
+  React.ComponentRef<typeof DropdownMenuPrimitive.SubContent>,
+  React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.SubContent> & PanelHighlightProps
+>(({ className, hoverHighlight = true, children, ...props }, ref) => (
+  <DropdownMenuPrimitive.Portal>
+    <DropdownMenuPrimitive.SubContent
+      ref={useMenuPanel(ref, { highlight: hoverHighlight })}
+      {...{ [MENU_PANEL_ATTR]: '' }}
+      className={cn(
+        'relative z-50 min-w-[8rem] overflow-hidden rounded-xl border border-[var(--cmd-palette-border)] bg-[var(--cmd-palette-bg)] p-1 text-[var(--cmd-palette-item-text)] shadow-[shadow:var(--shadow-menu)] origin-[var(--radix-dropdown-menu-content-transform-origin)] data-[state=open]:animate-float-in data-[state=closed]:animate-float-out',
+        className,
+      )}
+      {...props}
+    >
+      <MenuHighlightContext.Provider value={hoverHighlight}>
+        {hoverHighlight && <MenuHighlightLayer />}
+        {children}
+      </MenuHighlightContext.Provider>
+    </DropdownMenuPrimitive.SubContent>
+  </DropdownMenuPrimitive.Portal>
+));
+DropdownMenuSubContent.displayName = DropdownMenuPrimitive.SubContent.displayName;
+
+const DropdownMenuContent = React.forwardRef<
+  React.ComponentRef<typeof DropdownMenuPrimitive.Content>,
+  React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.Content> & PanelHighlightProps & {
+    /** Optional top-layer host, e.g. a menu above native fullscreen media. */
+    portalContainer?: HTMLElement | null;
+  }
+>(({ className, sideOffset = 4, hoverHighlight = true, children, portalContainer, ...props }, ref) => (
+  <DropdownMenuPrimitive.Portal container={portalContainer}>
+    <DropdownMenuPrimitive.Content
+      ref={useMenuPanel(ref, { highlight: hoverHighlight })}
+      {...{ [MENU_PANEL_ATTR]: '' }}
+      sideOffset={sideOffset}
+      className={cn(
+        'relative z-50 min-w-[8rem] overflow-hidden rounded-xl border border-[var(--cmd-palette-border)] bg-[var(--cmd-palette-bg)] p-1 text-[var(--cmd-palette-item-text)] shadow-[shadow:var(--shadow-menu)]',
+        'origin-[var(--radix-dropdown-menu-content-transform-origin)] data-[state=open]:animate-float-in data-[state=closed]:animate-float-out',
+        className,
+      )}
+      {...props}
+    >
+      <MenuHighlightContext.Provider value={hoverHighlight}>
+        {hoverHighlight && <MenuHighlightLayer />}
+        {children}
+      </MenuHighlightContext.Provider>
+    </DropdownMenuPrimitive.Content>
+  </DropdownMenuPrimitive.Portal>
+));
+DropdownMenuContent.displayName = DropdownMenuPrimitive.Content.displayName;
+
+const DropdownMenuItem = React.forwardRef<
+  React.ComponentRef<typeof DropdownMenuPrimitive.Item>,
+  React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.Item> & {
+    inset?: boolean;
+    /** Destructive action: the single menu danger red. */
+    variant?: 'default' | 'danger';
+  }
+>(({ className, inset, variant = 'default', asChild, children, ...props }, ref) => {
+  const row = useRowHighlight(className);
+  return (
+    <DropdownMenuPrimitive.Item
+      ref={ref}
+      {...row.attrs}
+      className={cn(
+        ROW_BASE,
+        row.weight,
+        'cursor-pointer px-2',
+        row.fill,
+        variant === 'danger' && MENU_DANGER_TEXT,
+        inset && 'pl-8',
+        className,
+      )}
+      asChild={asChild}
+      {...props}
+    >
+      {asChild ? children : withMenuLabels(children)}
+    </DropdownMenuPrimitive.Item>
+  );
+});
+DropdownMenuItem.displayName = DropdownMenuPrimitive.Item.displayName;
+
+const DropdownMenuCheckboxItem = React.forwardRef<
+  React.ComponentRef<typeof DropdownMenuPrimitive.CheckboxItem>,
+  React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.CheckboxItem>
+>(({ className, children, checked, ...props }, ref) => {
+  const row = useRowHighlight(className);
+  return (
+    <DropdownMenuPrimitive.CheckboxItem
+      ref={ref}
+      {...row.attrs}
+      className={cn(ROW_BASE, row.weight, 'cursor-default pl-8 pr-2', row.fill, className)}
+      checked={checked}
+      {...props}
+    >
+      <span className="absolute left-2 flex h-3.5 w-3.5 items-center justify-center">
+        <DropdownMenuPrimitive.ItemIndicator>
+          <svg
+            width="15"
+            height="15"
+            viewBox="0 0 15 15"
+            fill="none"
+            xmlns="http://www.w3.org/2000/svg"
+          >
+            <path
+              d="M11.4669 3.72684C11.7558 3.91574 11.8369 4.30308 11.648 4.59198L7.39799 11.092C7.29783 11.2452 7.13556 11.3467 6.95402 11.3699C6.77247 11.3931 6.58989 11.3354 6.45446 11.2124L3.70446 8.71241C3.44905 8.48022 3.43023 8.08494 3.66242 7.82953C3.89461 7.57412 4.28989 7.5553 4.5453 7.78749L6.75292 9.79441L10.6018 3.90792C10.7907 3.61902 11.178 3.53795 11.4669 3.72684Z"
+              fill="currentColor"
+              fillRule="evenodd"
+              clipRule="evenodd"
+            />
+          </svg>
+        </DropdownMenuPrimitive.ItemIndicator>
+      </span>
+      {withMenuLabels(children)}
+    </DropdownMenuPrimitive.CheckboxItem>
+  );
+});
+DropdownMenuCheckboxItem.displayName = DropdownMenuPrimitive.CheckboxItem.displayName;
+
+const DropdownMenuRadioItem = React.forwardRef<
+  React.ComponentRef<typeof DropdownMenuPrimitive.RadioItem>,
+  React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.RadioItem>
+>(({ className, children, ...props }, ref) => {
+  const row = useRowHighlight(className);
+  return (
+    <DropdownMenuPrimitive.RadioItem
+      ref={ref}
+      {...row.attrs}
+      className={cn(ROW_BASE, row.weight, 'cursor-default pl-8 pr-2', row.fill, className)}
+      {...props}
+    >
+      <span className="absolute left-2 flex h-3.5 w-3.5 items-center justify-center">
+        <DropdownMenuPrimitive.ItemIndicator>
+          <svg
+            width="15"
+            height="15"
+            viewBox="0 0 15 15"
+            fill="none"
+            xmlns="http://www.w3.org/2000/svg"
+          >
+            <path
+              d="M7.49991 0.876953C3.84222 0.876953 0.877075 3.8421 0.877075 7.49979C0.877075 11.1575 3.84222 14.123 7.49991 14.123C11.1576 14.123 14.1227 11.1575 14.1227 7.49979C14.1227 3.8421 11.1576 0.876953 7.49991 0.876953ZM7.49991 1.82695C10.6329 1.82695 13.1727 4.3668 13.1727 7.49979C13.1727 10.6328 10.6329 13.173 7.49991 13.173C4.36692 13.173 1.82708 10.6328 1.82708 7.49979C1.82708 4.3668 4.36692 1.82695 7.49991 1.82695ZM7.49991 4.37695C5.77492 4.37695 4.37708 5.77479 4.37708 7.49979C4.37708 9.22479 5.77492 10.623 7.49991 10.623C9.22491 10.623 10.6227 9.22479 10.6227 7.49979C10.6227 5.77479 9.22491 4.37695 7.49991 4.37695Z"
+              fill="currentColor"
+              fillRule="evenodd"
+              clipRule="evenodd"
+            />
+          </svg>
+        </DropdownMenuPrimitive.ItemIndicator>
+      </span>
+      {withMenuLabels(children)}
+    </DropdownMenuPrimitive.RadioItem>
+  );
+});
+DropdownMenuRadioItem.displayName = DropdownMenuPrimitive.RadioItem.displayName;
+
+const DropdownMenuLabel = React.forwardRef<
+  React.ComponentRef<typeof DropdownMenuPrimitive.Label>,
+  React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.Label> & {
+    inset?: boolean;
+  }
+>(({ className, inset, ...props }, ref) => (
+  <DropdownMenuPrimitive.Label
+    ref={ref}
+    className={cn(
+      'px-2 py-1.5 text-12 font-medium leading-[1.33] text-[var(--cmd-palette-item-meta)]',
+      inset && 'pl-8',
+      className,
+    )}
+    {...props}
+  />
+));
+DropdownMenuLabel.displayName = DropdownMenuPrimitive.Label.displayName;
+
+// Separators use the Board divider --cmd-palette-border, the panel border colour.
+const DropdownMenuSeparator = React.forwardRef<
+  React.ComponentRef<typeof DropdownMenuPrimitive.Separator>,
+  React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.Separator>
+>(({ className, ...props }, ref) => (
+  <DropdownMenuPrimitive.Separator
+    ref={ref}
+    className={cn('-mx-1 my-1 h-px bg-[var(--cmd-palette-border)]', className)}
+    {...props}
+  />
+));
+DropdownMenuSeparator.displayName = DropdownMenuPrimitive.Separator.displayName;
+
+// Shortcuts stay at 400 while their row turns 500, so the key hint never shifts.
+function DropdownMenuShortcut({ className, ...props }: React.HTMLAttributes<HTMLSpanElement>) {
+  return (
+    <span
+      className={cn(
+        'ml-auto pl-4 text-12 font-normal leading-[1.33] tracking-widest text-[var(--cmd-palette-item-meta)]',
+        className,
+      )}
+      {...props}
+    />
+  );
+}
+DropdownMenuShortcut.displayName = 'DropdownMenuShortcut';
+
+export {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuCheckboxItem,
+  DropdownMenuRadioItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuShortcut,
+  DropdownMenuGroup,
+  DropdownMenuPortal,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
+  DropdownMenuRadioGroup,
+};

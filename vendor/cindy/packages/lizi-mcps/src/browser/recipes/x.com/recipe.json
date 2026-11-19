@@ -1,0 +1,18 @@
+{
+  "id": "twitter-profile",
+  "match": [
+    "x.com",
+    "twitter.com"
+  ],
+  "description": "Fetch a Twitter user profile — bio, stats, etc. (defaults to the logged-in user when no username is given)",
+  "access": "read",
+  "adapter": "twitter/profile",
+  "inputs": {
+    "username": {
+      "required": false,
+      "type": "string",
+      "description": "Twitter screen name (with or without @). Defaults to the logged-in user when omitted."
+    }
+  },
+  "steps": []
+}

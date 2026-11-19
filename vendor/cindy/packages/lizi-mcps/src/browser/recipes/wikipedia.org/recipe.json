@@ -1,0 +1,29 @@
+{
+  "id": "wikipedia-search",
+  "match": [
+    "wikipedia.org"
+  ],
+  "description": "Search Wikipedia articles",
+  "access": "read",
+  "adapter": "wikipedia/search",
+  "inputs": {
+    "query": {
+      "required": true,
+      "type": "str",
+      "description": "Search keyword"
+    },
+    "limit": {
+      "required": false,
+      "type": "int",
+      "default": 10,
+      "description": "Max results"
+    },
+    "lang": {
+      "required": false,
+      "type": "str",
+      "default": "en",
+      "description": "Language code (e.g. en, zh, ja)"
+    }
+  },
+  "steps": []
+}

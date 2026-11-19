@@ -1,0 +1,42 @@
+{
+  "id": "youtube-search",
+  "match": [
+    "youtube.com",
+    "www.youtube.com"
+  ],
+  "description": "Search YouTube videos, Shorts, channels, and playlists",
+  "access": "read",
+  "adapter": "youtube/search",
+  "inputs": {
+    "query": {
+      "required": true,
+      "type": "str",
+      "description": "Search query"
+    },
+    "limit": {
+      "required": false,
+      "type": "int",
+      "default": 20,
+      "description": "Max results (max 50)"
+    },
+    "type": {
+      "required": false,
+      "type": "str",
+      "default": "",
+      "description": "Filter type: shorts, video, channel, playlist"
+    },
+    "upload": {
+      "required": false,
+      "type": "str",
+      "default": "",
+      "description": "Upload date: hour, today, week, month, year"
+    },
+    "sort": {
+      "required": false,
+      "type": "str",
+      "default": "",
+      "description": "Sort by: relevance, date, views, rating"
+    }
+  },
+  "steps": []
+}

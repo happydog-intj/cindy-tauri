@@ -1,0 +1,503 @@
+/**
+ * useSessionRunningStatus — F-SB-7: Session status indicator data hook.
+ * ---------------------------------------------------------------------------
+ * Provides two pieces of data to the Sidebar:
+ *
+ * 1. `runningSessionIds` — a Set of session IDs whose agent is currently running.
+ *    Subscribes to ALL sessions via `makerChatStore.subscribeAll` so it
+ *    reacts to any session's `isRunning` change.
+ *
+ * 2. `notifications` — a Set of session IDs that need the user's attention
+ *    (角标点;颜色由 sessionAttentionStore 的 kind 决定:done=橙 / error=红 /
+ *    awaiting=黄)。A session enters this set when (均限非 active 会话):
+ *    - It transitions from running to not-running while NOT active —— 正常完成记
+ *      'done'(橙),以 error 结束记 'error'(红,V5 起出错也亮角标)。
+ *    - It has a pending ask-user question (`hasPendingAskUser`) while NOT
+ *      being the active session —— 记 'awaiting'(黄)。
+ *    - It has a pending permission request (`hasPendingPermission`) while NOT
+ *      being the active session.
+ *    - It has a pending plan review (`hasPendingPlanReview`) while NOT being
+ *      the active session (FP-3).
+ *    - It has pending local plugin setup (`hasPendingPluginSetup`) while NOT
+ *      being the active session.
+ *    - It has a pending input handoff (`hasPendingInputHandoff`, 代输入) while
+ *      NOT being the active session.
+ *
+ * Notifications are cleared when:
+ *    - The user navigates to that session (clicks it) — done / awaiting only。
+ *      'error' 例外:红角标是未处理告警的派生投影(hooks/usePendingAlertAttention),
+ *      展示不构成已读 —— 只有用户处置横幅或告警本身消失才清。
+ *    - The pending state that caused the notification disappears (e.g. the
+ *      ask-user or permission was resolved elsewhere) — 同样不清 'error'。
+ *
+ * The notification state is in-memory only (not persisted); a page refresh
+ * clears it.
+ *
+ * 队列去抖:排了多条队列时,turn A done → main 会几十毫秒后自动 spawn turn B。
+ * 正常 done 的角标 + 系统通知都经 QUEUE_DEBOUNCE_MS 去抖:窗口内又起新 turn
+ * 就取消(是自动衔接的中间态),排空到真正 idle 才触发一次。error / side-task /
+ * 静默完成不走去抖(见下方分支)。
+ */
+
+import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from 'react';
+import { makerChatStore } from '@/lib/makerChatStore';
+import { getDataOwnerGeneration } from '@/contexts/dataOwnerGeneration';
+import type { SessionStatusInfo } from '@/lib/makerChatStore';
+import {
+  addSessionAttention,
+  clearSessionAttention,
+  getSessionAttentionKind,
+  hasSessionAttention,
+  useSessionAttentionSnapshot,
+} from '@/lib/sessionAttentionStore';
+import {
+  clearCompletedSchedulerOwnedRunForNewActivity,
+  clearCompletedSilencedRunForNewActivity,
+  isSessionTerminalNotificationOwnedByScheduler,
+  isSessionDoneSilenced,
+} from '@/lib/silencedSessionDoneStore';
+import {
+  noteSessionTurnStartedForAlerts,
+  refreshPendingAlerts,
+} from '@/hooks/usePendingAlertAttention';
+import {
+  ensureAgentIslandActivitySubscribed,
+  isSessionCompletionHeldByAgentIsland,
+} from '@/state/agentIslandActivity';
+
+// Codex maker 化后, codex session 也走 makerChatStore;
+// 不再需要双 store 合并 —— 直接订阅 makerChatStore 即可。
+
+/**
+ * turn-A-done 后,main 自动 spawn turn-B 的最大间隔。经测本机 auto-drain
+ * 路径通常 <100ms,给 500ms 稳定裕度。太小容易漏(队列 drain 慢弹通知),
+ * 太大用户等真通知等太久。
+ */
+const QUEUE_DEBOUNCE_MS = 500;
+
+// Keep only currently pending request IDs across Sidebar remounts. A cleared dot
+// stays cleared for the same request, while a new request can alert immediately.
+// Account switches discard the ledger; settled/deleted tasks are pruned below.
+let pendingReminderOwnerId: string | null = null;
+const notifiedPendingRequests = new Map<string, Set<string>>();
+
+interface UseSessionRunningStatusOptions {
+  /**
+   * Fired when a session transitions running → done. Filters out errored
+   * sessions only — does NOT filter out the active session, because the
+   * "should we actually notify the user" decision (focus state, etc.) is
+   * the consumer's. The in-app dot still skips active session via its own
+   * branch; the callback fires for any non-error done.
+   */
+  onSessionDone?: (sessionId: string) => void;
+  /**
+   * Fired when a session transitions running → terminal error. It mirrors
+   * onSessionDone's no-active-session-filter policy so the consumer can gate
+   * on focus state and notification channel settings.
+   */
+  onSessionError?: (sessionId: string) => void;
+  /**
+   * Fired when a session enters a pending state needing user input
+   * (`pendingAskUser` / `pendingPermission` / `pendingPlanReview` /
+   * `pendingPluginSetup`). Rising
+   * edge fires for a new request (or new input-handoff step) in the session.
+   * Like onSessionDone, no active-session filter; the consumer decides.
+   */
+  onSessionNeedsReply?: (sessionId: string, options?: { inputHandoff: true; inputHandoffRequestId?: string }) => void;
+}
+
+/**
+ * @param activeSessionId - The currently viewed session ID (from URL match).
+ * @param options - Optional callbacks for transition side effects.
+ */
+export function useSessionRunningStatus(
+  activeSessionId: string | undefined,
+  options?: UseSessionRunningStatusOptions,
+) {
+  // Codex maker 化后, codex 与 Claude 共用 makerChatStore;
+  // sidebar 的 running 三点指示器对两个 vendor 一视同仁, 单 store 订阅即可。
+  const statusMap = useSyncExternalStore(
+    makerChatStore.subscribeAll,
+    makerChatStore.getRunningSnapshot,
+    makerChatStore.getRunningSnapshot,
+  );
+
+  // Latest callbacks — kept in refs so the transition effect doesn't
+  // re-run when the caller passes inline lambdas each render.
+  const onSessionDoneRef = useRef(options?.onSessionDone);
+  const onSessionErrorRef = useRef(options?.onSessionError);
+  const onSessionNeedsReplyRef = useRef(options?.onSessionNeedsReply);
+  const activeSessionIdRef = useRef(activeSessionId);
+  activeSessionIdRef.current = activeSessionId;
+  useEffect(() => {
+    onSessionDoneRef.current = options?.onSessionDone;
+    onSessionErrorRef.current = options?.onSessionError;
+    onSessionNeedsReplyRef.current = options?.onSessionNeedsReply;
+  }, [options?.onSessionDone, options?.onSessionError, options?.onSessionNeedsReply]);
+  // The done debounce reads Main's completion hold; mirror it from mount.
+  useEffect(() => {
+    ensureAgentIslandActivitySubscribed();
+  }, []);
+
+  // Track previous running set to detect running -> done transitions
+  const prevRunningRef = useRef(new Set<string>());
+
+  // Track which sessions had pending states last cycle, so we can detect
+  // when pending states disappear and auto-clear notifications.
+  const prevPendingRef = useRef(new Set<string>());
+  const prevPendingKeysRef = useRef(new Map<string, Set<string>>());
+  const prevPendingOwnerRef = useRef(getDataOwnerGeneration().dataOwnerId);
+
+  /** 本 hook 因 turn 以错误结束而点的红点(新一轮正常结束时据此收掉过期的那颗)。 */
+  const liveErrorMarkedRef = useRef(new Set<string>());
+
+  /**
+   * Pending done-notifications waiting for a debounce window to expire.
+   * 场景:用户排了队列,turn A done → main 会几十毫秒后自动 spawn turn B。
+   * 基于状态的 `hasQueuedNext` 检查不够 robust(main 有可能先清 pendingQueue
+   * 再发 running=false 的 projection);改用时间去抖:done 后先塞进这张 map,
+   * QUEUE_DEBOUNCE_MS 内若同 session 又开新 turn,取消这次 fire(是自动衔接);
+   * 时限内没起新 turn 才真正弹通知 + 亮角标。
+   */
+  const pendingDoneTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+
+  const notifications = useSessionAttentionSnapshot();
+
+  // Detect transitions that should add or remove notifications.
+  useEffect(() => {
+    const currentRunningSet = deriveRunningSet(statusMap);
+    const prevRunning = prevRunningRef.current;
+
+    // --- 1. Detect new turn starts ---
+    for (const sessionId of currentRunningSet) {
+      if (!prevRunning.has(sessionId)) {
+        // 只清「run 已终态」的标记(用户手动起的新对话或下一个 run);run 还在跑时
+        // 是 subagent 续 turn / silent-stop 自动续跑,标记必须留着。兜底定时器不在
+        // 这里动 —— 统一由本 effect 末尾的对账按当前 running 状态处理。
+        clearCompletedSilencedRunForNewActivity(sessionId);
+        clearCompletedSchedulerOwnedRunForNewActivity(sessionId);
+        // error 红角标与真实错误态同步:新 turn 启动会清掉 store 的终止错误
+        // (staleErrorClearedOnTurnStart),若此时角标还是 'error' 就成了 orphan——
+        // 活跃会话的 done 分支不覆写它,角标会永久残留。错误已不存在,这里显式清除
+        // (explicit 才能过 store 咽喉);新 turn 的结局(done/error)会按最新状态
+        // 重新挂角标,提醒不丢失。
+        // 与派生红点(usePendingAlertAttention)一致:turn 启动会插入新的 user 行,
+        // 原 error 行不再是尾行,pending-alerts 也不再命中 —— 两条路径同向收敛。
+        // hasSessionTerminalError 仍为 true 时不清(mivo 等 skipTurnReset 上升沿
+        // 不拆横幅);派生账本另走 noteSessionTurnStartedForAlerts,只在仍认领
+        // 错误尾行时重算,横幅已灭则差分熄灭红点。
+        if (getSessionAttentionKind(sessionId) !== 'error') {
+          // 本 hook 点的那颗已被处置(关横幅、重试等)：不再认领，之后别的来源点的红点不归它收。
+          liveErrorMarkedRef.current.delete(sessionId);
+        } else if (!makerChatStore.hasSessionTerminalError(sessionId)) {
+          liveErrorMarkedRef.current.delete(sessionId);
+          clearSessionAttention(sessionId, { intent: 'explicit' });
+        }
+        noteSessionTurnStartedForAlerts(sessionId);
+        // Queue auto-drain cancellation:如果此 session 有 pending done 定时器
+        // (刚 turn done 还在 debounce 窗口内),说明 main 正在自动衔接下一条队列
+        // 消息 —— 取消这次通知/角标 fire。用户视角这是一条完整任务的中间态。
+        const pendingTimer = pendingDoneTimersRef.current.get(sessionId);
+        if (pendingTimer !== undefined) {
+          clearTimeout(pendingTimer);
+          pendingDoneTimersRef.current.delete(sessionId);
+        }
+      }
+    }
+
+    // --- 2. Detect running -> done transitions ---
+    for (const sessionId of prevRunning) {
+      if (!currentRunningSet.has(sessionId)) {
+        // Session transitioned from running -> not running.
+        const info = statusMap.get(sessionId);
+        // side-task(mivo 等 skipTurnReset)的结束不是 turn 终态:done/error/角标/
+        // 通知全部跳过。transition entry 只存活一个投递窗口(store 调度清除),
+        // 本 effect 若晚于清除运行会拿到 info===undefined,用 store 兜底查询
+        // (与 hasError fallback 同款)。
+        const isSideTaskStop = info?.sideTask ?? makerChatStore.wasLastStopSideTask(sessionId);
+        if (isSideTaskStop) continue;
+        // The transition entry lives in the snapshot only until the store's
+        // scheduled clear fires — this effect may observe the generation where
+        // the entry is already gone (info === undefined). Falling back to
+        // `false` here was the root cause of failed turns being notified as
+        // "done"; always resolve errors against the authoritative store.
+        const hasError = info?.hasError ?? makerChatStore.hasSessionTerminalError(sessionId);
+        // 两个查询都无副作用、且在 run 存续期间对每次 done 转换都成立:一个静默
+        // run 内 running→done 会翻转多次(后台 subagent 续 turn、silent-stop 自动
+        // 续跑),标记若被第一次中间 done 消费掉,最终那次真 done 就会当成普通完成
+        // 把系统通知发出去。标记的清除只由 scheduler 事件驱动,见
+        // silencedSessionDoneStore 的文件头注释。
+        const isSilencedDone = !hasError && (isSessionDoneSilenced(sessionId)
+          || makerChatStore.wasLastStopQuietCompletion(sessionId));
+        // Scheduler 已按 schedule.notify 接管这次终态的桌面 / 飞书通知。这里只
+        // 抑制 callback。成功绿点改认 schedule 未读,不再从这条 running→done 点
+        // `done` attention;失败红点仍立即挂。debounce 落地还会再读一次标记,
+        // 免得 silenced 落在 500ms 窗口里。
+        const notificationOwnedByScheduler =
+          isSessionTerminalNotificationOwnedByScheduler(sessionId);
+        // error 立刻处理:队列会被 abort,不存在"下一条自动接着跑"的场景;红角标 +
+        // 系统通知(onSessionError,由 renderer 侧 gate focus)都马上触发,不走
+        // debounce。出错永不静默:失败的后台 turn 不能伪装成正常完成或悄无声息消失。
+        // 伙伴群专线的回合由群聊承接:回复进群,失败在群里显示轻提示。这条隐藏
+        // Session 不在任何列表里,挂上的角标用户永远点不掉(docs/product-rules/bot-group-chat.md §3)。
+        if (makerChatStore.wasLastStopGroupLane(sessionId)) continue;
+        if (hasError) {
+          // 即使是当前活跃会话也挂红角标:红点跟随「告警未处理」而非「是否看到」,
+          // 横幅就在眼前时列表同样亮点(2026-07 统一决策)。不能沿用「活跃会话不亮」
+          // 的 done 语义。清除只能来自用户处置横幅或 pending-alerts 派生收敛。
+          addSessionAttention(sessionId, 'error');
+          liveErrorMarkedRef.current.add(sessionId);
+          if (!notificationOwnedByScheduler) onSessionErrorRef.current?.(sessionId);
+          continue;
+        }
+
+        // 静默完成(scheduled automation 等):既不亮角标也不发系统通知,直接跳过、
+        // 不进 debounce 调度。中间 done 与最终 done 都会走到这里。
+        if (isSilencedDone) continue;
+
+        // A recoverable interruption clears the terminal error while waiting to
+        // retry. That idle gap is not completion, even if it lasts beyond debounce.
+        if (makerChatStore.hasSessionRecoveryPending(sessionId)) continue;
+
+        // 这一轮正常结束、错误已不在，上一次失败的红点却还亮着：新一轮启动那一刻可能还读到旧错误
+        // (撞上限后自动换电脑、额度恢复后自动继续时尤其如此)，当时没收掉，之后就再没人收。本 hook
+        // 自己点的直接收；派生账本(错误尾行 / 中断)重算一次，仍有未处置的告警会重新点亮。
+        if (
+          getSessionAttentionKind(sessionId) === 'error' &&
+          !makerChatStore.hasSessionTerminalError(sessionId)
+        ) {
+          if (liveErrorMarkedRef.current.delete(sessionId)) {
+            clearSessionAttention(sessionId, { intent: 'explicit' });
+          }
+          void refreshPendingAlerts();
+        }
+
+        // 正常 done:走 debounce。QUEUE_DEBOUNCE_MS 内若同 session 又变 running
+        // (main 自动衔接下一条队列),上面的 "--- 1. Detect new turn starts ---"
+        // 分支会 clearTimeout 取消这次。窗口过完仍是 not-running,才认为队列真的
+        // 排空 idle,再触发通知 + 亮角标。debounce 用时间维度解耦 main 侧「先清
+        // pendingQueue 再发 running=false projection」的时序,比 hasQueuedNext
+        // 状态判断更 robust。存量 pending 若存在(理论上不会:起新 turn 就清了),覆盖掉。
+        const existing = pendingDoneTimersRef.current.get(sessionId);
+        if (existing !== undefined) clearTimeout(existing);
+        const wasActiveAtCompletion = sessionId === activeSessionId;
+        const timer = setTimeout(() => {
+          pendingDoneTimersRef.current.delete(sessionId);
+          // Recovery may have been projected after this timer was scheduled.
+          if (makerChatStore.hasSessionRecoveryPending(sessionId)) return;
+          // Orca Lead 只是派完活结束本轮:Worker 还欠回报,Main 让灵动岛保持运行中,
+          // 这一轮不算完成。判据只认 Main 的同一份结论;Worker 回报唤起的那一轮
+          // done 才发完成通知、亮完成角标。
+          if (
+            isSessionCompletionHeldByAgentIsland(
+              sessionId,
+              makerChatStore.hasPausedQueue(sessionId),
+            )
+          ) {
+            return;
+          }
+          const runningSnapshot = makerChatStore.getRunningSnapshot();
+          // 落地前重查一次当前状态:若此刻会话正等待用户输入(ask-user / permission /
+          // plan-review),不要用 done 橙角标覆盖 section 3 已亮的 awaiting 黄角标 ——
+          // 否则「需要处理的交互」被降级成「已完成」,用户看不到。非 debounce 版本里
+          // section 3 在 section 2 之后跑、awaiting 天然覆盖 done;debounce 把 done 推迟到
+          // section 3 之后,必须显式让 awaiting 优先。done 系统通知仍照常发(与原行为一致)。
+          const cur = runningSnapshot.get(sessionId);
+          const isActive = sessionId === activeSessionIdRef.current;
+          const isRunning = cur?.isRunning === true;
+          // debounce 期间下一轮可能在真正进入 running 前失败并写入 terminal error。
+          // error 红点由现有告警 owner 投影；这里必须避免旧 run 的延迟 done 把它
+          // 覆盖成橙点，或再发一条过期的完成通知。starting 本身不作为抑制条件：
+          // 侧栏已把它显示为 running，保留旧 done 才能在启动失败时继续提醒用户。
+          const hasTerminalError = makerChatStore.hasSessionTerminalError(sessionId);
+          const stillPending =
+            !!cur &&
+            (cur.hasPendingAskUser ||
+              cur.hasPendingPermission ||
+              cur.hasPendingPlanReview ||
+              cur.hasPendingPluginSetup ||
+              cur.hasPendingInputHandoff === true);
+          // silenced 可能在 debounce 窗口内才到:转换当时没静默、进了 debounce,落地必须再读。
+          if (!hasTerminalError && (isSessionDoneSilenced(sessionId)
+            || makerChatStore.wasLastStopQuietCompletion(sessionId))) return;
+          const ownedNow = isSessionTerminalNotificationOwnedByScheduler(sessionId);
+          if (
+            !wasActiveAtCompletion &&
+            !isActive &&
+            !isRunning &&
+            !hasTerminalError &&
+            !stillPending &&
+            getSessionAttentionKind(sessionId) !== 'error' &&
+            !ownedNow
+          ) {
+            addSessionAttention(sessionId, 'done');
+          }
+          if (!ownedNow && !hasTerminalError && !isRunning) {
+            onSessionDoneRef.current?.(sessionId);
+          }
+        }, QUEUE_DEBOUNCE_MS);
+        pendingDoneTimersRef.current.set(sessionId, timer);
+      }
+    }
+
+    // --- 3. Detect pending ask-user / permission / plan-review / plugin-setup ---
+    const ownerId = getDataOwnerGeneration().dataOwnerId;
+    if (pendingReminderOwnerId !== ownerId) {
+      pendingReminderOwnerId = ownerId;
+      notifiedPendingRequests.clear();
+    }
+    if (prevPendingOwnerRef.current !== ownerId) {
+      prevPendingOwnerRef.current = ownerId;
+      prevPendingRef.current.clear();
+      prevPendingKeysRef.current.clear();
+    }
+    const currentPendingSet = new Set<string>();
+    const currentPendingKeys = new Map<string, Set<string>>();
+    const previouslyPending = new Set([
+      ...prevPendingRef.current,
+      ...notifiedPendingRequests.keys(),
+    ]);
+    for (const [id, info] of statusMap) {
+      if (
+        info.hasPendingAskUser ||
+        info.hasPendingPermission ||
+        info.hasPendingPlanReview ||
+        info.hasPendingPluginSetup ||
+        info.hasActionableInputHandoff === true
+      ) {
+        currentPendingSet.add(id);
+        const isActive = id === activeSessionId;
+        const keys = info.hasActionableInputHandoff
+          ? info.pendingRequestKeys
+          : info.pendingRequestKeys?.filter((key) => !key.startsWith('handoff:'));
+        const newKeys = keys?.filter((key) =>
+          !notifiedPendingRequests.get(id)?.has(key)
+          && !prevPendingKeysRef.current.get(id)?.has(key));
+        const wasAlreadyPending = keys?.length
+          ? newKeys?.length === 0
+          : prevPendingRef.current.has(id);
+        if (keys?.length) currentPendingKeys.set(id, new Set(keys));
+        // A cleared dot stays cleared for the same request across status ticks
+        // and Sidebar remounts, but a new request raises it immediately.
+        if (!isActive && !wasAlreadyPending) {
+          addSessionAttention(id, 'awaiting');
+        }
+        if (!wasAlreadyPending) {
+          // Main owns the fixed-copy phone push. The notification helper checks
+          // existing IM routing before deciding whether Feishu needs a fallback.
+          const handoffOnly = newKeys?.length
+            ? newKeys.every((key) => key.startsWith('handoff:'))
+            : info.hasActionableInputHandoff === true
+              && !info.hasPendingAskUser
+              && !info.hasPendingPermission
+              && !info.hasPendingPlanReview
+              && !info.hasPendingPluginSetup;
+          if (handoffOnly) {
+            const handoffKey = (newKeys ?? keys)?.find((key) => key.startsWith('handoff:'));
+            const requestId = handoffKey?.slice('handoff:'.length, handoffKey.lastIndexOf(':'));
+            onSessionNeedsReplyRef.current?.(id, {
+              inputHandoff: true,
+              ...(requestId ? { inputHandoffRequestId: requestId } : {}),
+            });
+          } else onSessionNeedsReplyRef.current?.(id);
+        }
+        // Other hook consumers only read running status. They may add the
+        // in-app dot, but must not consume the system notification owner's edge.
+        if (keys?.length && onSessionNeedsReplyRef.current) {
+          const seen = notifiedPendingRequests.get(id) ?? new Set<string>();
+          for (const key of keys) seen.add(key);
+          notifiedPendingRequests.set(id, seen);
+        }
+      }
+    }
+
+    // Keep memory bounded to requests still pending. A request resolved while
+    // Sidebar was unmounted is removed on the next snapshot.
+    for (const [id, seen] of notifiedPendingRequests) {
+      const current = currentPendingKeys.get(id);
+      const stillPending = statusMap.get(id)?.pendingRequestKeys;
+      for (const key of seen) {
+        if (!current?.has(key) && !stillPending?.includes(key)) seen.delete(key);
+      }
+      if (seen.size === 0) notifiedPendingRequests.delete(id);
+    }
+
+    // --- 4. Auto-clear notifications when pending state disappears ---
+    // If a session previously had a pending state but no longer does, remove
+    // the matching awaiting notification. Do this even when resolving the card
+    // immediately starts a continuation: otherwise the pending falling edge is
+    // consumed while running, and no later snapshot can clear the stale badge.
+    // Done/error notifications have separate owners and remain sticky.
+    for (const sessionId of previouslyPending) {
+      if (
+        !currentPendingSet.has(sessionId) &&
+        hasSessionAttention(sessionId) &&
+        getSessionAttentionKind(sessionId) === 'awaiting'
+      ) {
+        // 默认 passive 即可：这里只会命中 awaiting，且 clear 通知仍需同步给
+        // Main / 远端，使 Windows 任务栏角标与任务行一起收敛。
+        clearSessionAttention(sessionId);
+      }
+    }
+
+    prevRunningRef.current = new Set(currentRunningSet);
+    prevPendingRef.current = currentPendingSet;
+    prevPendingKeysRef.current = currentPendingKeys;
+  }, [statusMap, activeSessionId]);
+
+  // Unmount cleanup:清掉所有还没 fire 的 done debounce 定时器,避免 hook 卸载后
+  // 定时器仍触发 addSessionAttention / onSessionDone(referring stale refs 后果小,
+  // 但 leak 不干净)。
+  useEffect(() => {
+    const timers = pendingDoneTimersRef.current;
+    return () => {
+      for (const t of timers.values()) clearTimeout(t);
+      timers.clear();
+    };
+  }, []);
+
+  // When the active session changes, clear its notification if any.
+  // 默认 passive:切到会话 ≠ 处置了报错。store 会保住 'error' 红角标,
+  // 只有用户处置横幅或告警本身消失才清。
+  useEffect(() => {
+    if (!activeSessionId) return;
+    clearSessionAttention(activeSessionId);
+    // 完成后的 debounce 窗口内用户已经点进任务,说明这次完成已被消费。
+    // 直接取消待落地的 done,避免用户很快切走后定时器再补橙点并抬升排序。
+    const pendingTimer = pendingDoneTimersRef.current.get(activeSessionId);
+    if (pendingTimer !== undefined) {
+      clearTimeout(pendingTimer);
+      pendingDoneTimersRef.current.delete(activeSessionId);
+    }
+  }, [activeSessionId]);
+
+  const clearNotification = useCallback((sessionId: string) => {
+    // 默认 passive:点击会话卡片只导航,'error' 红角标由 store 保住。
+    clearSessionAttention(sessionId);
+  }, []);
+
+  // Derive running set for the return value (outside effect, for rendering).
+  // 必须 memo:裸调用每渲染都 new Set,会顺着 effectiveRunningSessionIds →
+  // handleActionClick / handleMoveSession 一路换引用,把 SessionItem 的 memo
+  // 全表打穿(见 sidebar/SessionItem.tsx 的性能不变量第 3 条)。statusMap 来自
+  // useSyncExternalStore,只在真实状态变化时换引用,故这里的缓存是安全的。
+  const runningSessionIds = useMemo(() => deriveRunningSet(statusMap), [statusMap]);
+
+  return {
+    /** Set of session IDs currently running. */
+    runningSessionIds,
+    /** Set of session IDs needing attention (done / pending ask / pending permission). */
+    notifications,
+    /** Clear notification for a session (called on click). */
+    clearNotification,
+  } as const;
+}
+
+/** Extract the set of currently-running session IDs from the status map. */
+function deriveRunningSet(statusMap: ReadonlyMap<string, SessionStatusInfo>): ReadonlySet<string> {
+  const set = new Set<string>();
+  for (const [id, info] of statusMap) {
+    if (info.isRunning) set.add(id);
+  }
+  return set;
+}

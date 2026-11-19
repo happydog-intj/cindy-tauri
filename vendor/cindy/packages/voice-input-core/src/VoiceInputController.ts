@@ -1,0 +1,1014 @@
+import type {
+  AsrEvent,
+  AsrProvider,
+  AudioTrace,
+  EditableRange,
+  RefinementResult,
+  SpeechSegment,
+  VoiceInputCallbacks,
+  VoiceInputErrorCode,
+  VoiceInputDraftReason,
+  VoiceInputDraftSource,
+  VoiceInputState,
+  VoiceInputTerminalOutcome,
+} from './types';
+import { VoiceTimelineLogger } from './VoiceTimelineLogger';
+import type { AudioGate } from './SpeakerGate';
+import { hasAdditionalSentence } from './pauseRefinement';
+
+type DictationRefiner = {
+  refine(input: {
+    text: string;
+    runId: string;
+    segmentIds: string[];
+    onPartial?: (text: string) => void;
+  }): Promise<RefinementResult>;
+};
+
+type PendingRefinement = {
+  text: string;
+  segmentIds: string[];
+  startedAt: number;
+  latestPreview?: string;
+  onPreview?: (text: string) => void;
+  promise: Promise<{ result?: RefinementResult; error?: unknown }>;
+  settled?: boolean;
+  result?: RefinementResult;
+};
+
+type VoiceInputControllerOptions = {
+  asr: AsrProvider;
+  refiner?: DictationRefiner;
+  logger: VoiceTimelineLogger;
+  callbacks: VoiceInputCallbacks;
+  stableWaitMs?: number;
+  /** Host opt-in: refine during a speech pause and publish a live draft. */
+  pauseRefinementEnabled?: boolean;
+  /** Replay retained audio once after an audible recording ends without text. */
+  retryEmptyTranscript?: boolean;
+  /** Host opt-in for known recovery failures; undefined keeps the generic error. */
+  recoveryErrorMessage?: (error: unknown) => string | undefined;
+  /**
+   * Optional filter in front of the ASR (e.g. the speaker gate). Activity and
+   * stall accounting see the filtered audio, so a run where only bystanders
+   * spoke ends as "no speech" instead of an empty-transcript failure.
+   */
+  audioGate?: AudioGate;
+};
+
+type CryptoWithUuid = {
+  randomUUID?: () => string;
+};
+
+// ASR stall watchdog thresholds. This is diagnostic only: OpenAI realtime can
+// legitimately pause partial deltas for 10+ seconds after a long pause, then
+// still return a complete transcript on stop. Treating that partial gap as a
+// recover trigger caused us to close a healthy session mid-dictation and lose
+// words around the reconnect boundary.
+//
+// The audio-side gate counts ONLY voiced chunks (RMS above threshold), not
+// raw audio duration. Counting raw duration meant a silent thinking pause
+// looked identical to a real stall: any 6+ seconds of mic-open silence
+// triggered false alarms. Voiced gating makes the warning meaningful while
+// keeping it non-destructive; network recovery is only driven by explicit
+// transport error/disconnected events.
+const ASR_STALL_WARN_AFTER_WALL_MS = 4_000;
+const ASR_STALL_WARN_AFTER_VOICED_MS = 2_000;
+const ASR_STALL_CHECK_INTERVAL_MS = 1_000;
+// Retry a few explicit transport failures (not partial gaps) so transient
+// gateway/WebSocket interruptions do not abort an otherwise healthy dictation.
+// Providers still own replay/merge safety; after the cap, surface the failure.
+const ASR_NETWORK_RECOVERY_MAX_ATTEMPTS = 3;
+// PCM16 RMS above this counts as "the user is talking right now". 300 is
+// well above quiet-room background (~30) and typing/AC noise (~50-150)
+// while being below normal speech (~800+) by enough margin to catch soft
+// speakers. Hardcoded for now; a per-mic adaptive baseline would be the
+// next refinement if false positives ever bite.
+const ASR_VOICED_RMS_THRESHOLD = 300;
+const EMPTY_TRANSCRIPT_ERROR = 'Voice input detected speech but returned no transcript. Please try again.';
+
+/**
+ * VoiceInputController owns click-to-dictate state.
+ *
+ * It deliberately treats ASR partials as the fast draft lane, Stop as the
+ * commit boundary, and refinement as an optional downstream lane. Audio capture
+ * stays outside this class so Electron renderer can own getUserMedia while
+ * Electron main owns provider sessions and keys.
+ */
+export class VoiceInputController {
+  private readonly asr: AsrProvider;
+  private readonly refiner?: DictationRefiner;
+  private readonly logger: VoiceTimelineLogger;
+  private readonly callbacks: VoiceInputCallbacks;
+  private readonly stableWaitMs: number;
+  private readonly pauseRefinementEnabled: boolean;
+  private readonly retryEmptyTranscript: boolean;
+  private readonly recoveryErrorMessage?: (error: unknown) => string | undefined;
+  private readonly audioGate?: AudioGate;
+  private lastSoundAt = 0;
+  private lastTranscriptChangeAt = 0;
+  private pauseRefinement?: PendingRefinement;
+  private liveRefinementPreview?: { basedOnText: string; text: string };
+  private state: VoiceInputState = 'idle';
+  private runId = '';
+  private startedAt = 0;
+  private latestPartial = '';
+  private latestStable = '';
+  // The most recent transcript regardless of lane, plus which lane produced it.
+  // Salvage cannot prefer `latestStable`: every provider emits both lanes as the
+  // full aggregate transcript, so a partial arriving after a stable (the next
+  // utterance already in progress) is strictly more complete. Preferring the
+  // stable lane would drop that tail — exactly the loss this salvage exists to
+  // prevent. Stop waits for a new stable after a newer partial; an older stable
+  // must never replace the tail while reusing a pause-time refinement.
+  private latestTranscript = '';
+  private latestTranscriptSource: 'partial' | 'stable' = 'partial';
+  private firstPartialSeen = false;
+  private firstAudioChunkSeen = false;
+  // Run-level speech activity separates an intentional silent stop from an
+  // ASR/provider failure that returned no transcript. This is deliberately
+  // independent from the stall watchdog's rolling window counters.
+  private speechActivitySeen = false;
+  private pendingStableResolvers: Array<(text: string | undefined) => void> = [];
+  // Set by cancel(); read by the in-flight refine() to short-circuit before
+  // emitting more timeline events, calling applyRefinement, or clobbering the
+  // 'done' state that cancel() already set. Cleared on each new start().
+  private currentRunCancelled = false;
+  // Stall watchdog state. lastAsrSignalAt is performance.now() of the most
+  // recent partial/stable; voicedAudioMsSinceLastSignal accumulates only
+  // trace.durationMs of chunks whose RMS clears the voiced threshold (so
+  // silent thinking pauses don't tick toward the warning). audioMsSinceLastSignal
+  // is kept as a diagnostic — useful in stall_warning logs to compare voiced
+  // vs total audio when judging whether thresholds are tuned right.
+  // stallWarned guards against repeated warn-level timeline events for the
+  // same stall window — reset on every fresh ASR signal.
+  private lastAsrSignalAt = 0;
+  private audioMsSinceLastSignal = 0;
+  private voicedAudioMsSinceLastSignal = 0;
+  private stallWarned = false;
+  private stallCheckTimer?: ReturnType<typeof setInterval>;
+  private networkRecoveryInFlight = false;
+  private networkRecoveryAttempts = 0;
+  // Whether this run ever received a partial/stable. Used in the stall warning
+  // event so the next reproduction immediately tells us "session never produced
+  // anything" vs "stopped after producing some text".
+  private everSawAsrSignal = false;
+  // Whether this run already handed text to the host via onSubmitted. Guards the
+  // failure-path salvage against double insertion: a recovery that rejects after
+  // stop() already submitted would otherwise insert the same transcript twice.
+  private transcriptEmitted = false;
+  // Set when onSubmitted threw. A callback that throws part-way has already run
+  // an unknown share of its side effects (mobile publishes the draft, then calls
+  // an injected history recorder that can throw), so retrying it through salvage
+  // would run those effects a second time. One attempt per run is the contract.
+  private submitCallbackThrew = false;
+
+  constructor(options: VoiceInputControllerOptions) {
+    this.asr = options.asr;
+    this.refiner = options.refiner;
+    this.logger = options.logger;
+    this.callbacks = options.callbacks;
+    this.stableWaitMs = options.stableWaitMs ?? 500;
+    this.pauseRefinementEnabled = options.pauseRefinementEnabled ?? false;
+    this.retryEmptyTranscript = options.retryEmptyTranscript ?? false;
+    this.recoveryErrorMessage = options.recoveryErrorMessage;
+    this.audioGate = options.audioGate;
+
+    this.asr.onEvent((event) => this.handleAsrEvent(event));
+  }
+
+  get id(): string {
+    return this.runId;
+  }
+
+  get currentState(): VoiceInputState {
+    return this.state;
+  }
+
+  async start(): Promise<string> {
+    if (this.state !== 'idle' && this.state !== 'done' && this.state !== 'error') return this.runId;
+
+    this.runId = createVoiceInputId();
+    this.startedAt = performance.now();
+    this.latestPartial = '';
+    this.latestStable = '';
+    this.latestTranscript = '';
+    this.latestTranscriptSource = 'partial';
+    this.firstPartialSeen = false;
+    this.firstAudioChunkSeen = false;
+    this.speechActivitySeen = false;
+    this.currentRunCancelled = false;
+    this.lastAsrSignalAt = performance.now();
+    this.audioMsSinceLastSignal = 0;
+    this.voicedAudioMsSinceLastSignal = 0;
+    this.stallWarned = false;
+    this.networkRecoveryAttempts = 0;
+    this.networkRecoveryInFlight = false;
+    this.everSawAsrSignal = false;
+    this.transcriptEmitted = false;
+    this.submitCallbackThrew = false;
+    this.lastSoundAt = performance.now();
+    this.lastTranscriptChangeAt = performance.now();
+    this.pauseRefinement = undefined;
+    this.liveRefinementPreview = undefined;
+    const gateRunId = this.runId;
+    this.audioGate?.begin((chunk, trace) => this.forwardAudio(gateRunId, chunk, trace));
+    this.startStallWatchdog();
+    this.setState('listening');
+    this.logger.record({ type: 'start_clicked', runId: this.runId, at: Date.now() });
+
+    try {
+      await this.asr.start();
+      return this.runId;
+    } catch (error) {
+      this.fail(error instanceof Error ? error.message : String(error));
+      throw error;
+    }
+  }
+
+  appendAudio(chunk: ArrayBuffer, trace?: AudioTrace): void {
+    if (this.state !== 'listening') return;
+    if (this.audioGate) {
+      this.audioGate.push(chunk, trace);
+      return;
+    }
+    this.forwardAudio(this.runId, chunk, trace);
+  }
+
+  /**
+   * Hands audio that passed the optional gate to the ASR. The gate releases
+   * held audio while stop() flushes it, so 'submitting' is still accepted.
+   */
+  private forwardAudio(runId: string, chunk: ArrayBuffer, trace?: AudioTrace): void {
+    if (runId !== this.runId) return;
+    if (this.state !== 'listening' && this.state !== 'submitting') return;
+    if (!this.firstAudioChunkSeen) {
+      this.firstAudioChunkSeen = true;
+      this.logger.record({
+        type: 'first_audio_chunk',
+        runId: this.runId,
+        at: Date.now(),
+        elapsedMs: performance.now() - this.startedAt,
+      });
+    }
+    const voiced = isChunkVoiced(chunk);
+    if (voiced) {
+      this.lastSoundAt = performance.now();
+      this.speechActivitySeen = true;
+    }
+    if (typeof trace?.durationMs === 'number') {
+      this.audioMsSinceLastSignal += trace.durationMs;
+      if (voiced) {
+        this.voicedAudioMsSinceLastSignal += trace.durationMs;
+      }
+    }
+    this.asr.appendAudio(chunk, trace);
+  }
+
+  async stop(): Promise<void> {
+    if (this.state !== 'listening') return;
+    const runId = this.runId;
+    this.stopStallWatchdog();
+    this.setState('submitting');
+    this.logger.record({ type: 'stop_clicked', runId, at: Date.now() });
+    // Release audio still held by the gate before the provider flushes. The
+    // gate fails open and bounds its own time, so this never rejects or hangs.
+    // Without a gate, stop() must not gain an extra await: the optimistic
+    // refinement below relies on starting in the same tick.
+    if (this.audioGate) await this.audioGate.finish().catch(() => undefined);
+    if (runId !== this.runId || this.leftSubmittingState()) return;
+    const optimisticRefinement = this.startOptimisticRefinement(runId);
+    const interrupted = (): boolean => {
+      if (runId !== this.runId) return true;
+      if (!this.currentRunCancelled) return false;
+      this.discardRefinement(runId, optimisticRefinement, 'cancelled');
+      return true;
+    };
+
+    let stable: string | undefined;
+    try {
+      await this.asr.flushAudio();
+      if (interrupted()) return;
+      if (!this.leftSubmittingState()) stable = await this.waitForStable(this.stableWaitMs);
+      if (interrupted()) return;
+      if (!this.leftSubmittingState() && !normalizeSubmittedText(stable || this.latestTranscript)
+        && this.speechActivitySeen && this.retryEmptyTranscript && this.asr.recover
+        && !this.networkRecoveryInFlight) {
+        stable = await this.retryEmptyRecording(runId);
+      }
+    } catch (error) {
+      if (interrupted()) return;
+      this.fail(this.recoveryErrorMessage?.(error) ?? (error instanceof Error ? error.message : String(error)));
+      await this.asr.stop();
+      return;
+    }
+
+    if (interrupted()) return;
+    const text = normalizeSubmittedText(stable || this.latestTranscript);
+    const source = stable ? 'stable' : this.latestTranscriptSource;
+
+    await this.asr.stop();
+
+    // Deliberately placed after the LAST provider await in this method, so it
+    // covers a failure landing during any of them. Providers hide such failures
+    // from this path: both flushAudio() and stop() await an in-flight recover()
+    // but swallow its rejection, so those awaits resolve normally on a run that
+    // fail() has already finished (salvaging the transcript and setting the
+    // terminal state). Continuing would submit the same transcript twice and
+    // overwrite 'error' with 'refining'/'done', hiding the failure entirely.
+    // transcriptEmitted is checked too: it is the direct invariant ("this run has
+    // already given the host its text"), so it holds even if a future failure
+    // path leaves the state alone.
+    if (runId !== this.runId) return;
+    if (this.leftSubmittingState() || this.transcriptEmitted) {
+      // cancel() also lands here (it moves the run to 'done'); logging that as
+      // a failure would misread the timeline for an intentional abort.
+      this.discardRefinement(runId, optimisticRefinement, this.currentRunCancelled ? 'cancelled' : 'run_failed');
+      return;
+    }
+
+    if (!text) {
+      this.discardRefinement(runId, optimisticRefinement, 'no_submitted_text');
+      if (this.speechActivitySeen) {
+        this.fail(EMPTY_TRANSCRIPT_ERROR, 'empty_transcript');
+      } else {
+        this.setState('done', 'no_speech');
+      }
+      return;
+    }
+
+    const readyResult = this.pauseRefinementEnabled && optimisticRefinement?.text === text
+      ? optimisticRefinement.result : undefined;
+    const readyText = readyResult?.accepted && readyResult.refinedText
+      && normalizeSubmittedText(readyResult.basedOnText) === text
+      ? readyResult.refinedText : undefined;
+    const segment: SpeechSegment = {
+      id: optimisticRefinement?.text === text ? optimisticRefinement.segmentIds[0] : createVoiceInputId(),
+      source: 'mic',
+      status: 'submitted',
+      text: readyText ?? text,
+      ...(readyText ? { basedOnText: text } : {}),
+      updatedAt: Date.now(),
+    };
+    let range: EditableRange | undefined;
+    try {
+      range = this.callbacks.onSubmitted(readyText ?? text, segment);
+    } catch (error) {
+      // salvageTranscript() already treats a throwing host as a real scenario
+      // (destroyed window, torn-down editor); this path has to survive it too.
+      // Letting the exception escape would reject stop() before any terminal
+      // state is set, stranding the run in 'submitting' — after which start()
+      // refuses to begin a new one and dictation is dead until reload.
+      this.submitCallbackThrew = true;
+      this.discardRefinement(runId, optimisticRefinement, 'run_failed');
+      this.fail(error instanceof Error ? error.message : String(error));
+      return;
+    }
+    // Same acceptance convention as salvageTranscript(): the returned range is
+    // the host's "I took the text" signal, and a host may refuse (mobile stops
+    // writing into the voice insertion once the user has edited it). Marking it
+    // emitted regardless would let a later failure claim transcriptKept for
+    // text that never landed.
+    this.transcriptEmitted = Boolean(range);
+    this.logger.record({ type: 'submitted', runId, at: Date.now(), text, source });
+
+    if (this.refiner && range) {
+      let refinement: PendingRefinement;
+      if (optimisticRefinement?.text === text) {
+        refinement = optimisticRefinement;
+      } else {
+        this.discardRefinement(runId, optimisticRefinement, 'final_text_changed');
+        refinement = this.startRefinementRequest(runId, text, [segment.id]);
+      }
+      this.setState('refining');
+      void this.finishRefinement(runId, segment, range, refinement);
+    } else {
+      this.discardRefinement(runId, optimisticRefinement, 'no_editable_range');
+      this.setState('done');
+    }
+  }
+
+  private async retryEmptyRecording(runId: string): Promise<string | undefined> {
+    const startedAt = performance.now();
+    this.logger.record({
+      type: 'asr_recovery_attempted', runId, at: Date.now(), trigger: 'empty_transcript', attempt: 1,
+      audioMsSinceLastSignal: this.audioMsSinceLastSignal,
+      voicedAudioMsSinceLastSignal: this.voicedAudioMsSinceLastSignal,
+      wallMsSinceLastSignal: startedAt - this.lastAsrSignalAt,
+      everSawSignal: this.everSawAsrSignal,
+    });
+    try {
+      // recover() owns replay of unconfirmed in-memory audio. stop() would
+      // clear that audio, so only tear the provider down after this one attempt.
+      await this.asr.recover!();
+      if (runId !== this.runId || this.leftSubmittingState()) return;
+      await this.asr.flushAudio();
+      if (runId !== this.runId || this.leftSubmittingState()) return;
+      const stable = await this.waitForStable(this.stableWaitMs);
+      if (runId !== this.runId || this.leftSubmittingState()) return;
+      const elapsedMs = performance.now() - startedAt;
+      if (normalizeSubmittedText(stable || this.latestTranscript)) {
+        this.logger.record({ type: 'asr_recovery_succeeded', runId, at: Date.now(), elapsedMs });
+      } else {
+        this.logger.record({ type: 'asr_recovery_failed', runId, at: Date.now(), elapsedMs, reason: 'empty_transcript' });
+      }
+      return stable;
+    } catch (error) {
+      if (runId !== this.runId || this.leftSubmittingState()) return;
+      this.logger.record({
+        type: 'asr_recovery_failed', runId, at: Date.now(), elapsedMs: performance.now() - startedAt,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * True when something moved this run out of the state stop() set on entry —
+   * fail() from a rejected recovery, or cancel(). Deliberately a method: inside
+   * stop(), the `state !== 'listening'` guard narrows this.state for the whole
+   * body, so an inline comparison against 'submitting' is a type error.
+   */
+  private leftSubmittingState(): boolean {
+    return this.state !== 'submitting';
+  }
+
+  async cancel(): Promise<void> {
+    if (!this.runId) return;
+    const runId = this.runId;
+    this.currentRunCancelled = true;
+    this.audioGate?.abort();
+    this.stopStallWatchdog();
+    this.pendingStableResolvers.splice(0).forEach((resolve) => resolve(undefined));
+    this.logger.record({ type: 'cancelled', runId, at: Date.now() });
+    // Enter the terminal state before closing the provider. Several realtime
+    // transports emit a final `disconnected` while their socket is intentionally
+    // closed; if we remain in `listening`, that normal teardown is indistinguishable
+    // from a network drop and surfaces a false "connection interrupted" error.
+    this.setState('done', 'cancelled');
+    await this.asr.stop();
+  }
+
+  private handleAsrEvent(event: AsrEvent): void {
+    if (!this.runId) return;
+
+    switch (event.type) {
+      case 'connected':
+        this.logger.record({
+          type: 'asr_connected',
+          runId: this.runId,
+          at: Date.now(),
+          elapsedMs: performance.now() - this.startedAt,
+        });
+        break;
+      case 'partial':
+        if (this.state !== 'listening' && this.state !== 'submitting') return;
+        if (event.text !== this.latestTranscript) this.lastTranscriptChangeAt = performance.now();
+        this.latestPartial = event.text;
+        this.latestTranscript = event.text;
+        this.latestTranscriptSource = 'partial';
+        this.resetStallCounters();
+        if (this.state !== 'listening') return;
+        if (!this.firstPartialSeen) {
+          this.firstPartialSeen = true;
+          this.logger.record({
+            type: 'first_partial',
+            runId: this.runId,
+            at: Date.now(),
+            elapsedMs: performance.now() - this.startedAt,
+            text: event.text,
+          });
+        }
+        this.publishDraft(event.text, 'partial');
+        break;
+      case 'stable':
+        if (this.state !== 'listening' && this.state !== 'submitting') return;
+        if (event.text !== this.latestTranscript) this.lastTranscriptChangeAt = performance.now();
+        this.latestStable = event.text;
+        this.latestTranscript = event.text;
+        this.latestTranscriptSource = 'stable';
+        this.resetStallCounters();
+        this.logger.record({
+          type: 'stable_received',
+          runId: this.runId,
+          at: Date.now(),
+          text: event.text,
+        });
+        if (this.state === 'listening') {
+          this.publishDraft(event.text, 'stable');
+        }
+        this.pendingStableResolvers.splice(0).forEach((resolve) => resolve(event.text));
+        break;
+      case 'error':
+        if (this.currentRunCancelled) break;
+        if (this.state === 'submitting' || this.state === 'refining') {
+          const text = normalizeSubmittedText(this.latestStable || this.latestPartial);
+          if (text) {
+            this.logger.record({
+              type: 'asr_stop_error_ignored',
+              runId: this.runId,
+              at: Date.now(),
+              message: event.message,
+              textChars: text.length,
+            });
+            break;
+          }
+        }
+        // Try recover before failing: keepalive timeouts and transient
+        // network errors arrive here as `error`. Partial stalls are only
+        // diagnostic; this self-heal path is reserved for transport failures.
+        if (this.state === 'listening' && this.tryRecover('error')) break;
+        this.fail(event.message);
+        break;
+      case 'disconnected':
+        if (this.currentRunCancelled) break;
+        // Same as 'error' above. Without this hook, a keepalive-driven
+        // socket terminate would emit `disconnected` and bypass recover
+        // entirely, producing the exact failure mode the resilience pass
+        // was supposed to prevent.
+        if (this.state === 'listening' && this.tryRecover('disconnected')) break;
+        if (this.state === 'listening') {
+          this.fail(
+            'Voice input connection was interrupted. Please try again.',
+            'connection_interrupted',
+          );
+        }
+        break;
+    }
+  }
+
+  // Returns true if recover was kicked off (caller should NOT call fail()).
+  // Returns false if recover is unavailable or already in flight from a
+  // concurrent trigger; in the in-flight case the existing recovery will
+  // either succeed and continue, or fail in its own catch handler.
+  private tryRecover(trigger: 'error' | 'disconnected'): boolean {
+    if (typeof this.asr.recover !== 'function') return false;
+    if (this.networkRecoveryInFlight) return true;
+    if (this.networkRecoveryAttempts >= ASR_NETWORK_RECOVERY_MAX_ATTEMPTS) return false;
+    this.attemptNetworkRecovery(
+      trigger,
+      this.audioMsSinceLastSignal,
+      this.voicedAudioMsSinceLastSignal,
+      performance.now() - this.lastAsrSignalAt,
+    );
+    return true;
+  }
+
+  private publishDraft(text: string, source: VoiceInputDraftSource): void {
+    let normalized = text.trim();
+    if (!normalized) return;
+    const preview = this.liveRefinementPreview;
+    const rawText = normalizeSubmittedText(text);
+    if (preview && rawText.startsWith(preview.basedOnText)) {
+      normalized = preview.text + rawText.slice(preview.basedOnText.length);
+      source = 'refinement';
+    }
+    const reason: VoiceInputDraftReason = source === 'refinement'
+      ? 'refinement_preview'
+      : source === 'stable' ? 'asr_stable' : 'asr_partial';
+    const segment: SpeechSegment = {
+      id: `draft-${this.runId}`,
+      source: 'mic',
+      status: 'draft',
+      text: normalized,
+      ...(source === 'refinement' ? { basedOnText: rawText } : {}),
+      updatedAt: Date.now(),
+    };
+    this.callbacks.onDraftChanged(normalized, segment, source);
+    this.logger.record({
+      type: 'draft_changed',
+      runId: this.runId,
+      at: Date.now(),
+      text: normalized,
+      reason,
+      source,
+    });
+  }
+
+  private waitForStable(timeoutMs: number): Promise<string | undefined> {
+    if (this.latestTranscriptSource === 'stable' && this.latestTranscript) {
+      return Promise.resolve(this.latestTranscript);
+    }
+    return new Promise((resolve) => {
+      const resolver = (text: string | undefined): void => {
+        clearTimeout(timer);
+        this.pendingStableResolvers = this.pendingStableResolvers.filter((item) => item !== resolver);
+        resolve(text);
+      };
+      const timer = setTimeout(() => {
+        this.pendingStableResolvers = this.pendingStableResolvers.filter((item) => item !== resolver);
+        resolve(undefined);
+      }, timeoutMs);
+      this.pendingStableResolvers.push(resolver);
+    });
+  }
+
+  private startOptimisticRefinement(runId: string): PendingRefinement | undefined {
+    if (!this.refiner) return undefined;
+    const text = normalizeSubmittedText(this.latestTranscript);
+    if (!text) return undefined;
+    if (this.pauseRefinement?.text === text) return this.pauseRefinement;
+    // A pause request already became stale, or the visible tail is still
+    // provisional. Wait for final ASR text instead of speculating again.
+    if (this.pauseRefinementEnabled && (this.pauseRefinement || this.latestTranscriptSource !== 'stable')) return undefined;
+    // Stop-time ASR finalization can take close to a second. Start refinement
+    // against the visible draft immediately, but only apply it if the final
+    // ASR text matches. If the provider corrects or extends the text, we
+    // discard this request and refine the final transcript instead.
+    return this.startRefinementRequest(runId, text, [createVoiceInputId()]);
+  }
+
+  private maybeRefineDuringPause(): void {
+    if (!this.pauseRefinementEnabled || !this.refiner || this.state !== 'listening') return;
+    const now = performance.now();
+    if (now - this.lastSoundAt < 2_000 || now - this.lastTranscriptChangeAt < 2_000) return;
+    if (this.pauseRefinement && !this.pauseRefinement.settled) return;
+    const text = normalizeSubmittedText(this.latestTranscript);
+    if (!hasAdditionalSentence(this.pauseRefinement?.text ?? '', text)) return;
+    const runId = this.runId;
+    const request = this.startRefinementRequest(runId, text, [createVoiceInputId()]);
+    this.pauseRefinement = request;
+    void request.promise.then(({ result }) => {
+      if (runId !== this.runId || this.state !== 'listening' || this.currentRunCancelled) return;
+      if (this.pauseRefinement !== request || !result?.accepted || !result.refinedText) return;
+      if (normalizeSubmittedText(result.basedOnText) !== request.text) return;
+      // A newer ASR revision may correct the beginning. Never overlay a result
+      // on a different source; if only a suffix grew, keep that new suffix.
+      if (!normalizeSubmittedText(this.latestTranscript).startsWith(request.text)) return;
+      this.liveRefinementPreview = { basedOnText: request.text, text: result.refinedText };
+      this.publishDraft(this.latestTranscript, this.latestTranscriptSource);
+    });
+  }
+
+  private startRefinementRequest(runId: string, text: string, segmentIds: string[]): PendingRefinement {
+    if (!this.refiner) throw new Error('Dictation refiner is not configured.');
+    const refineStartedAt = performance.now();
+    this.logger.record({ type: 'refine_requested', runId, at: Date.now(), text });
+
+    const request: PendingRefinement = {
+      text,
+      segmentIds,
+      startedAt: refineStartedAt,
+      promise: Promise.resolve({}),
+    };
+    request.promise = this.refiner.refine({
+      text,
+      runId,
+      segmentIds,
+      onPartial: (partial) => {
+        request.latestPreview = partial;
+        request.onPreview?.(partial);
+      },
+    }).then(
+      (result) => { request.settled = true; request.result = result; return { result }; },
+      (error: unknown) => { request.settled = true; return { error }; },
+    );
+    return request;
+  }
+
+  private async finishRefinement(
+    runId: string,
+    segment: SpeechSegment,
+    range: EditableRange,
+    request: PendingRefinement,
+  ): Promise<void> {
+    // A completed result may already have been submitted atomically. Replaying
+    // its earlier streaming preview would briefly replace it with older text.
+    if (!request.settled) this.attachRefinementPreview(runId, segment, range, request);
+    const { result, error } = await request.promise;
+    if (runId !== this.runId) {
+      this.discardRefinement(runId, request, 'stale_run');
+      return;
+    }
+    if (this.currentRunCancelled) {
+      this.discardRefinement(runId, request, 'cancelled');
+      return;
+    }
+    // A failure can land while refinement is in flight (a recovery rejecting
+    // after stop() already submitted). Every exit below writes a terminal state,
+    // so continuing would overwrite 'error' with 'done' and erase the failure
+    // the user was just told about — along with applying refined text to a run
+    // whose host already reported it as failed.
+    if (this.state === 'error') {
+      this.discardRefinement(runId, request, 'run_failed');
+      return;
+    }
+
+    if (error) {
+      this.logger.record({
+        type: 'refine_rejected',
+        runId,
+        at: Date.now(),
+        reason: error instanceof Error ? error.message : String(error),
+        elapsedMs: performance.now() - request.startedAt,
+      });
+      this.setState('done');
+      return;
+    }
+
+    if (!result?.accepted || !result.refinedText) {
+      this.logger.record({
+        type: 'refine_rejected',
+        runId,
+        at: Date.now(),
+        reason: result?.rejectionReason ?? 'unknown',
+        elapsedMs: result?.elapsedMs,
+        basedOnText: result?.basedOnText,
+        refinedText: result?.refinedText,
+      });
+      this.setState('done');
+      return;
+    }
+
+    this.logger.record({
+      type: 'refine_accepted',
+      runId,
+      at: Date.now(),
+      basedOnText: result.basedOnText,
+      refinedText: result.refinedText,
+      elapsedMs: result.elapsedMs,
+    });
+
+    if (this.callbacks.isRangeUserTouched?.(range) ?? range.userTouched) {
+      this.logger.record({ type: 'refine_skipped_user_touched', runId, at: Date.now(), rangeId: range.id });
+      this.setState('done');
+      return;
+    }
+
+    const applied = this.callbacks.applyRefinement?.(range, result.refinedText) ?? false;
+    if (applied) {
+      this.logger.record({
+        type: 'refine_applied',
+        runId,
+        at: Date.now(),
+        rangeId: range.id,
+        refinedText: result.refinedText,
+      });
+    }
+    this.setState('done');
+  }
+
+  private attachRefinementPreview(
+    runId: string,
+    segment: SpeechSegment,
+    range: EditableRange,
+    request: PendingRefinement,
+  ): void {
+    const emitPreview = (text: string): void => {
+      const normalized = text.replace(/\r\n?/g, '\n').trim();
+      if (!normalized || normalized === request.text) return;
+      // Same reason as finishRefinement's check: once the run has failed, its
+      // host is showing an error — streaming refinement previews into it would
+      // rewrite text the user was just told the session stopped producing.
+      if (runId !== this.runId || this.currentRunCancelled || this.state === 'error') return;
+      if (this.callbacks.isRangeUserTouched?.(range) ?? range.userTouched) return;
+      this.callbacks.onRefinementPreview?.(normalized, {
+        ...segment,
+        status: 'draft',
+        basedOnText: request.text,
+        text: normalized,
+        updatedAt: Date.now(),
+      }, range);
+    };
+    request.onPreview = emitPreview;
+    if (request.latestPreview) emitPreview(request.latestPreview);
+  }
+
+  private discardRefinement(
+    runId: string,
+    request: PendingRefinement | undefined,
+    reason: 'final_text_changed' | 'stale_run' | 'cancelled' | 'no_submitted_text' | 'no_editable_range' | 'run_failed',
+  ): void {
+    if (!request) return;
+    this.logger.record({
+      type: 'refine_discarded',
+      runId,
+      at: Date.now(),
+      reason,
+      basedOnText: request.text,
+    });
+  }
+
+  private setState(state: VoiceInputState, outcome?: VoiceInputTerminalOutcome): void {
+    this.state = state;
+    const terminalOutcome = outcome
+      ?? (state === 'error' ? 'failed' : state === 'done' ? 'success' : undefined);
+    this.callbacks.onStateChanged?.(state, terminalOutcome);
+  }
+
+  private fail(message: string, code?: VoiceInputErrorCode): void {
+    // Idempotent: a recover() race can plausibly produce two fail() calls in
+    // the same tick (one from a stale 'disconnected' event, one from
+    // recovery_failed). Without this guard the renderer toasts both, which
+    // shows the user a confusing second error after they already saw the first.
+    if (this.state === 'error' || this.state === 'done') return;
+    this.audioGate?.abort();
+    if (this.runId) {
+      this.logger.record({ type: 'error', runId: this.runId, at: Date.now(), message, code });
+    }
+    this.stopStallWatchdog();
+    this.pendingStableResolvers.splice(0).forEach((resolve) => resolve(undefined));
+    // Salvage before the terminal state: hosts tear the draft down when they see
+    // 'error', so the submitted text has to reach them first.
+    this.salvageTranscript();
+    this.setState('error', 'failed');
+    // Retention travels as a detail, never as the code: `message` may be the
+    // only thing telling the user their credential expired or their quota ran
+    // out. transcriptEmitted covers both salvage and a stop() that submitted
+    // before the failure landed (a recovery rejecting during refinement).
+    this.callbacks.onError?.(message, code, { transcriptKept: this.transcriptEmitted });
+  }
+
+  /**
+   * Hand already-recognized text to the host before entering the error state.
+   *
+   * A socket that dies mid-dictation used to discard everything the user had
+   * said so far: partials only ever existed as a host-side draft, and fail()
+   * never offered them to onSubmitted. The transcript is worth more than the
+   * dead session, so commit it raw — refinement needs the same network that
+   * just failed — and let the host report the failure with transcriptKept set.
+   *
+   * The host's returned range is the acceptance signal. A host can legitimately
+   * refuse: mobile stops writing into the voice insertion once the user has
+   * edited it, so the text never lands. Claiming retention there would tell the
+   * user their words were kept when the tail was actually dropped.
+   */
+  private salvageTranscript(): boolean {
+    if (this.transcriptEmitted || this.submitCallbackThrew) return false;
+    const text = normalizeSubmittedText(this.latestTranscript);
+    if (!text) return false;
+    const segment: SpeechSegment = {
+      id: createVoiceInputId(),
+      source: 'mic',
+      status: 'submitted',
+      text,
+      updatedAt: Date.now(),
+    };
+    let accepted = false;
+    try {
+      accepted = Boolean(this.callbacks.onSubmitted(text, segment));
+    } catch {
+      // A host that cannot take the text (destroyed window, torn-down editor)
+      // must not also swallow the error report the user is waiting for.
+      accepted = false;
+    }
+    this.logger.record({
+      type: 'transcript_salvaged',
+      runId: this.runId,
+      at: Date.now(),
+      text,
+      source: this.latestTranscriptSource,
+      accepted,
+    });
+    if (!accepted) return false;
+    this.transcriptEmitted = true;
+    return true;
+  }
+
+  private resetStallCounters(): void {
+    this.lastAsrSignalAt = performance.now();
+    this.audioMsSinceLastSignal = 0;
+    this.voicedAudioMsSinceLastSignal = 0;
+    this.stallWarned = false;
+    this.everSawAsrSignal = true;
+  }
+
+  private startStallWatchdog(): void {
+    this.stopStallWatchdog();
+    this.stallCheckTimer = setInterval(() => this.checkAsrStall(), ASR_STALL_CHECK_INTERVAL_MS);
+  }
+
+  private stopStallWatchdog(): void {
+    if (this.stallCheckTimer === undefined) return;
+    clearInterval(this.stallCheckTimer);
+    this.stallCheckTimer = undefined;
+  }
+
+  private checkAsrStall(): void {
+    if (this.state !== 'listening') {
+      this.stopStallWatchdog();
+      return;
+    }
+    if (this.networkRecoveryInFlight) return;
+    this.maybeRefineDuringPause();
+
+    const wallMs = performance.now() - this.lastAsrSignalAt;
+    const audioMs = this.audioMsSinceLastSignal;
+    const voicedMs = this.voicedAudioMsSinceLastSignal;
+
+    if (
+      !this.stallWarned &&
+      voicedMs >= ASR_STALL_WARN_AFTER_VOICED_MS &&
+      wallMs >= ASR_STALL_WARN_AFTER_WALL_MS
+    ) {
+      this.stallWarned = true;
+      this.logger.record({
+        type: 'asr_stall_warning',
+        runId: this.runId,
+        at: Date.now(),
+        audioMsSinceLastSignal: Math.round(audioMs),
+        voicedAudioMsSinceLastSignal: Math.round(voicedMs),
+        wallMsSinceLastSignal: Math.round(wallMs),
+        everSawSignal: this.everSawAsrSignal,
+      });
+    }
+  }
+
+  private attemptNetworkRecovery(
+    trigger: 'error' | 'disconnected',
+    audioMs: number,
+    voicedMs: number,
+    wallMs: number,
+  ): void {
+    if (!this.asr.recover) return;
+    const runId = this.runId;
+    this.networkRecoveryInFlight = true;
+    this.networkRecoveryAttempts += 1;
+    const startedAt = performance.now();
+    this.logger.record({
+      type: 'asr_recovery_attempted',
+      runId,
+      at: Date.now(),
+      trigger,
+      attempt: this.networkRecoveryAttempts,
+      audioMsSinceLastSignal: Math.round(audioMs),
+      voicedAudioMsSinceLastSignal: Math.round(voicedMs),
+      wallMsSinceLastSignal: Math.round(wallMs),
+      everSawSignal: this.everSawAsrSignal,
+    });
+    void this.asr
+      .recover()
+      .then(() => {
+        if (runId !== this.runId) return;
+        // Reset stall counters so the next watchdog window starts fresh.
+        this.lastAsrSignalAt = performance.now();
+        this.audioMsSinceLastSignal = 0;
+        this.voicedAudioMsSinceLastSignal = 0;
+        this.stallWarned = false;
+        this.logger.record({
+          type: 'asr_recovery_succeeded',
+          runId,
+          at: Date.now(),
+          elapsedMs: performance.now() - startedAt,
+        });
+      })
+      .catch((error: unknown) => {
+        if (runId !== this.runId) return;
+        const reason = error instanceof Error ? error.message : String(error);
+        this.logger.record({
+          type: 'asr_recovery_failed',
+          runId,
+          at: Date.now(),
+          elapsedMs: performance.now() - startedAt,
+          reason,
+        });
+        this.stopStallWatchdog();
+        const message = this.recoveryErrorMessage?.(error);
+        this.fail(
+          message ?? 'Voice input stopped receiving recognition. Please try again.',
+          message === undefined ? 'recognition_stalled' : undefined,
+        );
+      })
+      .finally(() => {
+        if (runId !== this.runId) return;
+        this.networkRecoveryInFlight = false;
+      });
+  }
+}
+
+function normalizeSubmittedText(text: string): string {
+  return text.replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * True when the chunk's PCM16 RMS is loud enough to plausibly contain speech.
+ * Used by the stall watchdog to distinguish "user is silent" from "user is
+ * speaking but server is quiet": only voiced chunks count toward the warning
+ * threshold, so a 30-second thinking pause never creates noisy diagnostics.
+ *
+ * Pure silence in a quiet room is RMS ~10-30; typing/AC/fan noise ~50-150;
+ * normal speech ~800+. The threshold (300) sits in the gap between background
+ * noise and soft speech — well below typical voice levels but high enough to
+ * reject room hum.
+ */
+function isChunkVoiced(chunk: ArrayBuffer): boolean {
+  if (chunk.byteLength < 2) return false;
+  const sampleCount = Math.floor(chunk.byteLength / 2);
+  if (sampleCount === 0) return false;
+  const samples = new Int16Array(chunk, 0, sampleCount);
+  let sumSquares = 0;
+  for (let i = 0; i < sampleCount; i += 1) {
+    const s = samples[i];
+    sumSquares += s * s;
+  }
+  const rms = Math.sqrt(sumSquares / sampleCount);
+  return rms >= ASR_VOICED_RMS_THRESHOLD;
+}
+
+function createVoiceInputId(): string {
+  const cryptoLike = (globalThis as { crypto?: CryptoWithUuid }).crypto;
+  if (typeof cryptoLike?.randomUUID === 'function') {
+    return cryptoLike.randomUUID();
+  }
+  return `voice-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+}

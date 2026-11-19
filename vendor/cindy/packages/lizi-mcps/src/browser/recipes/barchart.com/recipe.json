@@ -1,0 +1,17 @@
+{
+  "id": "barchart-quote",
+  "match": [
+    "barchart.com"
+  ],
+  "description": "Barchart stock quote with price, volume, and key metrics",
+  "access": "read",
+  "adapter": "barchart/quote",
+  "inputs": {
+    "symbol": {
+      "required": true,
+      "type": "str",
+      "description": "Stock ticker (e.g. AAPL, MSFT, TSLA)"
+    }
+  },
+  "steps": []
+}

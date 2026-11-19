@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Cindy</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main class="card">
+      <header class="header" data-tauri-drag-region>
+        <h1 id="title" class="title" data-tauri-drag-region>Cindy</h1>
+        <span id="phase-chip" class="chip phase-waiting"></span>
+      </header>
+
+      <p id="message" class="message"></p>
+
+      <div class="spacer"></div>
+
+      <div id="progress-track" class="progress-track">
+        <div id="progress-fill" class="progress-fill" data-state="indeterminate"></div>
+      </div>
+
+      <div id="error-bar" class="error-bar" hidden>
+        <p id="error-text" class="error-text"></p>
+        <details id="error-details" hidden>
+          <summary id="error-details-label"></summary>
+          <p id="error-diagnostic" class="error-text"></p>
+        </details>
+      </div>
+
+      <footer class="footer">
+        <button id="btn-retry" type="button" class="btn" hidden></button>
+        <button id="btn-log" type="button" class="btn"></button>
+        <button id="btn-quit" type="button" class="btn" hidden></button>
+      </footer>
+    </main>
+
+    <script src="./retry-copy.js"></script>
+    <script src="./copy.js"></script>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

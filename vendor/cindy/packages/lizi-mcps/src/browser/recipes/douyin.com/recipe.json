@@ -1,0 +1,35 @@
+{
+  "id": "douyin-user-videos",
+  "match": [
+    "douyin.com"
+  ],
+  "description": "获取指定用户的视频列表（含下载地址和热门评论）",
+  "access": "read",
+  "adapter": "douyin/user-videos",
+  "inputs": {
+    "sec_uid": {
+      "required": true,
+      "type": "string",
+      "description": "用户 sec_uid（个人主页 URL 末尾部分，也可直接传整条主页 URL）"
+    },
+    "limit": {
+      "required": false,
+      "type": "int",
+      "default": 20,
+      "description": "获取数量（最大 20）"
+    },
+    "with_comments": {
+      "required": false,
+      "type": "bool",
+      "default": true,
+      "description": "包含热门评论（默认: true）"
+    },
+    "comment_limit": {
+      "required": false,
+      "type": "int",
+      "default": 10,
+      "description": "每个视频获取多少条评论（最大 10）"
+    }
+  },
+  "steps": []
+}

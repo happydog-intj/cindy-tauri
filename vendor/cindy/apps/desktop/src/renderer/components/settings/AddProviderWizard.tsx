@@ -1,0 +1,2370 @@
+import { isBuiltinApiKeyProviderId } from '../../../shared/providerSecrets';
+import { BUNDLED_CATALOG, providerSetupLink, providerPresetOAuth, providerPresetOAuthRuntimes, buildUserProvider, isMimoTokenPlanPreset } from '@cindy/model-providers';
+import { bindProviderPresetRuntime, providerEndpointBindings, bindProviderEndpoint } from '@cindy/model-providers';
+/**
+ * AddProviderWizard —— 「添加供应商」三步向导(2026-07 模型供应商重构)。
+ *
+ *   Step 1 选择供应商:目录画廊,**一家一张卡**(订阅渠道 = 目录里未连接的 OAuth
+ *           供应商;API Key 预设 = 目录 presets 段;自定义端点 = 逃生口,直接打开
+ *           完整表单 ProviderConnectionDialog)。鉴权方式由供应商定义决定,不让用户猜。
+ *   Step 2 连接:OAuth 渠道 = 一键授权；预设也可用 API Key，配官方获取入口。
+ *           原生订阅保持已有流程，渠道登录后进入模型选择。
+ *   Step 3 选择模型(仅预设):自动拉取列模型端点,预设推荐模型预勾;拉取失败
+ *           降级为「仅预设推荐模型」仍可完成(不把用户堵死在网络错误上)。
+ *
+ * codex 兼容性提示:数据驱动 —— 预设/供应商只声明单 runtime 时显示「仅支持 X」
+ * 说明行;不在向导里做运行时探测(探测能力在编辑表单的「测试连接」,后续迭代再
+ * 上探测式灰态)。
+ */
+
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import * as Dialog from '@radix-ui/react-dialog';
+import { useDialogExit } from '@/hooks/useDialogExit';
+import { WINDOW_DRAG_STYLE, WINDOW_NO_DRAG_STYLE } from '@/components/layout/windowDrag';
+import { Check, Info, Search } from 'lucide-react';
+
+import { Button } from '@/components/ui/button';
+import { cn } from '@/lib/utils';
+import { toast } from '@/lib/toast';
+import { Spinner } from '@/components/ui/spinner';
+import { createCustomProvider, deleteCustomProvider, updateCustomProvider, providerViewToCustomProviderConfig, type RuntimeKeys } from '@/lib/customProviders';
+import { isWizardOAuthChoice, isWizardApiKeyChoice, presetChoiceMeta, builtinChoiceMeta, type ProviderSearchTarget } from './providerSearch';
+import { CURRENT_CINDY_REGION } from '../../../shared/brandRegion';
+import { configuredPresetAgents } from '../../../shared/piRuntimeInitialization';
+import { presetConnectionRuntime } from '../../../shared/presetConnectionRuntime';
+import { presetCandidateRoute, presetModelCandidate, presetRouteHasInterfaceProfiles, presetSupplementalModels } from '../../../shared/providerModelCandidates';
+import { uniqueCustomProviderId } from '@/lib/customProviderId';
+import {
+  isLocalRuntimeBetaProviderId,
+  LOCAL_ADVANCED_PRESET_IDS,
+  LOCAL_CONNECT_PRESET_IDS,
+  MANAGED_LMSTUDIO_PROVIDER_ID,
+  MANAGED_OLLAMA_PROVIDER_ID,
+} from '../../../shared/localModelRuntime';
+import { extractIpcError } from '@/utils/ipcError';
+import { pickWizardRecommend, type WizardRecommend } from './wizardRecommend';
+import { localCliDisplayName, type LocalCliDetection } from '../../../shared/localCliDetect';
+import { useProviderOAuthDeviceCode } from '@/hooks/useProviderOAuthDeviceCode';
+import { acquireCodexLogin, type CodexLoginLease } from '@/hooks/codexAuthLogin';
+import { cardIcon, ProviderRow } from './ProviderRow';
+import { LocalOllamaInstall, offersManagedOllamaInstall } from './LocalOllamaInstall';
+import { MANAGED_LLAMACPP_PROVIDER_ID } from '../../../shared/llamaCpp';
+import { OAuthBrowserLink, OAuthDeviceCodeCard } from './OAuthDeviceCodeCard';
+import { SettingsTextInput } from './SettingsTextInput';
+import { modelsAfterProviderEndpointEdit } from '@/lib/customProviderEndpointEdit';
+import type { DetectedProviderDraft } from '../../../shared/providerDetection';
+import { SpeechModelChoices } from './SpeechModelChoices';
+import { isSpeechModel, SPEECH_API_PRESETS, speechReferenceModels, speechSetupTarget, withSpeechApiPresets } from '../../../shared/speechProviderSetup';
+
+import {
+  isOpenRouterModelsUrl,
+  isLoopbackProviderUrl,
+  isProviderRequestPath,
+  presetDisplayName,
+  sortPresetsForRegion,
+} from '@cindy/model-providers';
+import type {
+  AgentKind,
+  ModelRegistry,
+  CustomProviderConfig,
+  ProviderModelDiscoverySource,
+  ProviderModelRouteConfig,
+  ProviderRuntimeModelConfig,
+  ProviderPreset,
+  ProviderView,
+} from '@cindy/model-providers';
+
+/**
+ * 外部直达入口:
+ *   - builtin(左栏检测建议 / 引导卡 OAuth 行):直接进入该内置渠道的授权步。
+ *   - preset(引导卡「其他供应商」行):presets 异步载入后直达该预设的表单步。
+ */
+export type WizardEntry = ProviderSearchTarget;
+
+interface AddProviderWizardProps {
+  detected?: DetectedProviderDraft;
+  onReturnCustom?: (draft: DetectedProviderDraft) => void;
+  providers: ProviderView[];
+  entry?: WizardEntry;
+  /** 连接失败已在向导内提示；父级只恢复草稿，不再提示目录目标失效。 */
+  onEntryUnavailable?: (reason?: 'target-unavailable' | 'connection-failed') => void;
+  /** 「自定义端点」卡片 → 关闭向导并打开完整表单。 */
+  onOpenCustomForm: () => void;
+  onClose: () => void;
+  /** 完成(授权成功 / 预设创建成功);providerId 用于左栏选中新供应商。 */
+  onDone: (providerId?: string) => void;
+}
+
+type Selection =
+  | { kind: 'oauth'; provider: ProviderView }
+  | { kind: 'preset'; preset: ProviderPreset }
+  /** 内置 API-key 供应商(如 Gemini 图像来源,2026-07):保存 key 即连接,无自定义供应商落库。 */
+  | { kind: 'builtinApiKey'; provider: ProviderView }
+  | { kind: 'ollama-onboarding' };
+
+type PresetBaseUrls = Partial<Record<AgentKind, string>>;
+
+const AGENT_LABEL: Record<AgentKind, string> = {
+  'claude-code': 'Claude Code',
+  codex: 'Codex',
+  pi: 'Pi',
+};
+
+function presetRuntimeBaseUrl(
+  preset: ProviderPreset,
+  agent: AgentKind,
+  edited: PresetBaseUrls,
+): string {
+  const runtime = preset.runtimes[agent];
+  if (!runtime) return '';
+  if (!runtime.baseUrlEditable) return runtime.baseUrl;
+  if (edited[agent] !== undefined) return edited[agent]!.trim();
+  for (const [sourceAgent, endpoint] of Object.entries(edited)) {
+    const source = preset.runtimes[sourceAgent as AgentKind];
+    if (!source || !endpoint) continue;
+    // 默认地址相同的运行时指向同一服务(如本机 llama.cpp 的 Codex / Pi),未单独编辑时跟随已编辑的那个。
+    if (source.baseUrl === runtime.baseUrl) return endpoint.trim();
+    const bindings = providerEndpointBindings(source.baseUrl, endpoint.trim());
+    if (bindings && source.baseUrl.includes('{')) {
+      return bindProviderEndpoint(runtime.baseUrl, bindings, endpoint.trim());
+    }
+  }
+  return runtime.baseUrl;
+}
+
+function isValidEditablePresetBaseUrl(value: string, template?: string): boolean {
+  if (/[{}]/.test(value) || parseSafePresetHttpUrl(value) === null) return false;
+  if (!template?.includes('{')) return true;
+  return providerEndpointBindings(template, value) !== null;
+}
+
+function parseSafePresetHttpUrl(value: string): URL | null {
+  try {
+    const url = new URL(value);
+    if ((url.protocol !== 'http:' && url.protocol !== 'https:') || url.username || url.password)
+      return null;
+    return url;
+  } catch {
+    return null;
+  }
+}
+
+function isAllowedDiscoveryWireProtocol(
+  agent: AgentKind,
+  value: unknown,
+): value is ProviderModelRouteConfig['wireProtocol'] {
+  const supported =
+    value === 'anthropic-messages' || value === 'openai-responses' || value === 'openai-chat' || value === 'google-generative-ai';
+  return supported;
+}
+
+function isDiscoverySourceValidForRuntime(
+  agent: AgentKind,
+  runtimeBaseUrl: string,
+  source: ProviderModelDiscoverySource,
+): boolean {
+  const runtimeUrl = parseSafePresetHttpUrl(runtimeBaseUrl);
+  const sourceUrl = parseSafePresetHttpUrl(source.baseUrl);
+  if (
+    !runtimeUrl ||
+    !sourceUrl ||
+    sourceUrl.origin !== runtimeUrl.origin ||
+    !isAllowedDiscoveryWireProtocol(agent, source.wireProtocol)
+  )
+    return false;
+  if (source.modelsUrl !== undefined) {
+    const modelsUrl = parseSafePresetHttpUrl(source.modelsUrl);
+    if (!modelsUrl || modelsUrl.origin !== sourceUrl.origin) return false;
+  }
+  return source.requestPath === undefined || isProviderRequestPath(source.requestPath);
+}
+
+/**
+ * bespoke OAuth 渠道的官方 API 预设——授权步「改用 API Key 接入」的替代路径
+ * (API 用户没有订阅,OAuth 授权对其是错误路径)。
+ *
+ * 不能复用 OAuth routing 的 upstream:那是订阅专用端点(openai 是 chatgpt
+ * backend)。此处声明官方 API 端点,模型清单以 Step 3 列模型接口实拉为准
+ * (缺省由 baseUrl 推导 …/v1/models,见 provider-model-fetch);同时内置少量
+ * 推荐模型兜底——拉取因网络/限流失败时降级为「仅推荐模型」仍可完成创建,
+ * 不把用户堵死(与目录预设同语义;Greptile P1 反馈 2026-07-24)。
+ * 每个 runtime 都独立声明 wire protocol：Anthropic API 同时提供 Claude Code 的
+ * Messages 与 Codex 桥接所需的 Messages 端点；openai/xai 声明 Codex 与 Pi 原生协议
+ * runtime(两家无 Anthropic 兼容端点),表单会自动展示实际支持的 runtime。
+ */
+const ANTHROPIC_API_MODELS = [
+  { id: 'claude-opus-5', defaultEnabled: true, name: 'Claude Opus 5', contextWindow: 1_000_000 },
+  { id: 'claude-sonnet-5', defaultEnabled: true, name: 'Claude Sonnet 5', contextWindow: 1_000_000 },
+  { id: 'claude-haiku-4-5', defaultEnabled: true, name: 'Claude Haiku 4.5', contextWindow: 200_000 },
+];
+const OPENAI_API_MODELS = [
+  { id: 'gpt-5.5', defaultEnabled: true, name: 'GPT-5.5' },
+  { id: 'gpt-5.4-mini', defaultEnabled: true, name: 'GPT-5.4 mini' },
+];
+const XAI_API_MODELS = [
+  { id: 'grok-4.6', defaultEnabled: true, name: 'Grok 4.6', contextWindow: 500_000 },
+  { id: 'grok-4.5', defaultEnabled: true, name: 'Grok 4.5', contextWindow: 500_000 },
+  { id: 'grok-4.3', defaultEnabled: true, name: 'Grok 4.3', contextWindow: 1_000_000 },
+];
+
+export const OFFICIAL_API_PRESETS: Record<string, ProviderPreset> = {
+  anthropic: {
+    id: 'anthropic-api',
+    name: 'Anthropic API',
+    docsUrl: 'https://console.anthropic.com/settings/keys',
+    runtimes: {
+      'claude-code': {
+        baseUrl: 'https://api.anthropic.com',
+        // contextWindow 必须与目录(providers.json)一致:保存时它是窗口的唯一来源
+        // (拉取的模型列表不带窗口),缺省会落 200k 默认 → toSdkModelString 剥掉
+        // 1M 模型的 [1m] 路由,用户拿到 1/5 窗口。
+        models: ANTHROPIC_API_MODELS,
+      },
+      // Codex 通过 Responses → Anthropic Messages 本地桥接访问同一官方 API。
+      // 这不是 Claude.ai OAuth 路由：API key 由该 runtime 独立存储，出站只使用
+      // x-api-key，Codex 自带的 OpenAI Authorization 永不透传到 Anthropic。
+      codex: {
+        wireProtocol: 'anthropic-messages',
+        baseUrl: 'https://api.anthropic.com',
+        models: ANTHROPIC_API_MODELS,
+      },
+      pi: {
+        wireProtocol: 'anthropic-messages',
+        baseUrl: 'https://api.anthropic.com',
+        models: ANTHROPIC_API_MODELS,
+      },
+    },
+  },
+  openai: {
+    id: 'openai-api',
+    name: 'OpenAI API',
+    docsUrl: 'https://platform.openai.com/api-keys',
+    runtimes: {
+      codex: {
+        baseUrl: 'https://api.openai.com/v1',
+        models: OPENAI_API_MODELS,
+      },
+      pi: {
+        baseUrl: 'https://api.openai.com/v1',
+        wireProtocol: 'openai-responses',
+        models: OPENAI_API_MODELS,
+      },
+    },
+  },
+  xai: {
+    id: 'xai-api',
+    name: 'xAI API',
+    docsUrl: 'https://console.x.ai',
+    runtimes: {
+      codex: {
+        baseUrl: 'https://api.x.ai/v1',
+        wireProtocol: 'openai-chat',
+        // contextWindow 必须与目录一致:拉取失败时 handleFinish 只读预设窗口,
+        // 缺省会落 toCatalogModel 的 200k 默认。
+        models: XAI_API_MODELS,
+      },
+      pi: {
+        baseUrl: 'https://api.x.ai/v1',
+        wireProtocol: 'openai-chat',
+        models: XAI_API_MODELS,
+      },
+    },
+  },
+};
+
+function InfoLine({ text }: { text: string }) {
+  return (
+    <div className="flex items-start gap-2 text-12" style={{ color: 'var(--text-tertiary)' }}>
+      <Info size={13} className="mt-[1px] shrink-0" />
+      <span>{text}</span>
+    </div>
+  );
+}
+
+function GroupLabel({ children }: { children: React.ReactNode }) {
+  return (
+    <span
+      className="block px-2 pb-1.5 pt-3 text-11 font-medium uppercase"
+      style={{ color: 'var(--text-tertiary)', letterSpacing: '0.5px' }}
+    >
+      {children}
+    </span>
+  );
+}
+
+export function AddProviderWizard({
+  detected,
+  onReturnCustom,
+  providers,
+  entry,
+  onEntryUnavailable,
+  onOpenCustomForm: openCustomForm,
+  onClose: notifyClosed,
+  onDone: notifyDone,
+}: AddProviderWizardProps) {
+  const { t, i18n } = useTranslation();
+  const dialog = useDialogExit();
+  const panelRef = useRef<HTMLDivElement>(null);
+  const onClose = useCallback(() => dialog.close(notifyClosed), [dialog.close, notifyClosed]);
+  const onDone = useCallback((id?: string) => dialog.close(() => notifyDone(id)), [dialog.close, notifyDone]);
+  const onOpenCustomForm = useCallback(() => dialog.close(openCustomForm), [dialog.close, openCustomForm]);
+
+  // Native credentials alone do not mean this Cindy account has added the local
+  // connection. Keep the slot occupied when suspended or awaiting reconnection.
+  const localOpenAiAlreadyAdded = providers.some(
+    provider => provider.id === 'openai' &&
+      !provider.removed && (provider.connected || provider.removed === false || provider.openAiAccount?.reconnectRequired === true),
+  );
+
+  const [presets, setPresets] = useState<ProviderPreset[]>([]);
+  const [presetsLoadState, setPresetsLoadState] = useState<'loading' | 'ready' | 'failed'>('loading');
+  const presetEntryConsumedRef = useRef<string | null>(null);
+  // 用户改选后，原搜索入口就已消费；目录迟到的成功/失败均不得再接管新选择。
+  const consumePresetEntry = useCallback(() => {
+    if (entry?.kind === 'preset') presetEntryConsumedRef.current = entry.presetId;
+  }, [entry]);
+  const [query, setQuery] = useState('');
+  // entry(左栏检测建议 / 引导卡直达):目录里找得到该渠道才直达授权步,否则回落目录页。
+  const entryProvider =
+    entry?.kind === 'builtin' ? providers.find((x) => x.id === entry.providerId) : undefined;
+  const [sel, setSel] = useState<Selection | null>(() => {
+    if (detected) return { kind: 'preset', preset: detected.preset };
+    if (!entryProvider) return null;
+    return entryProvider.auth?.method === 'apiKey'
+      ? { kind: 'builtinApiKey', provider: entryProvider }
+      : { kind: 'oauth', provider: entryProvider };
+  });
+  // 预设表单态
+  const [name, setName] = useState(detected?.config.name || (detected ? presetDisplayName(detected.preset, i18n.language) : ''));
+  const [apiKey, setApiKey] = useState(detected?.apiKey ?? '');
+  const [presetBaseUrls, setPresetBaseUrls] = useState<PresetBaseUrls>({});
+  const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
+  const oauthDraftRef = useRef<CustomProviderConfig | null>(null);
+  const oauthAttemptRef = useRef(0);
+  const [ollamaCanInstall, setOllamaCanInstall] = useState(() =>
+    offersManagedOllamaInstall(window.electronAPI.platform),
+  );
+  const [loggingIn, setLoggingIn] = useState(false);
+  const [xaiDeviceLogin, setXaiDeviceLogin] = useState(false);
+  const genericOAuthProviderId =
+    sel?.kind === 'oauth' && sel.provider.auth.oauth ? sel.provider.id : null;
+  const genericDeviceFlow =
+    sel?.kind === 'oauth' && sel.provider.auth.oauth?.flow === 'device-code';
+  const accountLoginRef = useRef<{ providerId: string; ownerId: string } | null>(null);
+  const {
+    deviceCode: genericDeviceCode,
+    browserUrl,
+    clearDeviceCode: clearGenericDeviceCode,
+    beginOwnedLogin: beginGenericOwnedLogin,
+    cancelOwnedLogin: cancelGenericOwnedLogin,
+  } = useProviderOAuthDeviceCode(genericOAuthProviderId, {
+    observeProgress: genericDeviceFlow || (sel?.kind === 'oauth' && ['openai', 'xai'].includes(sel.provider.id)),
+    browserLoginRef: accountLoginRef,
+  });
+  // Step 3 拉取态
+  const [step, setStep] = useState<1 | 2 | 3>(entryProvider || detected ? 2 : 1);
+  const [fetchState, setFetchState] = useState<
+    | { status: 'idle' }
+    | { status: 'fetching' }
+    | { status: 'done'; failed: boolean; empty: boolean }
+  >({ status: 'idle' });
+  const [manualModelIds, setManualModelIds] = useState<Partial<Record<AgentKind, string>>>({});
+  /**
+   * 勾选清单:id → { name, checked, recommended, agents }。Map 保序(推荐在前,拉取新增在后)。
+   * agents = 该模型归属的 runtime:预设推荐模型归属「预设里列出它的那些 runtime」;拉取新增
+   * 归属「实际返回它的那个端点的 runtime」——完成创建时按归属分发,**不**把统一列表复制进
+   * 每个 runtime(双 runtime 预设两端模型集可以不同,cc-only 模型不能写进 codex,反之亦然)。
+   */
+  const [localProbe, setLocalProbe] = useState<{
+    ready: boolean;
+    appInstalled: boolean;
+    modelCount: number;
+    memoryGb: number;
+    detectedLocalPresetIds: string[];
+  }>({
+    ready: false,
+    appInstalled: false,
+    modelCount: 0,
+    memoryGb: 0,
+    detectedLocalPresetIds: [],
+  });
+  const [cliDetections, setCliDetections] = useState<LocalCliDetection[]>([]);
+  const [picks, setPicks] = useState<
+    Map<
+      string,
+      {
+        name: string;
+        checked: boolean;
+        recommended: boolean;
+        speechReference?: boolean;
+        manualSpeech?: boolean;
+        agents: AgentKind[];
+        /** 列模型端点上报的上下文窗口,**按 agent 分槽**(同一 id 双端可不同,如
+         *  cc=1M / codex=272K);完成创建时按所属 runtime 取值,作为供应商事实单独保存。 */
+        contextWindows?: Partial<Record<AgentKind, number>>;
+        discoveredCosts?: Partial<Record<AgentKind, import("@cindy/model-providers").ModelCost>>;
+        discoveredMetadata?: Partial<
+          Record<AgentKind, import('@cindy/model-providers').ModelMetadata>
+        >;
+        /** 附加目录发现出的模型级路由；主 runtime 目录发现的模型保持缺省路由。 */
+        routes?: Partial<Record<AgentKind, ProviderModelRouteConfig>>;
+        interfaceIds?: Partial<Record<AgentKind, string>>;
+      }
+    >
+  >(new Map());
+
+  const [modelRegistry, setModelRegistry] = useState<ModelRegistry>();
+
+  useEffect(() => {
+    let cancelled = false;
+    void window.electronAPI.maker
+      .listProviderPresets()
+      .then((r) => {
+        if (!cancelled) {
+          setModelRegistry(r.modelRegistry);
+          setPresets(withSpeechApiPresets(r.presets));
+          setPresetsLoadState('ready');
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setModelRegistry(BUNDLED_CATALOG.modelRegistry);
+          setPresets(withSpeechApiPresets(BUNDLED_CATALOG.presets ?? []));
+          setPresetsLoadState('failed');
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void window.electronAPI.maker
+      .localModelList()
+      .then((result) => {
+        if (cancelled) return;
+        setLocalProbe({
+          ready: true,
+          appInstalled: result.status.appInstalled,
+          modelCount: result.models.length,
+          memoryGb: result.memoryGb ?? 0,
+          detectedLocalPresetIds: result.detectedLocalPresetIds ?? [],
+        });
+      })
+      .catch(() => {
+        if (!cancelled) setLocalProbe((current) => ({ ...current, ready: true }));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void window.electronAPI.maker
+      .scanLocalCli()
+      .then((result) => {
+        if (!cancelled) setCliDetections(result.detections);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Native subscription brands remain available for adding another independent account.
+  const oauthChoices = useMemo(
+    () =>
+      providers.filter(isWizardOAuthChoice),
+    [providers],
+  );
+  // 内置 API-key 渠道(auth.method 'apiKey' 的 builtin 条目):
+  // 已添加（包括断开后保留）的连接不再进向导；声明了媒体清单才展示。
+  const builtinApiKeyChoices = useMemo(
+    () =>
+      providers.filter(isWizardApiKeyChoice),
+    [providers],
+  );
+  const sortedPresets = useMemo(
+    () => sortPresetsForRegion(presets, CURRENT_CINDY_REGION),
+    [presets],
+  );
+  const q = query.trim().toLowerCase();
+  const filteredOauth = q
+    ? oauthChoices.filter((p) => p.name.toLowerCase().includes(q))
+    : oauthChoices;
+  const isLocalPresetId = (id: string) =>
+    (LOCAL_CONNECT_PRESET_IDS as readonly string[]).includes(id) ||
+    (LOCAL_ADVANCED_PRESET_IDS as readonly string[]).includes(id);
+  const filteredPresets = (
+    q
+      ? sortedPresets.filter(
+          (p) =>
+            presetDisplayName(p, i18n.language).toLowerCase().includes(q) ||
+            p.name.toLowerCase().includes(q) ||
+            (p.nameEn?.toLowerCase().includes(q) ?? false) ||
+            (p.nameZhTW?.toLowerCase().includes(q) ?? false),
+        )
+      : sortedPresets
+  ).filter((p) => !isLocalPresetId(p.id));
+  const localConnectPresets = sortedPresets.filter((p) =>
+    (LOCAL_CONNECT_PRESET_IDS as readonly string[]).includes(p.id),
+  );
+  const localAdvancedPresets = sortedPresets.filter((p) =>
+    (LOCAL_ADVANCED_PRESET_IDS as readonly string[]).includes(p.id),
+  );
+  const filteredLocalConnect = q
+    ? localConnectPresets.filter((p) => p.name.toLowerCase().includes(q))
+    : localConnectPresets;
+  const filteredLocalAdvanced = q
+    ? localAdvancedPresets.filter((p) => p.name.toLowerCase().includes(q))
+    : localAdvancedPresets;
+  // 目录里的 llamacpp 预设是「连接已有服务」(默认 8080);Cindy 托管的 llama.cpp 走下方单独卡片,两者互不影响。
+  const filteredLocalPresets = [...filteredLocalConnect, ...filteredLocalAdvanced];
+
+  const ollamaAlreadyAdded = providers.some((p) => p.id === MANAGED_OLLAMA_PROVIDER_ID);
+  const oauthChoiceIds = new Set(oauthChoices.map((p) => p.id));
+  const connectedProviderIds = providers.filter((p) => p.connected).map((p) => p.id);
+  const cliCandidates = cliDetections
+    .filter((detection) => detection.installed && oauthChoiceIds.has(detection.providerId))
+    .map((detection) => ({
+      providerId: detection.providerId,
+      loggedIn: detection.loggedIn,
+      cli: detection.cli,
+    }));
+  const recommendations = localProbe.ready
+    ? pickWizardRecommend({
+        ollamaAlreadyAdded,
+        ollamaAppInstalled: localProbe.appInstalled,
+        installedLocalModelCount: localProbe.modelCount,
+        memoryGb: localProbe.memoryGb,
+        connectedProviderIds,
+        cliCandidates,
+        fallbackOauthProviderId: oauthChoices[0]?.id ?? null,
+      })
+    : [];
+  const recommendedOauthIds = new Set(
+    recommendations
+      .filter((item): item is Extract<WizardRecommend, { kind: 'oauth' }> => item.kind === 'oauth')
+      .map((item) => item.providerId),
+  );
+  const recommendsOllama = recommendations.some((item) => item.kind === 'ollama');
+  const ollamaMatchesQuery =
+    !q || t('settings.providers.local.title').toLowerCase().includes(q) || 'ollama'.includes(q);
+  const showOllamaInList =
+    !ollamaAlreadyAdded &&
+    ollamaMatchesQuery &&
+    (Boolean(q) || (localProbe.ready && !recommendsOllama));
+  const showLlamaCppInList = (!q || 'llama.cpp'.includes(q)) && !providers.some(p => p.id === MANAGED_LLAMACPP_PROVIDER_ID);
+  const listedOauth = q
+    ? filteredOauth
+    : filteredOauth.filter((p) => !recommendedOauthIds.has(p.id));
+  const detectedLocalPresets = filteredLocalPresets.filter((preset) =>
+    localProbe.detectedLocalPresetIds.includes(preset.id),
+  );
+  const undetectedLocalPresets = filteredLocalPresets.filter((preset) => {
+    if (localProbe.detectedLocalPresetIds.includes(preset.id)) return false;
+    if (preset.id === 'lmstudio' && providers.some((p) => p.id === MANAGED_LMSTUDIO_PROVIDER_ID)) {
+      return false;
+    }
+    return true;
+  });
+  const listedLocalPresets = q ? filteredLocalPresets : undetectedLocalPresets;
+
+  /**
+   * 拉取请求序号:防过期响应(与 ProviderConnectionDialog 的 fetchRequestSignature 同模式)。
+   * 换选供应商 / 返回目录都会推进序号,慢返回的旧请求结果直接丢弃,不污染新预设的勾选清单。
+   */
+  const fetchSeqRef = useRef(0);
+
+  useEffect(() => () => {
+    oauthAttemptRef.current += 1;
+    if (savingRef.current) return;
+    const draft = oauthDraftRef.current;
+    oauthDraftRef.current = null;
+    if (draft) void deleteCustomProvider(draft.id).catch(() => undefined);
+  }, []);
+
+  const pickOauth = useCallback((provider: ProviderView) => {
+    if (savingRef.current) return;
+    consumePresetEntry();
+    const draft = oauthDraftRef.current;
+    oauthDraftRef.current = null;
+    if (draft) void deleteCustomProvider(draft.id).catch(() => undefined);
+    fetchSeqRef.current += 1;
+    setManualModelIds({});
+    setSel({ kind: 'oauth', provider });
+    setApiKey('');
+    setStep(2);
+  }, [consumePresetEntry]);
+  const pickBuiltinApiKey = useCallback((provider: ProviderView) => {
+    if (savingRef.current) return;
+    consumePresetEntry();
+    const draft = oauthDraftRef.current;
+    oauthDraftRef.current = null;
+    if (draft) void deleteCustomProvider(draft.id).catch(() => undefined);
+    fetchSeqRef.current += 1;
+    setManualModelIds({});
+    setSel({ kind: 'builtinApiKey', provider });
+    setApiKey('');
+    setStep(2);
+  }, [consumePresetEntry]);
+  const connectLlamaCpp = useCallback(async () => {
+    if (savingRef.current) return;
+    consumePresetEntry();
+    if (providers.some(p => p.id === MANAGED_LLAMACPP_PROVIDER_ID)) {
+      onDone(MANAGED_LLAMACPP_PROVIDER_ID);
+      return;
+    }
+    savingRef.current = true;
+    setSaving(true);
+    try {
+      await window.electronAPI.maker.llamaCppEnsure();
+      await onDone(MANAGED_LLAMACPP_PROVIDER_ID);
+    } catch {
+      toast.error(t('settings.providers.llamacpp.failed'));
+      if (entry?.kind === 'llamacpp') onEntryUnavailable?.('connection-failed');
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
+    }
+  }, [onDone, providers, t, entry, onEntryUnavailable, consumePresetEntry]);
+
+  const pickPreset = useCallback(
+    (preset: ProviderPreset, useApiKey = false) => {
+      if (savingRef.current) return;
+      consumePresetEntry();
+      const oauth = providerPresetOAuth(preset.id);
+      if (oauth && !useApiKey) {
+        pickOauth({ ...buildUserProvider({
+          id: preset.id, name: preset.name,
+          auth: { method: 'oauth', oauth },
+          runtimes: providerPresetOAuthRuntimes(preset),
+        }), connected: false } as ProviderView);
+        return;
+      }
+      const draft = oauthDraftRef.current;
+      oauthDraftRef.current = null;
+      if (draft) void deleteCustomProvider(draft.id).catch(() => undefined);
+      if (
+        preset.id === 'lmstudio' &&
+        providers.some((p) => p.id === MANAGED_LMSTUDIO_PROVIDER_ID)
+      ) {
+        onDone(MANAGED_LMSTUDIO_PROVIDER_ID);
+        return;
+      }
+      fetchSeqRef.current += 1;
+      setManualModelIds({});
+      setSel({ kind: 'preset', preset });
+      setName(presetDisplayName(preset, i18n.language));
+      setApiKey('');
+      setPresetBaseUrls({});
+      setStep(2);
+    },
+    [i18n.language, onDone, providers, pickOauth, consumePresetEntry],
+  );
+
+  const connectOllama = useCallback(async () => {
+    if (savingRef.current) return;
+    consumePresetEntry();
+    savingRef.current = true;
+    setSaving(true);
+    try {
+      let status = await window.electronAPI.maker.localModelStatus();
+      if (status.kind === 'stopped' && status.appInstalled) {
+        status = await window.electronAPI.maker.localModelStart();
+      }
+      if (status.kind === 'absent') {
+        setOllamaCanInstall(
+          offersManagedOllamaInstall(window.electronAPI.platform, status.canInstallRuntime),
+        );
+        setSel({ kind: 'ollama-onboarding' });
+        setStep(2);
+        return;
+      }
+      if (status.kind === 'port-conflict') {
+        toast.error(t('settings.providers.local.conflict'));
+        if (entry?.kind === 'ollama') onEntryUnavailable?.('connection-failed');
+        return;
+      }
+      if (status.kind !== 'ready') {
+        toast.error(t(`settings.providers.local.status.${status.kind}`));
+        if (entry?.kind === 'ollama') onEntryUnavailable?.('connection-failed');
+        return;
+      }
+      await window.electronAPI.maker.localModelEnsure();
+      await onDone(MANAGED_OLLAMA_PROVIDER_ID);
+    } catch (error) {
+      const code = extractIpcError(error)?.code;
+      toast.error(
+        code === 'PRECONDITION_FAILED'
+          ? t('settings.providers.local.notReady')
+          : t('settings.providers.local.connectFailed'),
+      );
+      if (entry?.kind === 'ollama') onEntryUnavailable?.('connection-failed');
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
+    }
+  }, [onDone, t, entry, onEntryUnavailable, consumePresetEntry]);
+
+  useEffect(() => {
+    if (entry?.kind === 'builtin' && !providers.some(p => p.id === entry.providerId)) onEntryUnavailable?.();
+  }, [entry, providers, onEntryUnavailable]);
+
+  const llamaCppEntryConsumed = useRef(false);
+  useEffect(() => {
+    if (entry?.kind !== 'llamacpp' || llamaCppEntryConsumed.current) return;
+    llamaCppEntryConsumed.current = true;
+    void connectLlamaCpp();
+  }, [entry, connectLlamaCpp]);
+
+  const ollamaEntryConsumed = useRef(false);
+  useEffect(() => {
+    if (entry?.kind !== 'ollama' || ollamaEntryConsumed.current) return;
+    ollamaEntryConsumed.current = true;
+    void connectOllama();
+  }, [entry, connectOllama]);
+
+  // entry(preset 直达):presets 异步载入,到位后消费;找不到该预设则留在目录页。
+  // 按 presetId 记录已消费值(而非布尔):同一挂载期内 entry 换成另一个 preset
+  // (如深链二次进入)仍能直达,同一 entry 不重复触发。
+  useEffect(() => {
+    if (entry?.kind !== 'preset' || presetEntryConsumedRef.current === entry.presetId) return;
+    if (presetsLoadState === 'loading') return;
+    presetEntryConsumedRef.current = entry.presetId;
+    const preset = presets.find((p) => p.id === entry.presetId) ?? [...Object.values(OFFICIAL_API_PRESETS), ...SPEECH_API_PRESETS].find(p => p.id === entry.presetId);
+    if (preset) pickPreset(preset, entry.speechOnly === true);
+    else onEntryUnavailable?.();
+  }, [entry, presets, presetsLoadState, pickPreset, onEntryUnavailable]);
+
+  const localLoginRef = useRef<{ cancel: () => void } | null>(null);
+  useEffect(() => () => {
+    const localLogin = localLoginRef.current;
+    localLoginRef.current = null;
+    localLogin?.cancel();
+    const login = accountLoginRef.current;
+    accountLoginRef.current = null;
+    if (login) void window.electronAPI.maker.providerOAuthCancel(login.providerId, { ownerId: login.ownerId, releaseOwner: true });
+  }, []);
+
+  const useLocalOpenAiAccount = useCallback(async () => {
+    setLoggingIn(true);
+    let lease: CodexLoginLease | undefined;
+    const login = { cancel: () => lease?.release({ cancelIfLastOwner: true }) };
+    localLoginRef.current = login;
+    try {
+      lease = acquireCodexLogin('local');
+      const state = await lease.promise;
+      if (localLoginRef.current !== login) return;
+      if (state.authenticated && state.authSource === 'oauth' && state.credentialScope === 'system-shared') {
+        onDone('openai');
+      } else if (state.errorReason !== 'login_cancelled') {
+        toast.error(t('settings.providers.openai.localUnavailable'));
+      }
+    } catch {
+      if (localLoginRef.current === login) toast.error(t('settings.providers.openai.localUnavailable'));
+    } finally {
+      lease?.release();
+      if (localLoginRef.current === login) {
+        localLoginRef.current = null;
+        setLoggingIn(false);
+      }
+    }
+  }, [onDone, t]);
+
+  const useLocalClaudeAccount = useCallback(async () => {
+    setLoggingIn(true);
+    const loginKey = crypto.randomUUID();
+    const login = { cancel: () => { void window.electronAPI.maker.claudeOAuthCancel(loginKey).catch(() => undefined); } };
+    localLoginRef.current = login;
+    try {
+      const result = await window.electronAPI.maker.claudeOAuthLogin(loginKey);
+      if (localLoginRef.current !== login) return;
+      if (result.ok) onDone('anthropic');
+      else if (result.reason === 'local_unavailable') toast.error(t('settings.providers.localAccount.unavailable'));
+      else if (result.reason === 'not_a_subscription') toast.error(t('settings.connections.claude.toast.notSubscription'));
+      else if (result.reason !== 'login_cancelled') toast.error(t('settings.connections.claude.toast.loginFailed'));
+    } catch { if (localLoginRef.current === login) toast.error(t('settings.connections.claude.toast.loginFailed')); }
+    finally {
+      if (localLoginRef.current === login) {
+        localLoginRef.current = null;
+        setLoggingIn(false);
+      }
+    }
+  }, [onDone, t]);
+
+  // ── OAuth 授权（渠道登录后进入模型选择，原生订阅沿用已有流程）────────────────────
+  const handleAuthorize = useCallback(
+    async (method: 'browser' | 'device' = 'browser') => {
+      const selected = sel?.kind === 'oauth' ? sel.provider : undefined;
+      if (!selected) return;
+      const attempt = ++oauthAttemptRef.current;
+      let id = selected.id;
+      const preset = presets.find(p => p.id === id && providerPresetOAuth(p.id));
+      clearGenericDeviceCode();
+      setLoggingIn(true);
+      setXaiDeviceLogin(selected.id === 'xai' && method === 'device');
+      try {
+        let ok = false;
+        if (id === 'openai' || id === 'anthropic' || id === 'xai' || preset) {
+          const brand = id;
+          const native = brand === 'openai' ? 'codex' as const : brand === 'anthropic' ? 'claude' as const : 'xai' as const;
+          id = `${brand}-${crypto.randomUUID().slice(0, 8)}`;
+          const login = { providerId: id, ownerId: crypto.randomUUID() };
+          accountLoginRef.current = login;
+          let created = false;
+          try {
+            await createCustomProvider({ id, name: selected.name, auth: preset ? { method: 'oauth', oauth: providerPresetOAuth(preset.id)! } : { method: 'oauth', native },
+              runtimes: preset ? providerPresetOAuthRuntimes(preset) : brand === 'anthropic'
+                ? { 'claude-code': { baseUrl: 'https://api.anthropic.com', wireProtocol: 'anthropic-messages', models: [] } }
+                : { codex: { baseUrl: brand === 'openai' ? 'https://chatgpt.com/backend-api/codex' : 'https://api.x.ai/v1', wireProtocol: 'openai-responses', models: [] } },
+            }, {});
+            created = true;
+            if (accountLoginRef.current !== login) return;
+            const result = await window.electronAPI.maker.providerOAuthLogin(id, {
+              ownerId: login.ownerId,
+              ...(brand === 'xai' ? { method } : {}),
+            });
+            if (accountLoginRef.current !== login || result.reason === 'login_cancelled') return;
+            // A late success belongs to a cancelled wizard until ownership is checked.
+            // Keep ok false so finally also removes credentials committed before cancellation.
+            ok = result.ok;
+          } finally {
+            if (accountLoginRef.current === login) {
+              accountLoginRef.current = null;
+              clearGenericDeviceCode();
+            }
+            if (created && !ok) await deleteCustomProvider(id);
+          }
+        } else {
+          const ownedLogin = beginGenericOwnedLogin();
+          try {
+            const r = await window.electronAPI.maker.providerOAuthLogin(id, {
+              ownerId: ownedLogin.ownerId,
+            });
+            ok = r.ok;
+            if (!r.ok && r.reason === 'login_cancelled') return;
+          } finally {
+            ownedLogin.finish();
+          }
+        }
+        if (ok && preset) {
+          // Reuse the model picker after login. Credentials stay in Main; only the
+          // discovered, redacted model configuration comes back to the renderer.
+          const snapshot = await window.electronAPI.maker.listProviders();
+          if (oauthAttemptRef.current !== attempt) { await deleteCustomProvider(id); return; }
+          const connected = snapshot.providers.find(p => p.id === id);
+          if (!connected) { await deleteCustomProvider(id); throw new Error('provider_not_found_after_login'); }
+          const config = providerViewToCustomProviderConfig(connected);
+          oauthDraftRef.current = config;
+          const choices: typeof picks = new Map();
+          const recommendedIds = new Set(Object.values(preset.runtimes).flatMap(rt =>
+            rt?.models.filter(m => m.defaultEnabled !== false).map(m => m.id) ?? []));
+          for (const agent of connected.agents) for (const model of connected.models[agent] ?? []) {
+            const recommended = recommendedIds.has(model.id);
+            const existing = choices.get(model.id);
+            choices.set(model.id, { name: model.name, checked: recommended, recommended,
+              agents: [...(existing?.agents ?? []), agent],
+              discoveredMetadata: { ...existing?.discoveredMetadata, [agent]: model.discoveredMetadata },
+              discoveredCosts: { ...existing?.discoveredCosts,
+                [agent]: model.userModelConfig?.discoveredCost ?? model.discoveredCost },
+            });
+          }
+          setSel({ kind: 'preset', preset: { ...preset, runtimes: config.runtimes } });
+          setName(config.name);
+          setPresetBaseUrls(Object.fromEntries(Object.entries(config.runtimes).map(([a, rt]) => [a, rt!.baseUrl])));
+          setPicks(choices);
+          setFetchState({ status: 'done', failed: false, empty: choices.size === 0 });
+          setStep(3);
+          return;
+        }
+        if (ok) {
+          toast.success(
+            t('settings.providers.wizard.authorizedToast', { name: selected.name }),
+          );
+          onDone(id);
+        } else {
+          toast.error(t('settings.providers.wizard.authorizeFailed', { name: selected.name }));
+        }
+      } catch {
+        if (preset && id !== preset.id && !oauthDraftRef.current) await deleteCustomProvider(id).catch(() => undefined);
+        toast.error(t('settings.providers.wizard.authorizeFailed', { name: selected.name }));
+      } finally {
+        // A cancelled account login may settle after a retry or local login has started.
+        if (oauthAttemptRef.current === attempt && !accountLoginRef.current && !localLoginRef.current) {
+          setLoggingIn(false);
+          setXaiDeviceLogin(false);
+        }
+      }
+    },
+    [sel, presets, clearGenericDeviceCode, beginGenericOwnedLogin, onDone, t],
+  );
+
+  /**
+   * 取消进行中的 OAuth(与详情头的行为对称):等待授权期间点按钮 / 关弹窗 / 返回
+   * 都必须能中止 main 侧 login runner,否则浏览器流挂起时用户无法重试。
+   */
+  const cancelAuthorize = useCallback(() => {
+    oauthAttemptRef.current += 1;
+    const localLogin = localLoginRef.current;
+    localLoginRef.current = null;
+    localLogin?.cancel();
+    if (!sel || sel.kind !== 'oauth') return;
+    if (accountLoginRef.current) {
+      const login = accountLoginRef.current;
+      accountLoginRef.current = null;
+      if (login) void window.electronAPI.maker.providerOAuthCancel(login.providerId, { ownerId: login.ownerId, releaseOwner: true });
+    }
+    else cancelGenericOwnedLogin();
+    clearGenericDeviceCode();
+    setLoggingIn(false);
+    setXaiDeviceLogin(false);
+  }, [sel, clearGenericDeviceCode, cancelGenericOwnedLogin]);
+
+  /** 关闭向导:授权等待中先取消再关,不留挂起的 login runner。保存中不能关，避免删掉正在落盘的 OAuth 连接。 */
+  const handleClose = useCallback(() => {
+    if (savingRef.current) return;
+    if (loggingIn) cancelAuthorize();
+    onClose();
+  }, [loggingIn, cancelAuthorize, onClose]);
+
+  // ── 预设:进入 Step 3 时自动拉取模型 ─────────────────────────────────────
+  const startFetch = useCallback(async () => {
+    if (presetsLoadState === 'loading' || !sel || sel.kind !== 'preset') return;
+    const preset = sel.preset;
+    const agents = configuredPresetAgents(preset);
+    const editableBaseUrlsValid = agents.every((agent) => {
+      const rt = preset.runtimes[agent];
+      return (
+        !rt?.baseUrlEditable ||
+        isValidEditablePresetBaseUrl(presetRuntimeBaseUrl(preset, agent, presetBaseUrls), rt.baseUrl)
+      );
+    });
+    if (!editableBaseUrlsValid) return;
+    // Curated presets use omission as their legacy default-on; generated catalog additions
+    // explicitly default off. Keep the checkbox and recommendation badge consistent.
+    const initial = new Map<
+      string,
+      {
+        name: string;
+        checked: boolean;
+        recommended: boolean;
+        speechReference?: boolean;
+        manualSpeech?: boolean;
+        agents: AgentKind[];
+        contextWindows?: Partial<Record<AgentKind, number>>;
+        discoveredCosts?: Partial<Record<AgentKind, import("@cindy/model-providers").ModelCost>>;
+        discoveredMetadata?: Partial<
+          Record<AgentKind, import('@cindy/model-providers').ModelMetadata>
+        >;
+        routes?: Partial<Record<AgentKind, ProviderModelRouteConfig>>;
+        interfaceIds?: Partial<Record<AgentKind, string>>;
+      }
+    >();
+    for (const agent of agents) {
+      for (const m of preset.runtimes[agent]?.models ?? []) {
+        const existing = initial.get(m.id);
+        if (existing) {
+          if (!existing.agents.includes(agent)) existing.agents.push(agent);
+          if (m.defaultEnabled !== false) {
+            existing.checked = true;
+            existing.recommended = true;
+          }
+          if (m.route && !existing.routes?.[agent]) {
+            existing.routes = { ...existing.routes, [agent]: m.route };
+          }
+        } else {
+          initial.set(m.id, {
+            name: m.name,
+            checked: m.defaultEnabled !== false,
+            recommended: m.defaultEnabled !== false,
+            agents: [agent],
+            ...(m.route ? { routes: { [agent]: m.route } } : {}),
+          });
+        }
+      }
+    }
+    for (const agent of agents) {
+      const runtime = preset.runtimes[agent]!;
+      if (runtime.requestPath) continue;
+      const baseUrl = presetRuntimeBaseUrl(preset, agent, presetBaseUrls);
+      for (const model of presetSupplementalModels(preset, agent, modelRegistry, baseUrl)) {
+        const existing = initial.get(model.id);
+        if (existing) {
+          if (!existing.agents.includes(agent)) existing.agents.push(agent);
+        } else {
+          initial.set(model.id, { name: model.name, checked: false, recommended: false, agents: [agent] });
+        }
+        const candidate = initial.get(model.id)!;
+        if (model.route) candidate.routes = { ...candidate.routes, [agent]: model.route };
+        if (model.interfaceId) candidate.interfaceIds = { ...candidate.interfaceIds, [agent]: model.interfaceId };
+      }
+    }
+    // Suggestions add no account membership until the user finishes this wizard.
+    // Scope them to one real API-key runtime, never the device-code draft.
+    const speechTarget = !oauthDraftRef.current && speechSetupTarget(Object.fromEntries(
+      agents.map(agent => [agent, { ...preset.runtimes[agent]!, baseUrl: presetRuntimeBaseUrl(preset, agent, presetBaseUrls) }]),
+    ));
+    if (speechTarget) {
+      if (entry?.kind === 'preset' && entry.speechOnly) {
+        for (const value of initial.values()) value.checked = false;
+      }
+      for (const model of speechReferenceModels(presetRuntimeBaseUrl(preset, speechTarget.agent, presetBaseUrls))) {
+        if (initial.has(model.id)) continue;
+        initial.set(model.id, { name: model.name, checked: model.defaultEnabled !== false,
+          recommended: model.defaultEnabled !== false, agents: [speechTarget.agent], speechReference: true });
+      }
+    }
+    if (detected) {
+      const selectedIds = new Set(agents.flatMap(agent => detected.config.runtimes[agent]?.models.map(m => m.id) ?? []));
+      for (const [id, value] of initial) initial.set(id, { ...value, checked: selectedIds.has(id), recommended: false });
+      for (const agent of agents) for (const m of detected.config.runtimes[agent]?.models ?? []) {
+        const existing = initial.get(m.id);
+        initial.set(m.id, { ...existing, name: m.name, checked: true, recommended: false,
+          agents: [...new Set([...(existing?.agents ?? []), agent])],
+          discoveredMetadata: { ...existing?.discoveredMetadata, [agent]: m.discoveredMetadata },
+          ...(m.route ? { routes: { ...existing?.routes, [agent]: m.route } } : {}),
+        });
+      }
+    }
+    setPicks(previous => detected && previous.size ? previous : initial);
+    setStep(3);
+    setFetchState({ status: 'fetching' });
+    const seq = ++fetchSeqRef.current;
+    // 并行拉取**每个已配置 runtime** 的列模型端点:双 runtime 预设两端各自发现,
+    // 返回结果按「实际返回它的端点」归属合并——某模型两端都返回则归属两端。
+    // 同一个 modelsUrl 被多个 runtime 共用、但预设模型集合不同，说明该端点返回的是
+    // 跨协议总目录（OpenCode Go 即如此），响应本身无法判定模型属于 Messages 还是 Chat。
+    // 这类端点只能用于确认预设已有模型，不能扩大其 agent 归属或加入无法分类的新模型。
+    const discoveryAgentsByUrl = new Map<string, AgentKind[]>();
+    for (const agent of agents) {
+      const modelsUrl = preset.runtimes[agent]?.modelsUrl;
+      if (!modelsUrl) continue;
+      discoveryAgentsByUrl.set(modelsUrl, [...(discoveryAgentsByUrl.get(modelsUrl) ?? []), agent]);
+    }
+    const splitDiscoveryUrls = new Set(
+      [...discoveryAgentsByUrl.entries()]
+        .filter(([, owners]) => {
+          if (owners.length < 2) return false;
+          const modelSets = new Set(
+            owners.map((agent) =>
+              (preset.runtimes[agent]?.models ?? [])
+                .map((model) => model.id)
+                .sort()
+                .join('\u0000'),
+            ),
+          );
+          return modelSets.size > 1;
+        })
+        .map(([modelsUrl]) => modelsUrl),
+    );
+    const sharedProtocolUrls = new Set([...discoveryAgentsByUrl.entries()]
+      .filter(([, owners]) => new Set(owners.map(agent => presetCandidateRoute(preset, agent).wireProtocol)).size > 1)
+      .map(([url]) => url));
+    const results = await Promise.all(
+      agents.flatMap((agent) => {
+        const originalRuntime = preset.runtimes[agent];
+        const rt = originalRuntime ? bindProviderPresetRuntime(originalRuntime, presetRuntimeBaseUrl(preset, agent, presetBaseUrls)) : undefined;
+        if (!rt) {
+          return [];
+        }
+        const runtimeBaseUrl = presetRuntimeBaseUrl(preset, agent, presetBaseUrls);
+        const sources: {
+          baseUrl: string;
+          modelsUrl: string | null;
+          wireProtocol?: ProviderModelRouteConfig['wireProtocol'];
+          route?: ProviderModelRouteConfig;
+        }[] = [
+          {
+            baseUrl: runtimeBaseUrl,
+            modelsUrl: rt.modelsUrl ?? null,
+            ...(rt.wireProtocol ? { wireProtocol: rt.wireProtocol } : {}),
+          },
+          ...(rt.modelDiscovery ?? [])
+            .filter((source) => isDiscoverySourceValidForRuntime(agent, runtimeBaseUrl, source))
+            .map((source) => ({
+              baseUrl: source.baseUrl,
+              modelsUrl: source.modelsUrl ?? null,
+              wireProtocol: source.wireProtocol,
+              route: {
+                baseUrl: source.baseUrl,
+                wireProtocol: source.wireProtocol,
+                ...(source.requestPath ? { requestPath: source.requestPath } : {}),
+              },
+            })),
+        ];
+        return sources.map(async (source) => {
+          try {
+            const reuseDetection = detected?.catalog?.ok && agent === detected.agent
+              && apiKey === detected.apiKey && source.baseUrl === detected.preset.runtimes[agent]?.baseUrl
+              && !source.route && !source.modelsUrl?.includes('client_version=');
+            const r = reuseDetection ? detected!.catalog! : await window.electronAPI.maker.fetchProviderModels({
+              ...(detected ? { redirect: 'error' as const } : {}),
+              agent,
+              baseUrl: source.baseUrl,
+              authMethod: preset.authMethod ?? 'apiKey',
+              modelsUrl: source.modelsUrl,
+              apiKey: apiKey.trim() || null,
+              ...(source.wireProtocol ? { wireProtocol: source.wireProtocol } : {}),
+              ...(rt.headers ? { headers: rt.headers } : {}),
+            });
+            return {
+              agent,
+              modelsUrl: source.modelsUrl,
+              completeInventory: /^https:\/\/openrouter\.ai\/api(?:\/v1)?\/?$/.test(source.baseUrl)
+                && (!source.modelsUrl || isOpenRouterModelsUrl(source.modelsUrl)),
+              route: source.route,
+              ok: !!(r.ok && r.models),
+              models: r.models ?? [],
+            };
+          } catch {
+            return {
+              agent,
+              modelsUrl: source.modelsUrl,
+              completeInventory: false,
+              route: source.route,
+              ok: false,
+              models: [] as import('@cindy/model-providers').DiscoveredModel[],
+            };
+          }
+        });
+      }),
+    );
+    // A shared endpoint has one inventory, regardless of the consuming harness.
+    // Reuse a successful sibling read if an identical request failed transiently.
+    for (const result of results) {
+      if (result.ok || result.route) continue;
+      const runtime = preset.runtimes[result.agent];
+      const sibling = results.find(other => other.ok && !other.route && other.modelsUrl === result.modelsUrl
+        && presetRuntimeBaseUrl(preset, other.agent, presetBaseUrls) === presetRuntimeBaseUrl(preset, result.agent, presetBaseUrls)
+        && preset.runtimes[other.agent]?.wireProtocol === runtime?.wireProtocol
+        && JSON.stringify(preset.runtimes[other.agent]?.headers ?? {}) === JSON.stringify(runtime?.headers ?? {}));
+      if (sibling) { result.models = sibling.models; result.ok = true; }
+    }
+    // 过期响应丢弃:用户已返回 / 换选了其它供应商,旧结果不得合入当前清单。
+    if (seq !== fetchSeqRef.current) return;
+    const defaultDiscoveredModels = new Set(
+      results
+        .filter((result) => !result.route)
+        .flatMap((result) => result.models.map((model) => `${result.agent}\u0000${model.id}`)),
+    );
+    setPicks((prev) => {
+      const next = new Map(prev);
+      // A successful complete catalog supersedes offline membership, including stale presets.
+      // Failed requests and providers with partial/per-protocol inventories retain their fallback.
+      const complete = results.filter(result => result.ok && result.completeInventory);
+      if (complete.length === results.length && results.length === agents.length) {
+        const available = new Set(complete.flatMap(result => result.models.map(model => model.id)));
+        const userModels = new Set(Object.values(detected?.config.runtimes ?? {}).flatMap(runtime => runtime?.models.map(model => model.id) ?? []));
+        for (const [id] of next) if (!available.has(id) && !userModels.has(id)) next.delete(id);
+      }
+      const confirmedRoutes = new Set<string>();
+      for (const { agent, models, modelsUrl, route } of results) {
+        const preservePresetOwnership = !!modelsUrl && splitDiscoveryUrls.has(modelsUrl);
+        const runtimeRoute = presetCandidateRoute(preset, agent, presetRuntimeBaseUrl(preset, agent, presetBaseUrls));
+        const hasInterfaceProfiles = presetRouteHasInterfaceProfiles(preset, modelRegistry, runtimeRoute);
+        for (const m of models) {
+          const existing = next.get(m.id);
+          const candidate = presetModelCandidate(preset, agent, m, modelRegistry,
+            runtimeRoute,
+            route, preservePresetOwnership || (!!hasInterfaceProfiles && !!modelsUrl && sharedProtocolUrls.has(modelsUrl)));
+          if (!candidate && !existing?.agents.includes(agent)) continue;
+          if (existing) {
+            const mergedAgents =
+              candidate && !existing.agents.includes(agent)
+                ? [...existing.agents, agent]
+                : existing.agents;
+            // 端点上报的窗口按 agent 分槽、只补该槽的空(同一 id 双端窗口可以不同,
+            // 不能共享一个值;预设推荐模型的窗口在完成创建时以预设为准,这里补的是
+            // 「预设没写窗口」的兜底)。
+            const backfillWindow =
+              existing.contextWindows?.[agent] === undefined && m.contextWindow !== undefined;
+            const presetOwnsModel =
+              preset.runtimes[agent]?.models.some((model) => model.id === m.id) === true;
+            const discoveryKey = `${agent}\u0000${m.id}`;
+            const configuredRoute = detected?.config.runtimes[agent]?.models.find(model => model.id === m.id)?.route;
+            // A confirmed online route replaces an offline suggestion, while
+            // imported routes, main-source hits and earlier sources keep priority.
+            const updateRouting = !!candidate && !presetOwnsModel && !configuredRoute
+              && !confirmedRoutes.has(discoveryKey)
+              && (!route || !defaultDiscoveredModels.has(discoveryKey));
+            if (updateRouting) confirmedRoutes.add(discoveryKey);
+            if (
+              mergedAgents !== existing.agents ||
+              backfillWindow ||
+              updateRouting ||
+              existing.name !== m.name ||
+              m.discoveredCost ||
+              m.discoveredMetadata || existing.speechReference
+            ) {
+              next.set(m.id, {
+                ...existing,
+                speechReference: false,
+                // An explicit non-speech response revokes an offline TTS suggestion.
+                ...(existing.speechReference && m.discoveredMetadata?.mode && m.discoveredMetadata.mode !== 'audio_speech'
+                  ? { checked: false, recommended: false } : {}),
+                name: m.name,
+                ...(m.discoveredCost ? { discoveredCosts: { ...existing.discoveredCosts, [agent]: m.discoveredCost } } : {}),
+                agents: mergedAgents,
+                discoveredMetadata: {
+                  ...existing.discoveredMetadata,
+                  [agent]: m.discoveredMetadata ?? {
+                    name: m.name,
+                    ...(m.contextWindow !== undefined ? { contextWindow: m.contextWindow } : {}),
+                  },
+                },
+                ...(backfillWindow
+                  ? { contextWindows: { ...existing.contextWindows, [agent]: m.contextWindow } }
+                  : {}),
+                ...(updateRouting ? {
+                  routes: { ...existing.routes, [agent]: candidate?.route },
+                  interfaceIds: { ...existing.interfaceIds, [agent]: candidate?.interfaceId },
+                } : {}),
+              });
+            }
+          } else {
+            confirmedRoutes.add(`${agent}\u0000${m.id}`);
+            next.set(m.id, {
+              name: m.name,
+              ...(m.discoveredCost ? { discoveredCosts: { [agent]: m.discoveredCost } } : {}),
+              checked: false,
+              recommended: false,
+              agents: [agent],
+              discoveredMetadata: {
+                [agent]: m.discoveredMetadata ?? {
+                  name: m.name,
+                  ...(m.contextWindow !== undefined ? { contextWindow: m.contextWindow } : {}),
+                },
+              },
+              ...(m.contextWindow !== undefined
+                ? { contextWindows: { [agent]: m.contextWindow } }
+                : {}),
+              ...(candidate?.route ? { routes: { [agent]: candidate.route } } : {}),
+              ...(candidate?.interfaceId ? { interfaceIds: { [agent]: candidate.interfaceId } } : {}),
+            });
+          }
+        }
+      }
+      return next;
+    });
+    // 全部端点都失败才算失败(单端失败仍可按另一端 + 预设推荐完成)。
+    setFetchState({
+      status: 'done',
+      failed: !results.some((r) => r.ok),
+      empty: !results.some((r) => r.models.length > 0),
+    });
+  }, [sel, apiKey, presetBaseUrls, detected, entry, modelRegistry, presetsLoadState]);
+
+  /**
+   * 零推荐模型的本机代理（例如 LiteLLM）若 `/models` 不可用或返回空清单，仍允许用户
+   * 按 runtime 手填真实模型 ID。归属必须精确到当前 agent，不能把一个 ID 猜测性复制到
+   * 双 runtime；同一 ID 分别加入两端时才合并归属。
+   */
+  const addManualModel = useCallback(
+    (agent: AgentKind) => {
+      if (!sel || sel.kind !== 'preset' || !sel.preset.runtimes[agent]) return;
+      const id = manualModelIds[agent]?.trim() ?? '';
+      if (!id) return;
+      setPicks((prev) => {
+        const next = new Map(prev);
+        const existing = next.get(id);
+        next.set(
+          id,
+          existing
+            ? {
+                ...existing,
+                checked: true,
+                agents: existing.agents.includes(agent)
+                  ? existing.agents
+                  : [...existing.agents, agent],
+              }
+            : {
+                name: id,
+                checked: true,
+                recommended: false,
+                agents: [agent],
+              },
+        );
+        return next;
+      });
+      setManualModelIds((prev) => ({ ...prev, [agent]: '' }));
+    },
+    [sel, manualModelIds],
+  );
+
+  // ── 完成创建(预设)────────────────────────────────────────────────────
+  /**
+   * 内置 API-key 供应商(如 Gemini):保存 = 把 key 写进该供应商在册的 safeStorage 键
+   * (providerSecrets SSoT),连接态(provider-service 的 builtinApiKeyConnected)与
+   * 图像通道 ready 都以「key 已存」为准 —— 无自定义供应商落库、无模型拉取步。
+   */
+  const handleSaveBuiltinApiKey = useCallback(async () => {
+    if (savingRef.current || !sel || sel.kind !== 'builtinApiKey') return;
+    const id = sel.provider.id;
+    if (!isBuiltinApiKeyProviderId(id)) {
+      // 目录出现了未在 providerSecrets 登记的内置 API-key 供应商 = 数据/代码脱节,
+      // 明确报错让问题在配置期暴露,不静默写错键。
+      toast.error(t('settings.providers.wizard.authorizeFailed', { name: sel.provider.name }));
+      return;
+    }
+    const key = apiKey.trim();
+    if (!key) return;
+    savingRef.current = true;
+    setSaving(true);
+    try {
+      // 失败经统一 IPC 错误协议抛出(throwIpcError),这里 catch 即失败。
+      await window.electronAPI.builtinApiKeyStore(id, key);
+      toast.success(t('settings.providers.wizard.authorizedToast', { name: sel.provider.name }));
+      onDone(id);
+    } catch {
+      toast.error(t('settings.providers.wizard.authorizeFailed', { name: sel.provider.name }));
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
+    }
+  }, [sel, apiKey, onDone, t]);
+
+  const handleFinish = useCallback(async () => {
+    if (!sel || sel.kind !== 'preset') return;
+    const preset = sel.preset;
+    const selected = [...picks.entries()]
+      .filter(([, value]) => !value.speechReference || value.checked)
+      .map(([id, v]) => ({
+        id,
+        checked: v.checked,
+        name: v.name,
+        agents: v.agents,
+        contextWindows: v.contextWindows,
+        discoveredMetadata: v.discoveredMetadata,
+        discoveredCosts: v.discoveredCosts,
+        routes: v.routes,
+        interfaceIds: v.interfaceIds,
+        manualSpeech: v.manualSpeech,
+      }));
+    if (!selected.some(model => model.checked)) {
+      toast.error(t('settings.providers.wizard.noModelSelected'));
+      return;
+    }
+    const oauthDraft = oauthDraftRef.current;
+    oauthDraftRef.current = null;
+    savingRef.current = true;
+    setSaving(true);
+    try {
+      const existing = new Set(providers.map((p) => p.id));
+      const id = oauthDraft?.id ?? (
+        preset.id === 'lmstudio' && !detected
+          ? MANAGED_LMSTUDIO_PROVIDER_ID
+          : uniqueCustomProviderId(
+              name.trim() || presetDisplayName(preset, i18n.language),
+              existing,
+            ));
+      if (!detected && preset.id === 'lmstudio' && existing.has(MANAGED_LMSTUDIO_PROVIDER_ID)) {
+        onDone(MANAGED_LMSTUDIO_PROVIDER_ID);
+        return;
+      }
+      const runtimes: CustomProviderConfig['runtimes'] = { ...detected?.config.runtimes };
+      const keys: RuntimeKeys = { ...detected?.keys };
+      for (const agent of configuredPresetAgents(preset)) {
+        const originalRuntime = preset.runtimes[agent];
+        const rt = originalRuntime ? bindProviderPresetRuntime(originalRuntime, presetRuntimeBaseUrl(preset, agent, presetBaseUrls)) : undefined;
+        if (!rt) continue;
+        // 保存该 runtime 的完整目录；勾选控制默认开启，不删除未勾选项。
+        // 独立端点的模型归属仍分开，不能跨端点复制型号。
+        const agentModels = selected
+          .filter((m) => m.agents.includes(agent))
+          .map((m) => {
+            const presetModel = rt.models.find((candidate) => candidate.id === m.id);
+            // Only interface facts belong to discovery. Preset defaults follow a live reference.
+            const discoveredMetadata = m.discoveredMetadata?.[agent] ?? {};
+            // Current picks own visibility; an old disabled draft must not override
+            // a checked row. Leave checked models on the existing default contract.
+            const { defaultEnabled: _oldEnabled, ...draftModel }: Partial<ProviderRuntimeModelConfig> =
+              detected?.config.runtimes[agent]?.models.find(model => model.id === m.id) ?? {};
+            return {
+              ...draftModel,
+              // An automatic catalog pin must not override an explicit draft API or route.
+              ...(!draftModel.interfaceId && !draftModel.api && !draftModel.piApi && !draftModel.route
+                && m.interfaceIds?.[agent] ? { interfaceId: m.interfaceIds[agent] } : {}),
+              id: m.id,
+              name: m.name,
+              // Selecting a model follows native-engine defaults; it is not an
+              // explicit opt-in to every compatibility engine carrying the model.
+              ...(!m.checked ? { defaultEnabled: false } : {}),
+              discoveredMetadata,
+              ...(m.discoveredCosts?.[agent] ? { discoveredCost: m.discoveredCosts[agent] } : {}),
+              ...(m.manualSpeech ? { mode: 'audio_speech' as const } : presetModel?.mode ? { mode: presetModel.mode } : {}),
+              ...(presetModel?.modalities ? { modalities: { input: [...presetModel.modalities.input], output: [...presetModel.modalities.output] } } : {}),
+              ...(presetModel?.officialDocs ? { officialDocs: presetModel.officialDocs } : {}),
+              // Known models follow the maintained preset after refresh. Only
+              // independently discovered routes need a saved routing snapshot.
+              ...(!presetModel && m.routes?.[agent]
+                ? { route: m.routes[agent] }
+                : {}),
+            };
+          });
+        if (agentModels.length === 0) continue;
+        runtimes[agent] = {
+          ...presetConnectionRuntime(preset, agent, agentModels, rt.baseUrl),
+          ...(detected?.config.runtimes[agent]?.imageApi ? { imageApi: detected.config.runtimes[agent]!.imageApi } : {}),
+          ...(detected?.config.runtimes[agent]?.videoApi ? { videoApi: detected.config.runtimes[agent]!.videoApi } : {}),
+          ...(rt.modelsUrl ? { modelsUrl: rt.modelsUrl } : {}),
+        };
+        if (detected) runtimes[agent]!.models = runtimes[agent]!.models.map(model => {
+          const original = detected.config.runtimes[agent]?.models.find(m => m.id === model.id);
+          if (!original) return model;
+          // These are user fields from the custom draft, not imported preset defaults.
+          const { defaultEnabled: _enabled, discoveredMetadata: _metadata, discoveredCost: _cost, ...explicit } = original;
+          const preserved = { ...model, ...explicit };
+          return rt.baseUrl === detected.preset.runtimes[agent]?.baseUrl ? preserved
+            : modelsAfterProviderEndpointEdit([preserved], detected.config.runtimes[agent]?.baseUrl, rt.baseUrl)[0];
+        });
+        if (preset.authMethod !== 'none') {
+          const k = apiKey.trim();
+          if (k) keys[agent] = k;
+        }
+      }
+      if (Object.keys(runtimes).length === 0) {
+        toast.error(t('settings.providers.wizard.noModelSelected'));
+        if (oauthDraft) oauthDraftRef.current = oauthDraft;
+        return;
+      }
+      await (oauthDraft ? updateCustomProvider : createCustomProvider)(
+        {
+          ...(oauthDraft ?? {}),
+          id,
+          name: name.trim() || presetDisplayName(preset, i18n.language),
+          ...(preset.authMethod === 'none' ? { auth: { method: 'none' as const } } : {}),
+          runtimes,
+        },
+        keys,
+      );
+      toast.success(
+        t('settings.providers.wizard.createdToast', {
+          name: name.trim() || presetDisplayName(preset, i18n.language),
+        }),
+      );
+      onDone(id);
+    } catch {
+      if (oauthDraft) oauthDraftRef.current = oauthDraft;
+      toast.error(t('settings.providers.wizard.createFailed'));
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
+    }
+  }, [sel, picks, name, apiKey, presetBaseUrls, providers, onDone, t, i18n.language, detected]);
+
+  // ── 步骤指示 ─────────────────────────────────────────────────────────
+  // 目录步默认按完整路径显示三步(选择供应商 → 连接 → 选择模型);选中真的
+  // 没有第 3 步的两步流程(OAuth 授权即完成、内置 API Key 保存即连接)才收成
+  // 两步。未选择时就显示两步会让「选择模型」凭空消失/出现(2026-07-30 用户反馈)。
+  const totalSteps = sel == null || sel.kind === 'preset' || (sel.kind === 'oauth' && providerPresetOAuth(sel.provider.id)) ? 3 : 2;
+  const stepLabels = [
+    t('settings.providers.wizard.stepPick'),
+    t('settings.providers.wizard.stepConnect'),
+    ...(totalSteps === 3 ? [t('settings.providers.wizard.stepModels')] : []),
+  ];
+
+  // 预设单 runtime 时的「仅支持 X」说明(数据驱动的静态灰,见文件头注释)。
+  const presetAgents = sel?.kind === 'preset' ? configuredPresetAgents(sel.preset) : [];
+  const presetSingleAgentNote =
+    sel?.kind === 'preset' && presetAgents.length === 1 && sel.preset.id !== 'elevenlabs-api'
+      ? t('settings.providers.wizard.onlyAgentNote', { agent: AGENT_LABEL[presetAgents[0]] })
+      : null;
+  const oauthSingleAgentNote =
+    sel?.kind === 'oauth' && sel.provider.agents.length === 1
+      ? t('settings.providers.wizard.onlyAgentNote', {
+          agent: AGENT_LABEL[sel.provider.agents[0]],
+        })
+      : null;
+
+  const speechTarget = sel?.kind === 'preset' && !oauthDraftRef.current
+    ? speechSetupTarget(Object.fromEntries(presetAgents.map(agent => [agent, {
+        ...sel.preset.runtimes[agent]!, baseUrl: presetRuntimeBaseUrl(sel.preset, agent, presetBaseUrls),
+      }]))) : undefined;
+  const speechPicks = [...picks.entries()].filter(([id, value]) => value.manualSpeech || value.agents.some(agent =>
+    isSpeechModel({ id, discoveredMetadata: value.discoveredMetadata?.[agent], mode: sel?.kind === 'preset' ? sel.preset.runtimes[agent]?.models.find(model => model.id === id)?.mode : undefined })));
+  const speechIds = new Set(speechPicks.map(([id]) => id));
+  const generalPicks = [...picks.entries()].filter(([id]) => !speechIds.has(id));
+  const togglePick = (id: string) => setPicks(previous => {
+    const next = new Map(previous); const value = next.get(id);
+    if (value) next.set(id, { ...value, checked: !value.checked });
+    return next;
+  });
+  const checkedCount = [...picks.values()].filter((v) => v.checked).length;
+  const presetHasRecommendedModels =
+    sel?.kind === 'preset' &&
+    presetAgents.some((agent) => (sel.preset.runtimes[agent]?.models.length ?? 0) > 0);
+  const showManualModelFallback =
+    sel?.kind === 'preset' &&
+    fetchState.status === 'done' &&
+    (fetchState.failed || fetchState.empty) &&
+    !presetHasRecommendedModels &&
+    !(entry?.kind === 'preset' && entry.speechOnly) &&
+    speechTarget?.service !== 'elevenlabs';
+  const presetNeedsApiKey = sel?.kind === 'preset' && sel.preset.authMethod !== 'none';
+  const presetBaseUrlsValid =
+    sel?.kind === 'preset' &&
+    presetAgents.every((agent) => {
+      const runtime = sel.preset.runtimes[agent];
+      if (!runtime) return false;
+      const value = presetRuntimeBaseUrl(sel.preset, agent, presetBaseUrls);
+      if (sel.preset.authMethod === 'none') {
+        return (
+          isLoopbackProviderUrl(value) &&
+          (!runtime.modelsUrl?.trim() || isLoopbackProviderUrl(runtime.modelsUrl.trim()))
+        );
+      }
+      return !runtime.baseUrlEditable || isValidEditablePresetBaseUrl(value, runtime.baseUrl);
+    });
+  const presetCanContinue =
+    sel?.kind === 'preset' &&
+    presetsLoadState !== 'loading' &&
+    presetBaseUrlsValid &&
+    (!presetNeedsApiKey || apiKey.trim().length > 0 || (detected?.catalog?.ok === true && apiKey === detected.apiKey
+      && presetRuntimeBaseUrl(sel.preset, detected.agent, presetBaseUrls) === detected.preset.runtimes[detected.agent]?.baseUrl));
+
+  // The existing Radix dialog owns focus; refocus once the asynchronous search target is ready.
+  const searchTargetFocused = useRef(false);
+  useEffect(() => {
+    if (!onEntryUnavailable || step !== 2 || searchTargetFocused.current) return;
+    const frame = requestAnimationFrame(() => {
+      const target = panelRef.current?.querySelector<HTMLElement>('input:not([disabled]), button:not([disabled])');
+      if (target) { target.focus(); searchTargetFocused.current = true; }
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [onEntryUnavailable, step]);
+
+  const wizardTitle = sel
+              ? t('settings.providers.wizard.titleWith', {
+                  name:
+                    sel.kind === 'preset'
+                      ? presetDisplayName(sel.preset, i18n.language)
+                      : sel.kind === 'ollama-onboarding'
+                        ? t('settings.providers.local.title')
+                        : sel.provider.name,
+                })
+              : t('settings.providers.wizard.title');
+
+  return (
+    <Dialog.Root open={dialog.open} onOpenChange={(open) => { if (!open) handleClose(); }}>
+      <Dialog.Portal>
+        <Dialog.Overlay className="modal-scrim fixed inset-0 z-[10000]" style={WINDOW_DRAG_STYLE} />
+      <Dialog.Content
+        ref={panelRef}
+        aria-describedby={undefined}
+        onPointerDownOutside={(event) => event.preventDefault()}
+        onOpenAutoFocus={(event) => {
+          dialog.onOpenAutoFocus();
+          event.preventDefault();
+          const input = panelRef.current?.querySelector<HTMLElement>('input:not([disabled]), textarea:not([disabled])');
+          (input ?? panelRef.current?.querySelector<HTMLElement>('button:not([disabled])'))?.focus();
+        }}
+        onCloseAutoFocus={dialog.onCloseAutoFocus}
+        onEscapeKeyDown={(event) => {
+          if (savingRef.current || event.isComposing || event.keyCode === 229) event.preventDefault();
+        }}
+        style={WINDOW_NO_DRAG_STYLE}
+        className="modal-panel fixed inset-0 z-[10000] m-auto flex h-fit max-h-[min(640px,85vh)] w-[min(600px,calc(100vw-32px))] flex-col overflow-hidden outline-none"
+      >
+        {/* 头部:标题居左 + 步骤指示居右,同一行(2026-07 定稿原型形态)。 */}
+        <div className="flex items-center justify-between gap-4 px-4 pb-3 pt-4">
+          <Dialog.Title asChild><h3
+            className="min-w-0 break-words text-16 font-medium"
+            title={wizardTitle}
+            style={{ color: 'var(--settings-section-title)' }}
+          >
+            {wizardTitle}
+          </h3></Dialog.Title>
+          {step === 1 ? (
+            <button
+              type="button"
+              disabled={saving}
+              onClick={() => { if (!savingRef.current) onOpenCustomForm(); }}
+              className="min-h-6 shrink-0 rounded-full py-1 text-11 font-medium text-[var(--accent-emphasis)] underline underline-offset-4 transition-colors hover:text-[var(--text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)]"
+            >
+              {t('settings.providers.wizard.customAction')}
+            </button>
+          ) : (
+          <div className="flex shrink-0 items-center gap-4">
+            {stepLabels.map((label, i) => {
+              const n = i + 1;
+              const isCur = n === step || (n === totalSteps && step > totalSteps);
+              const isDone = n < step;
+              return (
+                <span
+                  key={label}
+                  className="flex items-center gap-1.5 text-12"
+                  style={{
+                    color: isCur ? 'var(--settings-section-title)' : 'var(--text-tertiary)',
+                  }}
+                >
+                  <span
+                    className="flex h-[18px] w-[18px] items-center justify-center rounded-full border text-10 font-medium"
+                    style={
+                      isCur
+                        ? {
+                            backgroundColor: 'var(--accent-cta-bg)',
+                            color: 'var(--surface-on-card)',
+                            borderColor: 'var(--accent-cta-bg)',
+                          }
+                        : isDone
+                          ? {
+                              backgroundColor: 'var(--surface-chip)',
+                              borderColor: 'var(--surface-chip)',
+                              color: 'var(--text-secondary)',
+                            }
+                          : { borderColor: 'var(--border-default)' }
+                    }
+                  >
+                    {isDone ? <Check size={10} /> : n}
+                  </span>
+                  <span className={cn(isCur && 'font-medium')}>{label}</span>
+                </span>
+              );
+            })}
+          </div>
+          )}
+        </div>
+
+        {/* 主体。第 1 步是固定搜索与限高滚动目录，入口放在头部；
+            滚动区上下保留 1px Board 细线;
+            第 2/3 步保持整体滚动的表单区。 */}
+        <div
+          className={cn(
+            'min-h-[320px] flex-1',
+            step === 1
+              ? 'flex min-h-0 flex-col overflow-hidden'
+              : 'overflow-y-auto border-y px-4 py-4',
+          )}
+          style={{ borderColor: 'var(--border-default)' }}
+        >
+          {step === 1 && (
+            <>
+              <div className="px-4 pb-3">
+                <div className="relative">
+                  <SettingsTextInput
+                    surface="ivory"
+                    value={query}
+                    onChange={setQuery}
+                    ariaLabel={t('settings.providers.wizard.searchPlaceholder')}
+                    placeholder={t('settings.providers.wizard.searchPlaceholder')}
+                    inputClassName="pl-9"
+                  />
+                  <Search
+                    size={14}
+                    aria-hidden="true"
+                    className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 text-[var(--text-tertiary)]"
+                  />
+                </div>
+              </div>
+
+              {/* 目录:单列列表(2026-07 定稿,替代三列卡片宫格),唯一的滚动区。 */}
+              <div
+                className="min-h-0 flex-1 overflow-y-auto border-y px-2 pb-2"
+                style={{ borderColor: 'var(--border-default)' }}
+              >
+                {!q && recommendations.length > 0 && (
+                  <>
+                    <GroupLabel>{t('settings.providers.wizard.groupRecommend')}</GroupLabel>
+                    {recommendations.map((item) => {
+                      if (item.kind === 'ollama') {
+                        return (
+                          <ProviderRow
+                            key="ollama"
+                            icon={cardIcon({ providerId: 'ollama', name: 'Ollama' })}
+                            name={t('settings.providers.local.title')}
+                            meta={t(`settings.providers.wizard.recommendReason.${item.reason}`)}
+                            beta
+                            onClick={() => void connectOllama()}
+                          />
+                        );
+                      }
+                      const provider = oauthChoices.find((choice) => choice.id === item.providerId);
+                      if (!provider) return null;
+                      const reasonMeta =
+                        item.reason === 'subscription'
+                          ? t('settings.providers.wizard.recommendReason.subscription')
+                          : t(
+                              item.reason === 'cli-logged-in'
+                                ? 'settings.providers.detect.hintLoggedIn'
+                                : 'settings.providers.detect.hintInstalled',
+                              { cli: localCliDisplayName(item.cli) },
+                            );
+                      return (
+                        <ProviderRow
+                          key={provider.id}
+                          icon={cardIcon({
+                            providerId: provider.id,
+                            name: provider.name,
+                          })}
+                          name={provider.name}
+                          meta={reasonMeta}
+                          onClick={() => pickOauth(provider)}
+                        />
+                      );
+                    })}
+                  </>
+                )}
+                {!q && detectedLocalPresets.length > 0 && (
+                  <>
+                    <GroupLabel>{t('settings.providers.wizard.groupDetectedLocal')}</GroupLabel>
+                    {detectedLocalPresets.map((p) => (
+                      <ProviderRow
+                        key={p.id}
+                        icon={cardIcon({
+                          providerId: p.id,
+                          name: presetDisplayName(p, i18n.language),
+                        })}
+                        name={presetDisplayName(p, i18n.language)}
+                        meta={t('settings.providers.wizard.metaLocalConnect')}
+                        beta={isLocalRuntimeBetaProviderId(p.id)}
+                        onClick={() => pickPreset(p)}
+                      />
+                    ))}
+                  </>
+                )}
+                {listedOauth.length > 0 && (
+                  <>
+                    <GroupLabel>{t('settings.providers.wizard.groupSubscription')}</GroupLabel>
+                    {listedOauth.map((p) => (
+                      <ProviderRow
+                        key={p.id}
+                        icon={cardIcon({ providerId: p.id, name: p.name })}
+                        name={p.name}
+                        meta={t(`settings.providers.${builtinChoiceMeta(p, !!OFFICIAL_API_PRESETS[p.id])}`)}
+                        onClick={() => pickOauth(p)}
+                      />
+                    ))}
+                  </>
+                )}
+
+                {(filteredPresets.length > 0 ||
+                  builtinApiKeyChoices.length > 0 ||
+                  showOllamaInList || showLlamaCppInList) && (
+                  <>
+                    <GroupLabel>{t('settings.providers.wizard.groupApiKey')}</GroupLabel>
+                    {showOllamaInList && (
+                      <ProviderRow
+                        icon={cardIcon({ providerId: 'ollama', name: 'Ollama' })}
+                        name={t('settings.providers.local.title')}
+                        meta={t('settings.providers.local.subtitle')}
+                        beta
+                        onClick={() => void connectOllama()}
+                      />
+                    )}
+                {showLlamaCppInList && (
+                  <ProviderRow
+                    icon={cardIcon({ providerId: 'llamacpp', name: 'llama.cpp' })}
+                    name={t('settings.providers.llamacpp.title')}
+                    meta={t('settings.providers.llamacpp.subtitle')}
+                    beta
+                    busy={saving}
+                    onClick={() => void connectLlamaCpp()}
+                  />
+                )}
+                    {builtinApiKeyChoices
+                      .filter((p) => !q || p.name.toLowerCase().includes(q))
+                      .map((p) => (
+                        <ProviderRow
+                          key={p.id}
+                          icon={cardIcon({ providerId: p.id, name: p.name })}
+                          name={p.name}
+                          meta={t('settings.providers.wizard.metaApiKey')}
+                          onClick={() => pickBuiltinApiKey(p)}
+                        />
+                      ))}
+                    {filteredPresets.map((p) => {
+                      const meta = presetChoiceMeta(p);
+                      return (
+                        <ProviderRow
+                          key={p.id}
+                          icon={cardIcon({
+                            providerId: p.id,
+                            name: presetDisplayName(p, i18n.language),
+                          })}
+                          name={presetDisplayName(p, i18n.language)}
+                          meta={t(`settings.providers.${meta.metaKey}`, meta.metaValues)}
+                          beta={isLocalRuntimeBetaProviderId(p.id)}
+                          onClick={() => pickPreset(p)}
+                        />
+                      );
+                    })}
+                  </>
+                )}
+                {listedLocalPresets.length > 0 && (
+                  <>
+                    <GroupLabel>{t('settings.providers.wizard.moreLocal')}</GroupLabel>
+                    {listedLocalPresets.map((p) => {
+                      const meta = presetChoiceMeta(p);
+                      return (
+                        <ProviderRow
+                          key={p.id}
+                          icon={cardIcon({
+                            providerId: p.id,
+                            name: presetDisplayName(p, i18n.language),
+                          })}
+                          name={presetDisplayName(p, i18n.language)}
+                          meta={t(`settings.providers.${meta.metaKey}`, meta.metaValues)}
+                          beta={isLocalRuntimeBetaProviderId(p.id)}
+                          onClick={() => pickPreset(p)}
+                        />
+                      );
+                    })}
+                  </>
+                )}
+              </div>
+
+            </>
+          )}
+
+          {step === 2 && sel?.kind === 'ollama-onboarding' && (
+            <div className="flex flex-col gap-4">
+              <span
+                className="text-14 font-medium"
+                style={{ color: 'var(--settings-section-title)' }}
+              >
+                {t('settings.providers.local.onboardingTitle')}
+              </span>
+              <LocalOllamaInstall canInstall={ollamaCanInstall} onReady={() => connectOllama()} />
+            </div>
+          )}
+          {step === 2 && sel?.kind === 'oauth' && (
+            <div className="flex flex-col gap-4">
+              <div className="flex items-center gap-3">
+                <span
+                  className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg"
+                  style={{
+                    backgroundColor: 'var(--settings-integration-avatar-bg)',
+                    border: '1px solid var(--settings-integration-avatar-border)',
+                    color: 'var(--settings-integration-avatar-icon)',
+                  }}
+                >
+                  {cardIcon({ providerId: sel.provider.id, name: sel.provider.name })}
+                </span>
+                <div className="flex min-w-0 flex-col">
+                  <span
+                    className="text-14 font-medium"
+                    style={{ color: 'var(--settings-section-title)' }}
+                  >
+                    {sel.provider.name}
+                  </span>
+                  <span className="text-12" style={{ color: 'var(--text-tertiary)' }}>
+                    {t(
+                      sel.provider.id === 'openai'
+                        ? localOpenAiAlreadyAdded
+                          ? 'settings.providers.openai.independentAccountDescription'
+                          : 'settings.providers.openai.accountSourcesDescription'
+                        : sel.provider.auth.oauth?.flow === 'device-code'
+                        ? 'settings.providers.wizard.deviceOAuthDesc'
+                        : 'settings.providers.wizard.oauthDesc',
+                    )}
+                  </span>
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                {/* 等待授权中按钮变「取消」(与详情头对称),不禁用——浏览器流挂起时用户必须能中止重试。 */}
+                {loggingIn ? (
+                  <Button variant="secondary" size="lg" type="button" onClick={cancelAuthorize}>
+                    <Spinner size={13} />
+                    {t('settings.providers.button.cancel')}
+                  </Button>
+                ) : (
+                  <>
+                    {sel.provider.id === 'openai' && !localOpenAiAlreadyAdded && (
+                      <Button
+                        variant="secondary"
+                        size="lg"
+                        type="button"
+                        onClick={() => void useLocalOpenAiAccount()}
+                      >
+                        {t('settings.providers.openai.useLocalAccount')}
+                      </Button>
+                    )}
+                    {/* Claude 订阅唯一入口:已添加时点它等同重新连接本机 Claude Code 登录。 */}
+                    {sel.provider.id === 'anthropic' && (
+                      <Button
+                        variant="secondary"
+                        size="lg"
+                        type="button"
+                        onClick={() => void useLocalClaudeAccount()}
+                      >
+                        {t('settings.providers.localAccount.useClaude')}
+                      </Button>
+                    )}
+                    {/* Claude 订阅只能经内置 Claude Code 自己的登录使用,不提供独立账号。 */}
+                    {sel.provider.id !== 'anthropic' && (
+                      <Button variant="secondary" size="lg" type="button" onClick={() => void handleAuthorize()}>
+                        {t(
+                          ['openai', 'xai'].includes(sel.provider.id)
+                              ? 'settings.providers.openai.addIndependentAccount'
+                              : sel.provider.auth.oauth?.flow === 'device-code'
+                                ? 'settings.providers.wizard.authorizeWithDeviceCode'
+                                : 'settings.providers.button.authorize',
+                        )}
+                      </Button>
+                    )}
+                    {sel.provider.id === 'xai' && (
+                      <Button variant="secondary" size="lg" type="button" onClick={() => void handleAuthorize('device')}>
+                        {t('settings.connections.xai.deviceLogin')}
+                      </Button>
+                    )}
+                  </>
+                )}
+                {/* 替代路径:API 用户没有订阅,OAuth 对其是错误路径——切到该渠道的
+                    官方 API 预设表单(填 key),与从目录选预设完全同一条流水线。
+                    与「授权」并排的次级描边按钮(White Pill):小灰字形态用户根本
+                    注意不到(2026-07-24 实测)。 */}
+                {(OFFICIAL_API_PRESETS[sel.provider.id] ?? presets.find(p => p.id === sel.provider.id)) && (
+                  <Button
+                    variant="secondary"
+                    size="lg"
+                    type="button"
+                    onClick={() =>
+                      pickPreset(
+                        (OFFICIAL_API_PRESETS[sel.provider.id] ?? presets.find((p) => p.id === sel.provider.id))!,
+                        true,
+                      )
+                    }
+                    disabled={loggingIn}
+                  >
+                    {t('settings.providers.wizard.useApiKey')}
+                  </Button>
+                )}
+              </div>
+              {(genericDeviceFlow || xaiDeviceLogin) && loggingIn && (
+                <OAuthDeviceCodeCard deviceCode={genericDeviceCode} />
+              )}
+              {loggingIn && browserUrl && <OAuthBrowserLink url={browserUrl} />}
+              {oauthSingleAgentNote && <InfoLine text={oauthSingleAgentNote} />}
+            </div>
+          )}
+
+          {step === 2 && sel?.kind === 'builtinApiKey' && (
+            <div className="flex flex-col gap-4">
+              <div className="flex items-center gap-3">
+                <span
+                  className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg"
+                  style={{
+                    backgroundColor: 'var(--settings-integration-avatar-bg)',
+                    border: '1px solid var(--settings-integration-avatar-border)',
+                    color: 'var(--settings-integration-avatar-icon)',
+                  }}
+                >
+                  {cardIcon({ providerId: sel.provider.id, name: sel.provider.name })}
+                </span>
+                <div className="flex min-w-0 flex-col">
+                  <span
+                    className="text-14 font-semibold"
+                    style={{ color: 'var(--settings-section-title)' }}
+                  >
+                    {sel.provider.name}
+                  </span>
+                  <span className="text-12" style={{ color: 'var(--text-tertiary)' }}>
+                    {t('settings.providers.wizard.builtinApiKey.subtitle')}
+                  </span>
+                </div>
+              </div>
+              <InfoLine text={t('settings.providers.wizard.builtinApiKey.note')} />
+              <div className="flex flex-col gap-1.5">
+                <label className="text-12 font-medium" style={{ color: 'var(--text-secondary)' }}>
+                  {t('settings.providers.custom.fields.apiKey')}
+                </label>
+                <SettingsTextInput
+                  value={apiKey}
+                  onChange={setApiKey}
+                  size="md"
+                  mono
+                  secret
+                  secretTipContentClassName="z-[10001]"
+                />
+              </div>
+            </div>
+          )}
+
+          {step === 2 && sel?.kind === 'preset' && (
+            <div className="flex flex-col gap-4">
+              <div className="flex flex-col gap-1.5">
+                <label className="text-12 font-medium" style={{ color: 'var(--text-secondary)' }}>
+                  {t('settings.providers.wizard.nameLabel')}
+                </label>
+                <input
+                  type="text"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  className="h-9 rounded-full border px-4 text-13 outline-none focus:ring-2 focus:ring-[var(--focus-ring)]"
+                  style={{
+                    borderColor: 'var(--border-default)',
+                    backgroundColor: 'var(--surface-elevated)',
+                    color: 'var(--settings-section-title)',
+                  }}
+                />
+              </div>
+              {providerSetupLink(sel.preset) && (
+                <a
+                  href={providerSetupLink(sel.preset)!.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-12 underline-offset-2 hover:underline"
+                  style={{ color: 'var(--text-secondary)' }}
+                >
+                  {t(`settings.providers.wizard.setupLink.${providerSetupLink(sel.preset)!.kind}`)}
+                </a>
+              )}
+              {presetNeedsApiKey ? (
+                <div className="flex flex-col gap-1.5">
+                  <label className="text-12 font-medium" style={{ color: 'var(--text-secondary)' }}>
+                    {t('settings.providers.custom.fields.apiKey')}
+                  </label>
+                  <SettingsTextInput
+                    value={apiKey}
+                    onChange={setApiKey}
+                    placeholder={isMimoTokenPlanPreset(sel.preset) ? 'tp-…' : 'sk-…'}
+                    size="md"
+                    mono
+                    secret
+                    secretTipContentClassName="z-[10001]"
+                  />
+                  {isMimoTokenPlanPreset(sel.preset) && (
+                    <InfoLine text={t('settings.providers.wizard.mimoTokenPlanNote')} />
+                  )}
+                </div>
+              ) : (
+                <InfoLine text={t('settings.providers.wizard.noAuthNote')} />
+              )}
+              <div className="flex flex-col gap-2">
+                {presetAgents.map((agent) => {
+                  const rt = sel.preset.runtimes[agent];
+                  if (rt?.baseUrlEditable) {
+                    const value = presetRuntimeBaseUrl(sel.preset, agent, presetBaseUrls);
+                    const valid = isValidEditablePresetBaseUrl(value.trim(), rt.baseUrl);
+                    return (
+                      <label key={agent} className="flex flex-col gap-1.5">
+                        <span
+                          className="text-12 font-medium"
+                          style={{ color: 'var(--text-secondary)' }}
+                        >
+                          {t('settings.providers.wizard.endpointLabel', {
+                            agent: AGENT_LABEL[agent],
+                          })}
+                        </span>
+                        <input
+                          type="url"
+                          value={value}
+                          onChange={(event) =>
+                            setPresetBaseUrls((prev) => ({
+                              ...prev,
+                              [agent]: event.target.value,
+                            }))
+                          }
+                          aria-invalid={!valid}
+                          className="h-9 rounded-full border px-4 font-mono text-12 outline-none focus:ring-2 focus:ring-[var(--focus-ring)]"
+                          style={{
+                            borderColor: valid ? 'var(--border-default)' : 'var(--error-border)',
+                            backgroundColor: 'var(--surface-elevated)',
+                            color: 'var(--settings-section-title)',
+                          }}
+                        />
+                      </label>
+                    );
+                  }
+                  return null;
+                })}
+              </div>
+              {entry?.kind === 'preset' && entry.speechOnly && <InfoLine text={t('settings.providers.speechSetup.separateKey')} />}
+              {presetSingleAgentNote && <InfoLine text={presetSingleAgentNote} />}
+
+            </div>
+          )}
+
+          {step === 3 && sel?.kind === 'preset' && (
+            <div className="flex flex-col gap-3">
+              {fetchState.status === 'fetching' ? (
+                <div
+                  className="flex items-center justify-center gap-2 py-16 text-13"
+                  style={{ color: 'var(--text-secondary)' }}
+                >
+                  <Spinner size={14} />
+                  {t('settings.providers.wizard.fetching')}
+                </div>
+              ) : (
+                <>
+                  {fetchState.status === 'done' && fetchState.failed && (
+                    <InfoLine text={t('settings.providers.wizard.fetchFailed')} />
+                  )}
+                  {(speechTarget || speechPicks.length > 0) && <SpeechModelChoices
+                    choices={speechPicks.map(([id, value]) => ({ id, ...value, reference: value.speechReference, manual: value.manualSpeech }))}
+                    onToggle={togglePick}
+                    onAdd={id => {
+                      const agent = speechTarget?.agent ?? speechPicks[0]?.[1].agents[0];
+                      if (!agent) return;
+                      setPicks(previous => {
+                        const next = new Map(previous); const existing = next.get(id);
+                        next.set(id, { ...existing, name: existing?.name ?? id, checked: true,
+                          recommended: existing?.recommended ?? false, agents: existing?.agents ?? [agent],
+                          speechReference: false, manualSpeech: true });
+                        return next;
+                      });
+                    }} />}
+                  {speechPicks.length > 0 && generalPicks.length > 0 && <p className="text-13 font-medium text-[var(--text-primary)]">{t('settings.providers.speechSetup.otherModels')}</p>}
+                  {generalPicks.length > 0 && (
+                    <div
+                      className="flex flex-col overflow-hidden rounded-xl border"
+                      style={{ borderColor: 'var(--border-default)' }}
+                    >
+                      {generalPicks.map(([id, v], i) => (
+                        <button
+                          key={id}
+                          type="button"
+                          onClick={() =>
+                            setPicks((prev) => {
+                              const next = new Map(prev);
+                              const cur = next.get(id);
+                              if (cur) next.set(id, { ...cur, checked: !cur.checked });
+                              return next;
+                            })
+                          }
+                          className={cn(
+                            'flex items-center gap-2.5 px-3.5 py-2.5 text-left transition-colors hover:bg-[var(--settings-menu-bg-hover)]',
+                            i > 0 && 'border-t',
+                          )}
+                          style={{ borderColor: 'var(--border-default)' }}
+                        >
+                          <span
+                            className="flex h-4 w-4 shrink-0 items-center justify-center rounded border"
+                            style={
+                              v.checked
+                                ? {
+                                    backgroundColor: 'var(--accent-cta-bg)',
+                                    borderColor: 'var(--accent-cta-bg)',
+                                    color: 'var(--surface-on-card)',
+                                  }
+                                : { borderColor: 'var(--text-tertiary)' }
+                            }
+                          >
+                            {v.checked && <Check size={11} strokeWidth={3} />}
+                          </span>
+                          <span
+                            className="min-w-0 flex-1 truncate text-13"
+                            style={{ color: 'var(--settings-section-title)' }}
+                          >
+                            {v.name}
+                          </span>
+                          {/* 双 runtime 预设里单端归属的模型,标注能力事实(与管理页同措辞)。 */}
+                          {presetAgents.length > 1 && v.agents.length === 1 && (
+                            <span
+                              className="shrink-0 text-12"
+                              style={{ color: 'var(--text-tertiary)' }}
+                            >
+                              {t('settings.providers.models.capabilityNote', {
+                                agent:
+                                  AGENT_LABEL[
+                                    v.agents[0] === 'claude-code' ? 'codex' : 'claude-code'
+                                  ],
+                              })}
+                            </span>
+                          )}
+                          {v.recommended && (
+                            <span
+                              className="flex h-[18px] shrink-0 items-center rounded-full px-2 text-11 font-medium"
+                              style={{
+                                backgroundColor: 'var(--surface-chip)',
+                                color: 'var(--text-secondary)',
+                              }}
+                            >
+                              {t('settings.providers.wizard.recommended')}
+                            </span>
+                          )}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  {showManualModelFallback && (
+                    <div
+                      className="flex flex-col gap-3 rounded-xl border p-3.5"
+                      style={{ borderColor: 'var(--border-default)' }}
+                    >
+                      <InfoLine text={t('settings.providers.wizard.manualModelHint')} />
+                      {presetAgents.map((agent) => (
+                        <label key={agent} className="flex flex-col gap-1.5">
+                          <span
+                            className="text-12 font-medium"
+                            style={{ color: 'var(--text-secondary)' }}
+                          >
+                            {t('settings.providers.wizard.manualModelLabel', {
+                              agent: AGENT_LABEL[agent],
+                            })}
+                          </span>
+                          <span className="flex items-center gap-2">
+                            <input
+                              type="text"
+                              value={manualModelIds[agent] ?? ''}
+                              onChange={(event) =>
+                                setManualModelIds((prev) => ({
+                                  ...prev,
+                                  [agent]: event.target.value,
+                                }))
+                              }
+                              onKeyDown={(event) => {
+                                if (event.key !== 'Enter') return;
+                                event.preventDefault();
+                                addManualModel(agent);
+                              }}
+                              placeholder={t('settings.providers.wizard.manualModelPlaceholder')}
+                              className="h-9 min-w-0 flex-1 rounded-full border px-4 font-mono text-12 outline-none focus:ring-2 focus:ring-[var(--focus-ring)]"
+                              style={{
+                                borderColor: 'var(--border-default)',
+                                backgroundColor: 'var(--surface-elevated)',
+                                color: 'var(--settings-section-title)',
+                              }}
+                            />
+                            <Button
+                              variant="secondary"
+                              size="lg"
+                              type="button"
+                              onClick={() => addManualModel(agent)}
+                              disabled={!manualModelIds[agent]?.trim()}
+                              compact
+                            >
+                              {t('settings.providers.wizard.addManualModel')}
+                            </Button>
+                          </span>
+                        </label>
+                      ))}
+                    </div>
+                  )}
+                  {(generalPicks.length > 0 || showManualModelFallback) && (
+                    <p className="text-11 leading-snug" style={{ color: 'var(--text-tertiary)' }}>
+                      {t('settings.providers.wizard.modelsHint')}
+                    </p>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* 底部 */}
+        {/* 底部操作行:不再加分割线 —— 弹窗内只保留滚动区上下两条细线(原型定稿)。 */}
+        <div className="flex items-center justify-between px-4 pb-4 pt-2">
+          <button
+            type="button"
+            onClick={() => {
+              if (savingRef.current) return;
+              if (step === 2 && detected && onReturnCustom && sel?.kind === 'preset') {
+                fetchSeqRef.current += 1;
+                const agent = detected.agent;
+                const editedBase = presetRuntimeBaseUrl(sel.preset, agent, presetBaseUrls);
+                const previous = detected.config.runtimes[agent]!;
+                const baseUrl = editedBase === detected.preset.runtimes[agent]?.baseUrl ? previous.baseUrl : editedBase;
+                const runtimes = { ...detected.config.runtimes };
+                const keys = { ...detected.keys };
+                for (const target of Object.keys(runtimes) as AgentKind[]) {
+                  const original = runtimes[target]!;
+                  const followsAddress = original.baseUrl === previous.baseUrl;
+                  const bound = sel.preset.runtimes[target];
+                  // Excluded engines are independent drafts, even if a field matches.
+                  if (!bound) continue;
+                  const targetInput = bound ? presetRuntimeBaseUrl(sel.preset, target, presetBaseUrls) : undefined;
+                  const targetBase = targetInput && targetInput !== bound?.baseUrl ? targetInput
+                    : followsAddress ? baseUrl : original.baseUrl;
+                  const models = bound && picks.size ? [...picks]
+                    .filter(([, model]) => model.checked && model.agents.includes(target))
+                    .map(([id, model]) => {
+                      const saved = original.models.find(row => row.id === id);
+                      // Only checked rows return to the custom form. Do not
+                      // resurrect an older disabled flag on this second save path.
+                      const { defaultEnabled: _oldEnabled, ...selectedModel }: Partial<ProviderRuntimeModelConfig> = saved ?? {};
+                      return { ...(!selectedModel.interfaceId && !selectedModel.api && !selectedModel.piApi && !selectedModel.route
+                        && model.interfaceIds?.[target] ? { interfaceId: model.interfaceIds[target] } : {}),
+                        ...selectedModel, id, name: model.name,
+                        discoveredMetadata: model.discoveredMetadata?.[target] ?? saved?.discoveredMetadata,
+                        ...(saved?.route ?? model.routes?.[target] ? { route: saved?.route ?? model.routes?.[target] } : {}),
+                      };
+                    }) : original.models;
+                  runtimes[target] = { ...original, baseUrl: targetBase,
+                    // Interface references need their product identity on both save paths.
+                    ...(models.some(model => model.interfaceId) ? { catalogPresetId: original.catalogPresetId ?? sel.preset.id } : {}),
+                    models: modelsAfterProviderEndpointEdit(models, original.baseUrl, targetBase),
+                  };
+                  if (target === agent || keys[target] === detected.apiKey) keys[target] = apiKey;
+                }
+                onReturnCustom({ ...detected, apiKey,
+                  catalog: apiKey === detected.apiKey && editedBase === detected.preset.runtimes[agent]?.baseUrl ? detected.catalog : undefined,
+                  keys, config: { ...detected.config, name, runtimes } });
+                return;
+              }
+              if (step === 3) {
+                if (oauthDraftRef.current && sel?.kind === 'preset') {
+                  pickPreset(presets.find(p => p.id === sel.preset.id) ?? sel.preset);
+                } else setStep(2);
+              }
+              else if (step === 2 && sel?.kind === 'preset' && providerPresetOAuth(sel.preset.id)) {
+                pickPreset(sel.preset);
+              }
+              else if (step === 2) {
+                // 返回目录前中止等待中的授权,不留挂起的 login runner;
+                // 同时推进拉取序号,让在途的旧模型请求结果作废。
+                if (loggingIn) cancelAuthorize();
+                fetchSeqRef.current += 1;
+                setSel(null);
+                setStep(1);
+              }
+            }}
+            className={cn(
+              'text-13 font-medium transition-opacity hover:opacity-80',
+              step === 1 && 'invisible',
+            )}
+            style={{ color: 'var(--text-secondary)' }}
+          >
+            {t('settings.providers.wizard.back')}
+          </button>
+          <div className="flex items-center gap-2.5">
+            <Button variant="secondary" size="lg" type="button" onClick={handleClose} disabled={saving}>
+              {t('settings.providers.wizard.cancel')}
+            </Button>
+            {sel?.kind === 'builtinApiKey' && step === 2 && (
+              <Button
+                variant="cta"
+                size="lg"
+                loading={saving}
+                type="button"
+                onClick={() => void handleSaveBuiltinApiKey()}
+                disabled={saving || apiKey.trim().length === 0}
+              >
+                {t('settings.providers.wizard.finish')}
+              </Button>
+            )}
+            {sel?.kind === 'preset' && step === 2 && (
+              <Button
+                variant="cta"
+                size="lg"
+                type="button"
+                onClick={() => void startFetch()}
+                disabled={!presetCanContinue}
+              >
+                {t('settings.providers.wizard.next')}
+              </Button>
+            )}
+            {sel?.kind === 'preset' && step === 3 && (
+              <Button
+                variant="cta"
+                size="lg"
+                loading={saving}
+                type="button"
+                onClick={() => void handleFinish()}
+                disabled={saving || fetchState.status === 'fetching' || checkedCount === 0}
+              >
+                {t('settings.providers.wizard.finish')}
+              </Button>
+            )}
+          </div>
+        </div>
+      </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
+  );
+}

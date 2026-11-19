@@ -1,0 +1,23 @@
+{
+  "id": "medium-tag-feed",
+  "match": [
+    "medium.com"
+  ],
+  "description": "Latest Medium articles tagged with a given keyword (RSS feed)",
+  "access": "read",
+  "adapter": "medium/tag",
+  "inputs": {
+    "tag": {
+      "required": true,
+      "type": "str",
+      "description": "Lowercase tag slug (e.g. \"programming\", \"machine-learning\")"
+    },
+    "limit": {
+      "required": false,
+      "type": "int",
+      "default": 20,
+      "description": "Max articles (1-25 — single RSS page)"
+    }
+  },
+  "steps": []
+}

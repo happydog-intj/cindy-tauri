@@ -1,0 +1,655 @@
+/**
+ * HookWorkspacePrefsEditor —— 工作目录卡片内嵌的会话偏好编辑行。
+ *
+ * 由 HookConnectionsSection 在每个目录卡片下渲染(用户反馈: 偏好属于目录
+ * 条目本身, 不该是独立区块): agent / 模型(含思考强度) / 权限模式三个字段。
+ *
+ * **两个控件一律复用应用标准选择器,本文件不自建任何选择 UI**(2026-07 用户
+ * 定稿: 这里曾私搭一套裸下拉, 露出 'claude-code' 原始 id、自己拼一遍可选模型
+ * 清单、effort 直接显示未经 i18n 的 low/medium/high):
+ *   - Harness 与模型由 ModelSelector 一次提交, 不保留独立引擎控件。
+ *   - 模型    -> ModelSelector 的 field trigger, **composer 同款全功能形态**(供应商
+ *                分段/订阅来源/推理强度全开; 2026-07 用户定稿基准: 全软件一个模型
+ *                选择面板, 处处同行为, 差异只有样式)。来源落本地
+ *                workspaceProviderSourceStore, model/effort 照旧走 server prefs
+ *   - 权限    -> PermissionSelector 的 field trigger
+ * 思考强度不再是独立控件 —— 它并进模型 trigger 显示成「模型名 · 档位」, 与
+ * 隔壁 ImDefaultSettingsSection(IM 新会话默认)和会话输入框成一套。
+ *
+ * 未显式设置的字段**解析出当前真正会生效的默认值**直接展示, 界面上不暴露
+ * 「默认」概念(无后缀 / 无弱化色 / 无「恢复默认」菜单项 —— 用户反馈: 不要
+ * 有 xxx(默认)这种); 选中任一项即写显式偏好。解析链与 main 侧 defaults.ts
+ * 逐字段对齐(resolveEffectiveRow, 纯函数有单测), 数据源是 imDefaultSettingsGet
+ * (**频道随 provider**: Slack 读 channels.slack, Telegram 读 global, 与派发侧
+ * session-runner 同源)+ 本机 capabilities。权限档另经
+ * resolveEffectivePermissionMode 校准: 无显式偏好 → bypassPermissions(无人值守
+ * 历史默认), 显式档不被当前 agent 支持 → 该 agent 最严档(绝不放宽)。
+ *
+ * 数据正本在本机 hook-workspace-prefs.json。设置页离线可读可写；连上后
+ * 镜像到 hook server，只供 /model 卡展示和遥控。卡片在线改动经推送写回本机。
+ * 写入的联动校准仍走 hookWorkspacePrefsLogic.ts。
+ *
+ * 状态模型(禁用整体置灰而非增删行, 规则 7):
+ *   - 开关未开 / 未绑定 -> 禁用 + 对应提示
+ *   - 已绑定但 hook 掉线 -> 仍可编辑, 提示改动保存在本机
+ * 颜色一律走主题 token(规则 16)。
+ */
+
+import { useModelPickerAgents } from '@/hooks/useAvailableAgents';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useTranslation } from 'react-i18next';
+
+import { cn } from '@/lib/utils';
+import { toast } from '@/lib/toast';
+import { extractIpcError } from '@/utils/ipcError';
+import { useAgentCapabilities, type AgentCapabilities } from '@/hooks/useAgentCapabilities';
+import { ModelSelector } from '@/components/new-chat/ModelSelector';
+import { useProviderShareAgentDevices } from '@/features/provider-share/useProviderShareAgentDevices';
+import { agentDeviceModelMemoryAccessors } from '@/state/agentDeviceModelMemory';
+import { PermissionSelector } from '@/components/new-chat/PermissionSelector';
+import type { MakerVendor } from '@/lib/ccAgent.types';
+import {
+  getProviderModelEffort,
+  setProviderModelChoice,
+  setProviderModelEffort,
+  getProviderModelFast,
+  setProviderModelFast,
+} from '@/state/providerModelMemory';
+import type {
+  HookPrefsPatch,
+  HookPrefsView,
+  HookWorkspacePrefs,
+  HookWorkspaceProviderSourceEntry,
+  ProviderPrefsView,
+  SlackHookView,
+} from '../../../shared/hookControlIpc';
+import type { ImDefaultSettingsState } from '../../../shared/imDefaultSettings';
+import {
+  AGENT_KINDS,
+  HOOK_DEFAULT_PERMISSION_MODE,
+  isKnownAgent,
+  patchForModelChange,
+  resolveEffectiveRow,
+  type ImDefaultsLike,
+  type KnownAgent,
+  type PrefsAgentCaps,
+} from './hookWorkspacePrefsLogic';
+
+/** 全 null 的缺省偏好行(该目录从未设置过)。 */
+function emptyPrefs(workspace: string): HookWorkspacePrefs {
+  return { workspace, model: null, effort: null, agentKind: null, permissionMode: null };
+}
+
+function toPrefsCaps(caps: AgentCapabilities | null): PrefsAgentCaps | null {
+  if (caps === null) return null;
+  return {
+    models: caps.availableModels.map((m) => ({
+      id: m.id,
+      efforts: m.efforts,
+      defaultEffort: m.defaultEffort,
+    })),
+    permissionModes: caps.permissionModes.map((pm) => ({ id: pm.id })),
+  };
+}
+
+export interface HookWorkspacePrefsState {
+  /** 按别名查该目录偏好(无行返回全 null 缺省; multi-team 下按选中 team 过滤)。 */
+  prefsFor: (alias: string) => HookWorkspacePrefs;
+  /** 目录显式来源优先，否则继承当前引擎的 IM 默认来源。 */
+  providerSourceFor: (alias: string) => string | null;
+  agentDeviceFor: (alias: string) => string | null;
+  /** 写/清该目录的模型来源偏好(providerId = null 清除)。 */
+  applyProviderSource: (alias: string, providerId: string | null, agentDeviceId?: string | null) => Promise<boolean>;
+  /** 是否可编辑(已连接 + 已绑定 + 快照可用)。 */
+  editable: boolean;
+  /** 写入在途的目录别名(该卡片下拉禁用)。 */
+  pendingWs: string | null;
+  /** 不可编辑的原因提示(null = 无需提示); 宿主渲染一次。 */
+  hint: string | null;
+  /** hint 为「服务器过旧」时提供的重试入口(其余为 null)。 */
+  retry: (() => void) | null;
+  /** 桌面新会话默认设置(解析「当前生效默认值」的数据源; 未就绪为 null)。 */
+  imDefaults: ImDefaultsLike | null;
+  /** 重新拉取 imDefaults(存量 global override 被清掉后刷新目录行的生效值)。 */
+  reloadImDefaults: () => Promise<void>;
+  /** alsoProviderSource: 远端写成功后串联落本地来源(undefined = 不动来源)。 */
+  applyPatch: (
+    workspace: string,
+    patch: HookPrefsPatch,
+    alsoProviderSource?: string | null,
+    agentDeviceId?: string | null,
+  ) => Promise<boolean>;
+  /** (multi-team)可用绑定清单(未 displaced); 单绑定/老 server 时 ≤1 条。 */
+  teams: Array<{ teamId: string; teamName: string | null }>;
+  /** 当前偏好归属 team(teams 非空时必有值; 选中项失效自动回落首个)。 */
+  selectedTeamId: string | null;
+  selectTeam: (teamId: string) => void;
+  /** 是否显示 team 切换 chip(server multi-team 且 ≥2 个可用绑定)。 */
+  showTeamChip: boolean;
+}
+
+export type HookPrefsProvider = 'slack' | 'telegram' | 'x';
+
+/** provider-neutral prefs 线(Telegram / X): 走 provider.bind/prefs 帧, 绑定按 bindingId 归属。 */
+type NeutralPrefsProvider = Exclude<HookPrefsProvider, 'slack'>;
+function isNeutralPrefsProvider(provider: HookPrefsProvider): provider is NeutralPrefsProvider {
+  return provider !== 'slack';
+}
+
+function isProviderPrefsView(view: HookPrefsView | ProviderPrefsView): view is ProviderPrefsView {
+  return 'provider' in view;
+}
+
+/**
+ * 目录偏好共享状态(单订阅): 拉取/写入/推送同步 + 禁用态归纳。
+ * hook 传 null 时(数据未就绪)一切禁用无提示。
+ */
+export function useHookWorkspacePrefs(
+  hook: SlackHookView | null,
+  provider: HookPrefsProvider = 'slack',
+): HookWorkspacePrefsState {
+  const { t } = useTranslation();
+  const [prefsView, setPrefsView] = useState<HookPrefsView | ProviderPrefsView | null>(null);
+  /** 'unavailable' = 快照读不到(server 太旧 / 通道缺失 / 内部错), 提示 + 重试。 */
+  const [loadError, setLoadError] = useState<'unavailable' | null>(null);
+  const [pendingWs, setPendingWs] = useState<string | null>(null);
+  const [imDefaults, setImDefaults] = useState<ImDefaultsLike | null>(null);
+  // 目录模型来源偏好(纯本地文件, 不经 WS): 全量条目一次拉取, 写后用返回值刷新。
+  const [providerSources, setProviderSources] = useState<HookWorkspaceProviderSourceEntry[]>([]);
+  // latest-wins 守卫(Copilot review): 快速连选/跨窗口广播时, 较慢的旧回复不得覆盖新状态。
+  const providerSourceRevisionRef = useRef(0);
+  /**
+   * 拉一次「新会话默认设置」(目录行未显式设置字段的生效值解析源)。
+   * 单独抽出来是因为存量 global override 被清掉后要能立刻刷新生效值 —— 否则目录行
+   * 会继续显示已经不再生效的旧默认。
+   */
+  const fetchImDefaults = useCallback(async (): Promise<void> => {
+    try {
+      const state: ImDefaultSettingsState = await window.electronAPI.maker.imDefaultSettingsGet(
+        provider === 'slack' ? 'slack' : undefined,
+      );
+      setImDefaults({ agentKind: state.agentKind, agents: state.agents });
+    } catch {
+      /* 读不到就保持上一份(解析退回内置默认), 不影响目录行其它字段 */
+    }
+  }, [provider]);
+
+  const neutral = isNeutralPrefsProvider(provider);
+  const neutralView = neutral && hook !== null ? hook[provider as NeutralPrefsProvider] : null;
+  const neutralBindingId =
+    neutralView?.binding?.state === 'confirmed' ? neutralView.binding.bindingId : null;
+  const enabled = neutral ? neutralView?.enabled === true : hook?.enabled === true;
+  const connected = neutral
+    ? enabled && Boolean(neutralView?.available) && neutralView?.status === 'connected'
+    : enabled && hook?.status === 'connected';
+  const providerBindingConfirmed = !neutral || neutralView?.binding?.state === 'confirmed';
+  // 本机正本不依赖 WS：已绑定即可拉本地快照。未绑定仍不发起（避免空身份）。
+  const readyIdentity = providerBindingConfirmed
+    ? neutral
+      ? neutralBindingId === null
+        ? null
+        : `${provider}:${neutralBindingId}`
+      : enabled
+        ? 'slack'
+        : null
+    : null;
+  // Initialised to null (never a real identity) so the ready-edge effect below
+  // is the single fetch trigger: it performs the first fetch on mount only when
+  // the provider is actually reachable, and cannot double-fetch with a separate
+  // mount effect (issue #279 review).
+  const lastReadyIdentityRef = useRef<string | null>(null);
+  const fetchRevisionRef = useRef(0);
+  const mutationRevisionRef = useRef(0);
+  const neutralBindingIdRef = useRef<string | null>(neutralBindingId);
+  neutralBindingIdRef.current = neutralBindingId;
+
+  const fetchPrefs = useCallback(async () => {
+    const revision = ++fetchRevisionRef.current;
+    try {
+      const res = isNeutralPrefsProvider(provider)
+        ? await window.electronAPI.hookControl.getProviderWorkspacePrefs(provider)
+        : await window.electronAPI.hookControl.getWorkspacePrefs();
+      if (revision !== fetchRevisionRef.current) return;
+      const nextPrefs: HookPrefsView | ProviderPrefsView = res.prefs;
+      if (
+        isNeutralPrefsProvider(provider) &&
+        (!isProviderPrefsView(nextPrefs) ||
+          nextPrefs.provider !== provider ||
+          nextPrefs.bindingId !== neutralBindingIdRef.current)
+      ) {
+        return;
+      }
+      if (provider === 'slack' && isProviderPrefsView(nextPrefs)) return;
+      setPrefsView(nextPrefs);
+      setLoadError(null);
+    } catch (err) {
+      if (revision !== fetchRevisionRef.current) return;
+      const code = extractIpcError(err)?.code;
+      // GET 已改走本机文件, 不应再出现 HOOK_NOT_CONNECTED; 仍静默以免旧桌面误报。
+      if (code !== 'HOOK_NOT_CONNECTED') setLoadError('unavailable');
+    }
+  }, [provider]);
+
+  useEffect(() => {
+    let active = true;
+    const applyIncoming = (view: HookPrefsView | ProviderPrefsView) => {
+      if (isNeutralPrefsProvider(provider)) {
+        if (
+          !isProviderPrefsView(view) ||
+          view.provider !== provider ||
+          view.bindingId !== neutralBindingIdRef.current
+        ) {
+          return;
+        }
+      } else if (isProviderPrefsView(view)) {
+        return;
+      }
+      // /model 卡改动 / 其它窗口写入的实时同步(全量快照 latest-wins)
+      fetchRevisionRef.current += 1;
+      setPrefsView(view);
+      setLoadError(null);
+    };
+    const offPrefs = isNeutralPrefsProvider(provider)
+      ? window.electronAPI.hookControl.onProviderPrefsChanged((view) => {
+          if (view.provider === provider) applyIncoming(view);
+        })
+      : window.electronAPI.hookControl.onPrefsChanged(applyIncoming);
+    // The ready-edge effect below performs the initial prefs fetch (only when
+    // reachable). The subscription set up here just needs to exist first so no
+    // server push is missed before that fetch resolves.
+    // 桌面新会话默认设置: 未显式设置字段的生效值解析源, 面板打开时取一次即可。
+    // **频道必须与派发侧同源**: session-runner 用
+    // `readImDefaultSettings(sourceIm === 'slack' ? 'slack' : undefined)` —— Slack 读
+    // channels.slack, 官方 Telegram 读 global；个人 Telegram Bot 才读
+    // channels.telegram。这里必须与官方派发侧同源，否则目录行会显示一套默认值、
+    // 实际会话却使用另一套。
+    void fetchImDefaults();
+    // 初次拉取同样受 latest-wins 守卫(Copilot review): 回复未归时若已收到其它
+    // 窗口的写入广播(revision 已前进), 旧快照不得回滚新状态。
+    const initialSourcesRevision = providerSourceRevisionRef.current;
+    void window.electronAPI.hookControl
+      .getWorkspaceProviderSources()
+      .then((res) => {
+        if (active && providerSourceRevisionRef.current === initialSourcesRevision) {
+          setProviderSources(res.entries);
+        }
+      })
+      .catch(() => {});
+    // 多窗口同步(codex review): 会话副窗也能开设置页, 其它窗口写入时以广播的
+    // 全量条目为准刷新(与 prefs.state 的 latest-wins 快照语义一致)。
+    const offProviderSources = window.electronAPI.hookControl.onWorkspaceProviderSourcesChanged(
+      (entries) => {
+        providerSourceRevisionRef.current += 1;
+        setProviderSources(entries);
+      },
+    );
+    return () => {
+      active = false;
+      fetchRevisionRef.current += 1;
+      mutationRevisionRef.current += 1;
+      offPrefs();
+      offProviderSources();
+    };
+  }, [fetchPrefs, provider]);
+
+  // 唯一的拉取触发点: 初次挂载、断线 -> 重连成功、或 Telegram 绑定身份变化时,
+  // 拉取对应 provider 的快照。readyIdentity 为 null(provider 未连接/未绑定)时
+  // 不发起无意义的 prefs IPC —— 否则会以 HOOK_NOT_CONNECTED 失败并在 Main 侧
+  // 打出误导性的 Slack ERROR(issue #279)。lastReadyIdentityRef 初始为 null,
+  // 保证 provider 首次可用即拉取且同一身份不重复触发; 只看布尔 ready 会让 A
+  // 换绑 B 时继续展示 A 的偏好。
+  useEffect(() => {
+    if (readyIdentity !== null && readyIdentity !== lastReadyIdentityRef.current) {
+      void fetchPrefs();
+    }
+    lastReadyIdentityRef.current = readyIdentity;
+  }, [readyIdentity, fetchPrefs]);
+
+  // (multi-team)偏好归属 team: 可选清单 = 未 displaced 的绑定; 选中项失效
+  // (解绑/被顶)时自动回落首个, 不留悬空选择
+  // 离线冷启动 welcome 还没回来时 serverMultiTeam 是 false，但 bindings
+  // 缓存已经能区分 multi-team。有未 displaced 行就按多绑定写 teamId，
+  // 避免离线改动落成 null 行、重连后无法镜像到对应 workspace。
+  const multiTeam =
+    provider === 'slack' &&
+    (hook?.serverMultiTeam === true || (hook?.bindings ?? []).some((b) => !b.displaced));
+  const teams = useMemo(
+    () =>
+      (provider === 'slack' ? (hook?.bindings ?? []) : [])
+        .filter((b) => !b.displaced)
+        .map((b) => ({ teamId: b.teamId, teamName: b.teamName })),
+    [hook, provider],
+  );
+  const [selectedTeamRaw, setSelectedTeamRaw] = useState<string | null>(null);
+  const selectedTeamId = teams.some((tm) => tm.teamId === selectedTeamRaw)
+    ? selectedTeamRaw
+    : (teams[0]?.teamId ?? null);
+  const activePrefsView: HookPrefsView | ProviderPrefsView | null = neutral
+    ? prefsView !== null &&
+      isProviderPrefsView(prefsView) &&
+      prefsView.provider === provider &&
+      prefsView.bindingId === neutralBindingId
+      ? prefsView
+      : null
+    : prefsView !== null && !isProviderPrefsView(prefsView)
+      ? prefsView
+      : null;
+
+  const prefsFor = useCallback(
+    (alias: string): HookWorkspacePrefs => {
+      const entries = activePrefsView?.prefs ?? [];
+      if (multiTeam && selectedTeamId !== null) {
+        // 精确 team 匹配优先; 老 server 存量行(无 teamId)宽松兜底
+        return (
+          entries.find((e) => e.workspace === alias && (e.teamId ?? null) === selectedTeamId) ??
+          entries.find((e) => e.workspace === alias && (e.teamId ?? null) === null) ??
+          emptyPrefs(alias)
+        );
+      }
+      return entries.find((e) => e.workspace === alias) ?? emptyPrefs(alias);
+    },
+    [activePrefsView, multiTeam, selectedTeamId],
+  );
+
+  // 与派发端同口径：有目录来源时整组覆盖(缺省位置表示明确选本机)，
+  // 无目录来源才继承该引擎的默认来源及执行位置，不能逐字段混用。
+  const providerRouteFor = useCallback((alias: string) => {
+    const teamId = multiTeam ? selectedTeamId : null;
+    const entry = providerSources.find((e) => e.channel === provider && e.teamId === teamId && e.workspace === alias)
+      ?? providerSources.find((e) => e.channel === provider && e.teamId === null && e.workspace === alias);
+    if (entry) return entry;
+    const agentKind = prefsFor(alias).agentKind;
+    return imDefaults?.agents[isKnownAgent(agentKind) ? agentKind : imDefaults.agentKind] ?? null;
+  }, [providerSources, provider, multiTeam, selectedTeamId, prefsFor, imDefaults]);
+  const providerSourceFor = useCallback((alias: string): string | null =>
+    providerRouteFor(alias)?.providerId ?? null, [providerRouteFor]);
+  const agentDeviceFor = useCallback((alias: string): string | null =>
+    providerRouteFor(alias)?.agentDeviceId ?? null, [providerRouteFor]);
+
+  const applyProviderSource = useCallback(
+    (alias: string, providerId: string | null, agentDeviceId?: string | null) => {
+      const teamId = multiTeam ? selectedTeamId : null;
+      const revision = ++providerSourceRevisionRef.current;
+      return window.electronAPI.hookControl
+        .setWorkspaceProviderSource({ channel: provider, teamId, workspace: alias, providerId,
+          ...(agentDeviceId !== undefined ? { agentDeviceId } : {}) })
+        .then((res) => {
+          if (revision === providerSourceRevisionRef.current) setProviderSources(res.entries);
+          return true;
+        })
+        .catch((err: unknown) => {
+          if (revision === providerSourceRevisionRef.current) {
+            toast.error(extractIpcError(err)?.message ?? t('settings.tina.prefs.toast.saveFailed'));
+          }
+          return false;
+        });
+    },
+    [provider, multiTeam, selectedTeamId, t],
+  );
+
+  const applyPatch = useCallback(
+    // alsoProviderSource(可选): 远端 model/effort 写**成功后**再落本地来源 ——
+    // 两个持久面串联而非并行(Greptile/codex review: 并行 fire-and-forget 会在
+    // 一半失败时留下「新来源配旧模型」的分裂态)。顺序选「先远端后本地」:远端
+    // 失败 → 整体失败, 来源不动, 状态与操作前一致;本地失败(概率远小)→ 旧来源
+    // 配新模型, 派发端校验不通过时拒绝新任务并提示重新选择模型(显式来源不换账号)。
+    (workspace: string, patch: HookPrefsPatch, alsoProviderSource?: string | null, agentDeviceId?: string | null) => {
+      // A server push, binding change, retry, or newer mutation must win over
+      // this response. Otherwise a delayed set reply can roll the UI back to
+      // an older provider snapshot and clear another mutation's pending state.
+      const revision = ++fetchRevisionRef.current;
+      const mutationRevision = ++mutationRevisionRef.current;
+      setPendingWs(workspace);
+      const request = isNeutralPrefsProvider(provider)
+        ? window.electronAPI.hookControl.setProviderWorkspacePrefs(provider, workspace, patch)
+        : window.electronAPI.hookControl.setWorkspacePrefs(
+            workspace,
+            patch,
+            multiTeam ? selectedTeamId : undefined,
+          );
+      return request
+        .then(async (res) => {
+          // 来源落地在快照守卫**之前**(codex review): invoke 成功 = 远端已确认
+          // 本次 (model, effort) 写入 —— 这一事实不因「更新的快照先到」而失效;
+          // 守卫只管下方 UI 快照是否回填,若来源也被守卫跳过(prefs 回执经广播
+          // 先到的正常时序), 会留下「新模型 + 旧来源」的持久分裂。
+          if (alsoProviderSource !== undefined) {
+            if (!await applyProviderSource(workspace, alsoProviderSource, agentDeviceId)) return false;
+          }
+          if (revision !== fetchRevisionRef.current) return true;
+          const nextPrefs: HookPrefsView | ProviderPrefsView = res.prefs;
+          if (
+            isNeutralPrefsProvider(provider) &&
+            (!isProviderPrefsView(nextPrefs) ||
+              nextPrefs.provider !== provider ||
+              nextPrefs.bindingId !== neutralBindingIdRef.current)
+          ) {
+            return true;
+          }
+          if (provider === 'slack' && isProviderPrefsView(nextPrefs)) return true;
+          fetchRevisionRef.current += 1;
+          setPrefsView(nextPrefs);
+          setLoadError(null);
+          return true;
+        })
+        .catch((err: unknown) => {
+          if (revision !== fetchRevisionRef.current) return false;
+          const ipcErr = extractIpcError(err);
+          if (ipcErr?.code === 'HOOK_PREFS_TIMEOUT') setLoadError('unavailable');
+          toast.error(ipcErr?.message ?? t('settings.tina.prefs.toast.saveFailed'));
+          void fetchPrefs();
+          return false;
+        })
+        .finally(() => {
+          if (mutationRevision === mutationRevisionRef.current) setPendingWs(null);
+        });
+    },
+    [fetchPrefs, t, multiTeam, provider, selectedTeamId, applyProviderSource],
+  );
+
+  const bound = providerBindingConfirmed && activePrefsView?.bound === true;
+  const providerLabel = t(
+    provider === 'telegram'
+      ? 'settings.tina.prefs.providerTelegram'
+      : provider === 'x'
+        ? 'settings.tina.prefs.providerX'
+        : 'settings.tina.prefs.providerSlack',
+  );
+  const hint = loadError === 'unavailable'
+    ? t('settings.tina.prefs.serverUnsupported')
+    : !providerBindingConfirmed || (activePrefsView !== null && !bound)
+      ? t('settings.tina.prefs.requireBinding', { provider: providerLabel })
+      : !connected
+        ? t('settings.tina.prefs.offlineLocal', { provider: providerLabel })
+        : null;
+
+  return {
+    prefsFor,
+    providerSourceFor,
+    agentDeviceFor,
+    applyProviderSource,
+    editable: Boolean(enabled) && bound && loadError === null,
+    pendingWs,
+    hint,
+    retry: loadError === 'unavailable' ? () => void fetchPrefs() : null,
+    imDefaults,
+    reloadImDefaults: fetchImDefaults,
+    applyPatch,
+    teams,
+    selectedTeamId,
+    selectTeam: setSelectedTeamRaw,
+    showTeamChip: multiTeam && teams.length > 1,
+  };
+}
+
+/** 字段外框:标题 + 控件,三个字段共用,保证 label 排版一致。 */
+function PrefsField({
+  label,
+  className,
+  children,
+}: {
+  label: string;
+  className?: string;
+  children: ReactNode;
+}) {
+  return (
+    <div className={cn('flex min-w-0 flex-col gap-1', className)}>
+      <span className="text-11 text-[var(--text-tertiary)]">{label}</span>
+      {children}
+    </div>
+  );
+}
+
+/** hook prefs 的 agentKind → 选择器的 vendor key。 */
+function toVendorKey(agentKind: string | null): 'cc' | 'codex' | 'pi' {
+  return agentKind === 'codex' || agentKind === 'pi' ? agentKind : 'cc';
+}
+
+/** 目录卡片内的偏好编辑行(完整模型配置 / 权限)。alias 为该行当前生效别名。 */
+export function WorkspacePrefsEditor({
+  alias,
+  state,
+  maxVisibleModelRows,
+}: {
+  alias: string;
+  state: HookWorkspacePrefsState;
+  maxVisibleModelRows?: number;
+}) {
+  const { t } = useTranslation();
+  const agentDeviceId = state.agentDeviceFor(alias);
+  const sharedDevices = useProviderShareAgentDevices([agentDeviceId]);
+  const claudeCaps = useAgentCapabilities('claude-code', agentDeviceId ?? undefined);
+  const codexCaps = useAgentCapabilities('codex', agentDeviceId ?? undefined);
+  const piCaps = useAgentCapabilities('pi', agentDeviceId ?? undefined);
+  const capsByAgent = useMemo(
+    () =>
+      ({
+        'claude-code': claudeCaps.capabilities,
+        codex: codexCaps.capabilities,
+        pi: piCaps.capabilities,
+      }) as Record<KnownAgent, AgentCapabilities | null>,
+    [claudeCaps.capabilities, codexCaps.capabilities, piCaps.capabilities],
+  );
+  const capsOf = useCallback(
+    (agentKind: string): AgentCapabilities | null =>
+      AGENT_KINDS.includes(agentKind as KnownAgent) ? capsByAgent[agentKind as KnownAgent] : null,
+    [capsByAgent],
+  );
+
+  const prefs = state.prefsFor(alias);
+  const eff = resolveEffectiveRow(prefs, state.imDefaults, (k) => toPrefsCaps(capsOf(k)));
+  const effAgentCaps = capsOf(eff.agentKind.id ?? '');
+  const disabled = !state.editable || state.pendingWs === alias;
+  const vendorKey = toVendorKey(eff.agentKind.id);
+
+  const pickerAgents = useModelPickerAgents(vendorKey === 'cc' ? 'claude-code' : vendorKey === 'pi' ? 'pi' : 'codex', agentDeviceId);
+
+  /** 落一个模型选择(分段行与 flat 行共用): 随手写入 (agent, model) 配对并校准 effort。 */
+  const applyModel = (next: string) => {
+    if (next === prefs.model || eff.agentKind.id === null) return;
+    return state.applyPatch(
+      alias,
+      patchForModelChange(eff.agentKind.id, next, prefs, toPrefsCaps(effAgentCaps)),
+    );
+  };
+
+  return (
+    <div className="flex flex-wrap items-end gap-2">
+      {/* 模型 + 思考强度同一个控件, **composer 同款全功能标准面板**(2026-07 用户
+          定稿基准: 全软件一个模型选择面板, 处处同行为, 差异只有样式):供应商分段、
+          订阅来源、推理强度全开。来源(providerId)是纯客户端维度, 落本地
+          workspaceProviderSourceStore; model/effort 照旧走 server prefs 通道
+          (Slack /model 卡展示不受影响)。派发侧按 (来源, 模型) 经
+          effectiveSourceIdForModel 校验: 显式来源失效时拒绝而不换账号; 目录模型
+          跟随默认时, 不提供该模型的残留来源被忽略(issue #5912), 不会拼出不可能
+          路由 —— 「选 A 落 B」的根因(选了来源没地方存)已消除。 */}
+      <PrefsField label={t('settings.tina.prefs.modelLabel')} className="flex-1 basis-[220px]">
+        <ModelSelector
+          remoteAgent={{ devices: sharedDevices.devices, selectedDeviceId: agentDeviceId }}
+          fastModeConfigurable={false}
+          unifiedAgents={pickerAgents}
+          onUnifiedSelect={({ engine, modelId, providerId, effort, agentDevice }) => state.applyPatch(
+            alias,
+            { agentKind: engine === 'cc' ? 'claude-code' : engine, model: modelId, effort: effort || null },
+            providerId,
+            agentDevice?.deviceId ?? null,
+          )}
+          modelId={eff.model.id ?? ''}
+          effort={eff.effort.id ?? ''}
+          vendorKey={vendorKey}
+          triggerVariant="field"
+          popoverSide="bottom"
+          maxVisibleModelRows={maxVisibleModelRows}
+          dense
+          // 可及名上下文与 agent 分段同规则(字段名 · 行别名),多卡片同屏读屏可区分。
+          ariaContext={`${t('settings.tina.prefs.modelLabel')} · ${alias}`}
+          // 当前 Harness 的能力加载失败也能改选其它可用 Harness。
+          disabled={disabled}
+          // 这一行的 modelId 可能是**解析出来的继承值**(prefs.model 为 null 时来自 IM
+          // 新会话默认), 点它的语义是「把继承值钉成本目录的显式偏好」, 必须照常回调 ——
+          // 否则用户点了没反应, 之后上游默认一变这条偏好就被静默改掉。
+          reselectEmitsChange
+          // 已存模型不在可见清单(被隐藏 / 供应商断开 / 目录下架)时显示裸 id 而非
+          // 「选择模型」占位符: 占位符会把「存过但当前不可用」显示成「没选过」, 用户
+          // 既看不到自己存的是什么、也无从判断为何 bot 用的不是它。与本组件接管前
+          // (PrefsSelect 的 modelLabel 回落裸 id)行为一致; 派发侧另有回落并记日志。
+          unknownModelLabel={(id) => id}
+          // 非选中行 hover 配置(推理强度/Fast)与 composer 共用同一份模型级全局预设。
+          modelMemory={agentDeviceId ? agentDeviceModelMemoryAccessors(agentDeviceId) : {
+            getEffort: getProviderModelEffort,
+            setEffort: setProviderModelEffort,
+            setChoice: setProviderModelChoice,
+            getFast: getProviderModelFast,
+            setFast: setProviderModelFast,
+          }}
+          currentProviderId={state.providerSourceFor(alias)}
+          // 分段行原子选择:model/effort 走远端 prefs,成功后来源落本地(串联,
+          // 见 applyPatch 的 alsoProviderSource 注释)。目标行的 provider-specific
+          // effort 由共享 ModelSelector 回传;旧调用方未提供时才回落本地记忆。
+          onProviderChange={(providerId, modelId, reconciledEffort) => {
+            if (eff.agentKind.id === null) return false;
+            const caps = toPrefsCaps(effAgentCaps);
+            if (modelId) {
+              const patch = patchForModelChange(eff.agentKind.id, modelId, prefs, caps);
+              if (reconciledEffort !== undefined) {
+                patch.effort = reconciledEffort || null;
+              } else {
+                const remembered =
+                  providerId && isKnownAgent(eff.agentKind.id)
+                    ? getProviderModelEffort(eff.agentKind.id, providerId, modelId)
+                    : undefined;
+                if (
+                  remembered &&
+                  caps?.models.find((m) => m.id === modelId)?.efforts.includes(remembered)
+                ) {
+                  patch.effort = remembered;
+                }
+              }
+              return state.applyPatch(alias, patch, providerId, agentDeviceId);
+            } else {
+              void state.applyProviderSource(alias, providerId, agentDeviceId);
+            }
+          }}
+          onModelChange={applyModel}
+          onEffortChange={(next) => {
+            if (next !== prefs.effort) return state.applyPatch(alias, { effort: next });
+          }}
+        />
+      </PrefsField>
+      <PrefsField label={t('settings.tina.prefs.permissionLabel')} className="basis-[160px]">
+        <PermissionSelector
+          permissionMode={eff.permissionMode.id ?? HOOK_DEFAULT_PERMISSION_MODE}
+          vendorKey={vendorKey}
+          triggerVariant="field"
+          dense
+          // 可及名上下文与 agent 分段同规则(字段名 · 行别名),多卡片同屏读屏可区分。
+          ariaContext={`${t('settings.tina.prefs.permissionLabel')} · ${alias}`}
+          disabled={disabled || effAgentCaps === null}
+          onPermissionModeChange={(next) => {
+            if (next !== prefs.permissionMode) state.applyPatch(alias, { permissionMode: next });
+          }}
+        />
+      </PrefsField>
+    </div>
+  );
+}

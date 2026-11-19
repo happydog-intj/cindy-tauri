@@ -1,0 +1,19 @@
+{
+  "id": "zsxq-dynamics",
+  "match": [
+    "wx.zsxq.com",
+    "zsxq.com"
+  ],
+  "description": "获取所有星球的最新动态",
+  "access": "read",
+  "adapter": "zsxq/dynamics",
+  "inputs": {
+    "limit": {
+      "required": false,
+      "type": "int",
+      "default": 20,
+      "description": "Number of dynamics to return"
+    }
+  },
+  "steps": []
+}

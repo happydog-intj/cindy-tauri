@@ -1,0 +1,1811 @@
+/**
+ * cindy-subagent —— 写进 pi `PI_CODING_AGENT_DIR/internal-extensions/` 的扩展源码(字符串常量)。
+ *
+ * 为什么是 Cindy 自己的实现,而不是装社区包:
+ *  - pi 上游刻意不内置子代理,社区(`pi-subagents` 等)一律以「扩展 + 子 pi 进程」补齐。
+ *    但整包引入等于把第三方代码塞进 `pi-harness.md` §4.2 划定的自包含注入边界,并跟着上游
+ *    版本跑。这里参考社区与上游示例的设计,只重做我们需要的部分,代码归 Cindy 所有。
+ *  - 沿用 §3 设计原则:直接用 pi 自身能力(`--mode rpc` 子进程、`--tools` 白名单、
+ *    `--append-system-prompt`),不再套一层外部框架、不做二次转义。
+ *
+ * 这段代码跑在 **pi 子进程**(bun runtime)里,不能 import cindy 任何模块;只依赖 pi 的
+ * ExtensionAPI 与 node 内建。约束(与 cindy-bridge 同):模板里**不得出现模板字符串**,
+ * 否则 `${...}` 会被外层 String.raw 插值 —— 一律用字符串拼接。
+ *
+ * 安全形态(重要,别当冗余删掉):
+ *  - 子进程使用独立 `PI_CODING_AGENT_DIR`,显式 `--no-extensions` 关闭隐式发现，再只用
+ *    `--extension <runDir>/cindy-bridge.ts` 回装从内部扩展目录复制的权限门。这样 project extension
+ *    永远不会执行，bridge 的 tool_call 拦截 + 凭证路径硬拦仍对子代理生效。
+ *  - 只读角色固定 read/grep/find/ls；worker/custom-write 才拿 edit/write/bash。Ask/Auto
+ *    下 bridge 产生的 `extension_ui_request` 由 durable runner 记录，父 PI adapter 转交
+ *    Cindy 现有审批 UI，再把 allow/deny 精确回送给对应 child RPC。父任务未加载时不猜测，
+ *    请求保持挂起并在恢复后处理；超时仍由 runner fail-closed 收口。
+ *  - `CINDY_PI_SUBAGENT_DEPTH` 防递归:达到上限后本扩展不注册工具,子代理无法再派子代理。
+ *  - 每个子代理持久化独立会话,恢复时沿用原 session id,不写入父任务的会话 JSONL。
+ *  - foreground child 仍遵守**父死子亡**，由父存活看门狗 + exit 同步清扫兜底。显式
+ *    async 则交给 Cindy detached runner：父 session 导航/卸载只停止 observer，不终止
+ *    child；停止、超时和删除均由持有真实 ChildProcess handle 的 runner 执行。
+ *
+ * 进度回传走 pi 工具原生的 `onUpdate` 流(→ `tool_execution_update`),由
+ * `subagent-progress.ts` 翻成统一 `agent_task_update` → 与 Claude / Codex 共用
+ * `AgentTaskCard`。不另开侧信道。
+ *
+ * 更新方式:PiAgent 每次 startSession 覆写该文件。
+ */
+
+import { PI_GLOBAL_CONTEXT_FILE_NAMES } from './global-context.js';
+
+/** 工具名 —— 与 `@cindy/maker-shared` 的 `PI_SUBAGENT_TOOL_NAME` 必须一致(卡片判据靠它)。 */
+export const CINDY_SUBAGENT_TOOL_NAME = 'subagent';
+
+export const CINDY_SUBAGENT_EXTENSION_FILENAME = 'cindy-subagent.ts';
+export const CINDY_SUBAGENT_RUNNER_CONTROL_TITLE = 'cindy:pi-subagent-runner';
+
+/** Cindy 注入给子进程的 env 名:pi 二进制路径、递归深度、子代理模型。 */
+export const CINDY_SUBAGENT_ENV = {
+  binary: 'CINDY_PI_SUBAGENT_BINARY',
+  depth: 'CINDY_PI_SUBAGENT_DEPTH',
+  /**
+   * 子代理运行期快照文件({model?, provider?})。刻意不用 env 传 model:env 在 spawn 时
+   * 定型,会话中途 setModel 后子代理会继续用旧模型;provider 不一起传还会让同名模型落到
+   * 错误 endpoint。扩展每次派子代理现读本文件(与权限档同机制)。
+   */
+  runtimeFile: 'CINDY_PI_SUBAGENT_RUNTIME_FILE',
+  /** Durable run root owned by Cindy, scoped to the parent session. */
+  runRoot: 'CINDY_PI_SUBAGENT_RUN_ROOT',
+  /** Cindy-generated CommonJS runner staged into each durable run. */
+  runnerFile: 'CINDY_PI_SUBAGENT_RUNNER_FILE',
+  /** Host runtime instance that owns permission sync and approval forwarding. */
+  ownerId: 'CINDY_PI_SUBAGENT_OWNER_ID',
+} as const;
+
+/**
+ * 父进程 pid —— 由**父扩展**在 spawn 子代理时注入(不是 host 注入,所以不在
+ * `CINDY_SUBAGENT_ENV` 里)。子进程里的看门狗靠它判断父进程是否还活着。
+ */
+export const CINDY_SUBAGENT_PARENT_PID_ENV = 'CINDY_PI_SUBAGENT_PARENT_PID';
+
+/** 看门狗轮询间隔:也是父进程死亡后子代理最长残留时间。 */
+export const CINDY_SUBAGENT_PARENT_WATCHDOG_INTERVAL_MS = 2000;
+
+/**
+ * 父存活看门狗 —— 追加在扩展源码末尾(函数声明会提升,所以放最后不影响调用)。
+ *
+ * 为什么必须由**子进程自己**盯着父进程,而不是父进程负责回收:
+ *  - Cindy 的 `PiRpcProcess.close()` 是 SIGTERM → 3s → SIGKILL,两者都只打到 pi 父进程;
+ *    孙进程(子代理)不在同一进程组被信号覆盖,会被 init 收养后继续请求模型、烧额度。
+ *  - 父进程侧能挂的钩子覆盖不全:`process.on('exit')` 在 SIGTERM 默认终止路径上**不触发**,
+ *    SIGKILL 下更不可能有任何代码执行。所以父侧清扫只能当快路径,兜不住主要死法。
+ *  - 刻意**不在扩展里注册 `SIGTERM`/`SIGINT` 处理器**:Node/Bun 里一旦添加信号监听,该信号
+ *    的默认终止行为就被抑制 —— 如果 pi 自身没有别的处理器,pi 收到 SIGTERM 后不会退出,
+ *    每次关会话都得等满 Cindy 的 3s 宽限再被 SIGKILL,把"优雅关闭"变成"必然强杀"。
+ *
+ * 存活判据用 `process.kill(pid, 0)` —— 只做存在性检查,不真的发信号:
+ *  - `EPERM`(进程在、无权发信号)按**活着**处理;其余任何异常都按**已死**处理。方向是刻意
+ *    选的:误判成死 = 子代理中途被杀(用户看到一次失败的子代理),误判成活 = 孤儿进程无上限
+ *    地烧额度 —— 父进程一死,那个 10min 兜底超时的定时器也跟着消失了,没有第二道闸。
+ *  - pid 复用会让判活偏保守(误认为父进程还在),此时只能等子代理自己跑完;这是已知残留风险,
+ *    换来的是绝不误杀正在干活的子代理。
+ *
+ * 平台覆盖:macOS 上已用真 pi 进程实测(父进程 SIGKILL 后子进程 ~1s 自行退出)。Windows 走
+ * libuv 的 `OpenProcess` 存在性检查,语义相同但未实测 —— CI 的 Windows 分片会跑本机制的执行级
+ * 测试,若那里表现不同,以测试结果为准。
+ */
+export const CINDY_SUBAGENT_PARENT_WATCHDOG_SOURCE = String.raw`
+const PARENT_PID_ENV = 'CINDY_PI_SUBAGENT_PARENT_PID';
+const PARENT_WATCHDOG_INTERVAL_MS = 2000;
+
+function installParentWatchdog() {
+  const raw = process.env[PARENT_PID_ENV];
+  const parentPid = typeof raw === 'string' ? Number.parseInt(raw, 10) : Number.NaN;
+  if (!Number.isFinite(parentPid) || parentPid <= 0) return;
+  const timer = setInterval(function () {
+    let alive = true;
+    try {
+      process.kill(parentPid, 0);
+    } catch (err) {
+      // EPERM = 进程在、只是没权限发信号 → 活着。其余(ESRCH 及任何意外错型)按死处理。
+      alive = !!err && err.code === 'EPERM';
+    }
+    if (!alive) {
+      clearInterval(timer);
+      process.exit(0);
+    }
+  }, PARENT_WATCHDOG_INTERVAL_MS);
+  // unref:看门狗自己不留住事件循环,子代理干完活该退就退。
+  if (timer && typeof timer.unref === 'function') timer.unref();
+}
+`;
+
+const CINDY_SUBAGENT_EXTENSION_BODY = String.raw`/**
+ * cindy-subagent (generated by Cindy — do not edit; overwritten on session start)
+ */
+import { spawnSync } from 'node:child_process';
+import { createHmac } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
+import { chmodSync, copyFileSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { basename, dirname, join, resolve } from 'node:path';
+const TOOL_NAME = 'subagent';
+const MARKER = '__cindySubagent';
+const BINARY_ENV = 'CINDY_PI_SUBAGENT_BINARY';
+const DEPTH_ENV = 'CINDY_PI_SUBAGENT_DEPTH';
+const RUNTIME_FILE_ENV = 'CINDY_PI_SUBAGENT_RUNTIME_FILE';
+const RUN_ROOT_ENV = 'CINDY_PI_SUBAGENT_RUN_ROOT';
+const RUNNER_FILE_ENV = 'CINDY_PI_SUBAGENT_RUNNER_FILE';
+const OWNER_ID_ENV = 'CINDY_PI_SUBAGENT_OWNER_ID';
+const PERMISSION_FILE_ENV = 'CINDY_PI_PERMISSION_FILE';
+const PARENT_SESSION_ENV = 'CINDY_PI_SESSION_ID';
+const SESSION_TOKEN_ENV = 'CINDY_PI_SESSION_TOKEN';
+const CONFIG_HOME_ENV = 'PI_CODING_AGENT_DIR';
+// PARENT_PID_ENV 与 PARENT_WATCHDOG_INTERVAL_MS 由末尾追加的看门狗段声明(那段要能独立
+// 跑起来受测)。**别在这里重复声明** —— 同名 const 会让拼接后的模块直接 SyntaxError,
+// 整个扩展加载失败。有测试守这条。
+
+// 子代理不得再派子代理:深度到顶就不注册工具(与 codex agents.max_depth 同语义)。
+const MAX_DEPTH = 1;
+const MAX_TASKS = 8;
+const MAX_CONCURRENCY = 4;
+const DEFAULT_TIMEOUT_SECONDS = 30 * 60;
+const MIN_TIMEOUT_SECONDS = 10;
+const MAX_TIMEOUT_SECONDS = 24 * 60 * 60;
+// 回给父模型的单任务输出上限:子代理的价值是"只回结论",别把全文灌回主线程。
+const MAX_OUTPUT_CHARS = 16000;
+// **调用级**总预算。只限单项没用:8 个任务各 16k 拼起来仍是 ~128k 字符注进父请求,
+// 一次委派就能把父上下文吃掉大半(review)。成功与全失败两条返回路径都要过这道闸。
+const MAX_TOTAL_OUTPUT_CHARS = 32000;
+const MAX_TASK_CHARS = 32000;
+const MAX_MODEL_CHARS = 500;
+const MAX_TITLE_CHARS = 120;
+const MAX_PARENT_CONTEXT_CHARS = 32000;
+// 兜底超时:卡死的子代理不能把父 turn 永久挂住。
+const TASK_TIMEOUT_MS = 10 * 60 * 1000;
+// 写下 stop 控制之后,等 runner 发布终态的宽限期。**每条写 stop 的路径都必须
+// 配一个 deadline**:stopWritten 是单闩,谁先写谁就把它占住,没配 deadline 的那条
+// 会让后面的 deadline 分支永远进不去,runner 卡死时父 turn 就无限轮询下去。
+const STOP_GRACE_MS = 5000;
+// 放弃等待后,给 runner 处理 SIGTERM(杀 children + 写终态)的时间,之后 SIGKILL。
+const RUNNER_TERMINATE_GRACE_MS = 2000;
+// Windows 没有「替换正被别人打开的文件」这回事:host 正在读 status.json 时 rename 会以
+// EPERM/EACCES/EBUSY 失败。共享冲突是毫秒级瞬时的,有界重试即可。
+const RENAME_RETRY_ATTEMPTS = 10;
+const RENAME_RETRY_STEP_MS = 25;
+const RENAME_RETRY_MAX_MS = 100;
+
+// tools 同时是 --tools 白名单。只读角色永不拿写工具；worker/custom-write 的 Ask/Auto
+// 审批通过 child RPC → durable runner → Cindy 审批 UI 往返，未获明确 allow 就 fail-closed。
+const WRITE_TOOLS = 'read,grep,find,ls,edit,write,bash';
+const THINKING_LEVELS = 'off|minimal|low|medium|high|xhigh|max';
+const RUNNER_CONTROL_TITLE = 'cindy:pi-subagent-runner';
+const LAUNCH_RECEIPT = 'Cindy subagent launched. The agent is working in the background.';
+let controlWriteSequence = 0;
+const PROFILES = {
+  scout: {
+    tools: 'read,grep,find,ls',
+    prompt: 'You are a scout subagent. Investigate the codebase and answer the question you were given. '
+      + 'Read only what you need. Report conclusions with file:line anchors — never paste long file contents. '
+      + 'Be concise: the parent agent only needs your findings, not your process.',
+  },
+  reviewer: {
+    tools: 'read,grep,find,ls',
+    prompt: 'You are a code review subagent. Review what you were asked to review and report concrete, '
+      + 'actionable defects with file:line anchors, most severe first. State the failure scenario for each. '
+      + 'Do not restate what the code does. If you find nothing real, say so plainly.',
+  },
+  planner: {
+    tools: 'read,grep,find,ls',
+    prompt: 'You are a planning subagent. Read the relevant code, then produce a concrete implementation plan: '
+      + 'which files change, in what order, and what could break. Cite file:line for every claim about current '
+      + 'behavior. Do not write code.',
+  },
+  worker: {
+    tools: 'read,grep,find,ls',
+    prompt: 'You are a worker subagent. Implement the assigned task with the smallest correct change, validate it, '
+      + 'and report the changed files and verification. Do not expand scope or spawn another subagent.',
+  },
+};
+
+function profileNames() {
+  return Object.keys(PROFILES).join(' | ');
+}
+
+/**
+ * 现读子代理运行期快照(model + provider)。每次派子代理都读 —— 会话中途 setModel 后
+ * 立即生效。
+ *
+ * 读不到返回空对象,调用方**必须据此失败关闭**:退回 pi 默认解析会把 BYOM / 本地
+ * provider 的请求发到错误 endpoint,那比"本次没有子代理"糟糕得多(review)。
+ */
+function readRuntimeSnapshot() {
+  const file = process.env[RUNTIME_FILE_ENV];
+  if (typeof file !== 'string' || file.length === 0) return {};
+  try {
+    const parsed = JSON.parse(readFileSync(file, 'utf8'));
+    if (!parsed || typeof parsed !== 'object') return {};
+    const model = typeof parsed.model === 'string' && parsed.model.trim().length > 0
+      ? parsed.model.trim()
+      : undefined;
+    const provider = typeof parsed.provider === 'string' && parsed.provider.trim().length > 0
+      ? parsed.provider.trim()
+      : undefined;
+    const modelRoutes = {};
+    if (parsed.modelRoutes && typeof parsed.modelRoutes === 'object' && !Array.isArray(parsed.modelRoutes)) {
+      let count = 0;
+      for (const [id, rawRoutes] of Object.entries(parsed.modelRoutes)) {
+        if (++count > 512) break;
+        if (typeof id !== 'string' || id.length === 0 || id.length > MAX_MODEL_CHARS || !Array.isArray(rawRoutes)) continue;
+        const routes = rawRoutes.slice(0, 16).map(function (route) {
+          if (!route || typeof route !== 'object') return null;
+          const routeProvider = typeof route.provider === 'string' ? route.provider.trim() : '';
+          const routeModel = typeof route.model === 'string' ? route.model.trim() : '';
+          const sourceProviderId = typeof route.sourceProviderId === 'string'
+            ? route.sourceProviderId.trim()
+            : '';
+          if (!routeProvider || !routeModel || routeProvider.length > MAX_MODEL_CHARS || routeModel.length > MAX_MODEL_CHARS) {
+            return null;
+          }
+          return {
+            provider: routeProvider,
+            model: routeModel,
+            ...(sourceProviderId && sourceProviderId.length <= MAX_MODEL_CHARS
+              ? { sourceProviderId: sourceProviderId }
+              : {}),
+            ...(route.proxySessionAuth === true && sourceProviderId
+              ? { proxySessionAuth: true }
+              : {}),
+          };
+        }).filter(Boolean);
+        if (routes.length > 0) modelRoutes[id] = routes;
+      }
+    }
+    // pending = host 已写入这份路由但 pi 侧还没确认(set_model RPC 在飞)。这段窗口里派发是
+    // 不安全的:用它就是用未确认的 provider,RPC 若被拒,子进程已经起来了、撤不回。
+    return { model: model, provider: provider, modelRoutes: modelRoutes, pending: parsed.pending === true };
+  } catch (err) {
+    console.error('[cindy-subagent] runtime snapshot unreadable: ' + String(err));
+    return {};
+  }
+}
+
+function enforceIsolation(input) {
+  if (input.isolation !== 'require-worktree') return;
+  const gitDir = spawnSync('git', ['rev-parse', '--git-dir'], {
+    cwd: process.cwd(), encoding: 'utf8', windowsHide: true,
+  });
+  const commonDir = spawnSync('git', ['rev-parse', '--git-common-dir'], {
+    cwd: process.cwd(), encoding: 'utf8', windowsHide: true,
+  });
+  if (gitDir.status !== 0 || commonDir.status !== 0) {
+    throw new Error('subagent: isolation requires a Git worktree-backed parent task.');
+  }
+  const gitPath = resolve(process.cwd(), String(gitDir.stdout || '').trim());
+  const commonPath = resolve(process.cwd(), String(commonDir.stdout || '').trim());
+  if (gitPath === commonPath) {
+    throw new Error('subagent: this parent task is in the primary checkout, not an isolated linked worktree.');
+  }
+}
+
+// Use Pi's model-visible projection: raw branch entries can resurrect content
+// removed by compaction or context edits. Keep the newest request even when a
+// large tool result follows it; omit image bytes and hidden reasoning.
+function parentContextSnapshot(ctx) {
+  const manager = ctx && ctx.sessionManager;
+  if (!manager) return '';
+  let messages;
+  if (typeof manager.buildSessionProjection === 'function') {
+    messages = manager.buildSessionProjection().messages;
+  } else if (typeof manager.buildSessionContext === 'function') {
+    messages = manager.buildSessionContext().messages;
+  } else {
+    // Older Pi exposes compaction-aware entries rather than a projection.
+    const entries = typeof manager.buildContextEntries === 'function'
+      ? manager.buildContextEntries()
+      : null;
+    if (!entries) throw new Error('subagent: Pi cannot project the parent context; use context:fresh.');
+    messages = entries.flatMap(function (entry) {
+      if (entry.type === 'message') return [entry.message];
+      if (entry.type === 'compaction' || entry.type === 'branch_summary') {
+        return [{ role: 'summary', content: entry.summary }];
+      }
+      if (entry.type === 'custom_message') return [{ role: 'custom', content: entry.content }];
+      return [];
+    });
+  }
+  if (!Array.isArray(messages)) return '';
+  const sections = messages.flatMap(function (message, index) {
+    if (!message || message.role === 'system') return [];
+    const content = message.content;
+    const text = typeof content === 'string' ? content : Array.isArray(content)
+      ? content.map(function (block) {
+          if (block && block.type === 'text') return block.text || '';
+          if (block && block.type === 'image') return '[Image omitted from text snapshot]';
+          if (block && block.type === 'toolCall') return '[Tool call: ' + block.name + ']';
+          return '';
+        }).join('') : typeof message.summary === 'string' ? message.summary : '';
+    if (!text.trim()) return [];
+    return [{ index: index, role: message.role, text: String(message.role).toUpperCase()
+      + (message.toolName ? ' (' + message.toolName + ')' : '') + ':\n' + text.trim() }];
+  });
+  const latestUser = sections.filter(function (section) { return section.role === 'user'; }).pop();
+  const summary = sections.filter(function (section) { return /summary/i.test(section.role); }).pop();
+  const selected = new Map();
+  let budget = MAX_PARENT_CONTEXT_CHARS;
+  function keep(section, limit) {
+    if (!section || selected.has(section.index) || budget < 3) return;
+    const size = Math.min(limit, budget - 2);
+    // Long user messages often put corrections after attachments/logs. Retain
+    // both ends and make omission explicit, rather than silently losing the tail.
+    const text = section.text.length > size && section.role === 'user' && size > 80
+      ? section.text.slice(0, Math.floor((size - 30) / 2)) + '\n[… middle omitted …]\n'
+        + section.text.slice(-Math.floor((size - 30) / 2))
+      : clampText(section.text, size);
+    selected.set(section.index, text);
+    budget -= text.length + 2;
+  }
+  keep(latestUser, 16000);
+  keep(summary, 8000);
+  for (let index = sections.length - 1; index >= 0 && budget > 2; index -= 1) {
+    keep(sections[index], sections[index].role === 'toolResult' ? 4000 : 8000);
+  }
+  return [...selected.entries()].sort(function (a, b) { return a[0] - b[0]; })
+    .map(function (entry) { return entry[1]; }).join('\n\n');
+}
+
+function routeProviders(candidates) {
+  const providers = [];
+  for (const route of candidates) {
+    // 同一个字符串可以既是某条路由的来源 id、又是另一条路由的运行期 provider 名
+    // (ChatGPT 的 openai-codex vs 来源 id 为 openai-codex 的自定义连接)。这种时候
+    // 列能唯一定位的那一个,不要让调用方拿到两个都能命中两条连接的名字。
+    const preferred = route.sourceProviderId || route.provider;
+    const collides = candidates.some(function (other) {
+      return other !== route
+        && (other.provider === preferred || (other.sourceProviderId || other.provider) === preferred);
+    });
+    const label = collides ? route.provider : preferred;
+    if (providers.indexOf(label) < 0) providers.push(label);
+  }
+  return providers;
+}
+
+function modelProviderMap(runtime) {
+  const map = {};
+  for (const [id, routes] of Object.entries(runtime.modelRoutes || {})) {
+    const providers = routeProviders(routes);
+    if (providers.length > 0) map[id] = providers;
+  }
+  return map;
+}
+
+/**
+ * 子任务实际跑的模型(= durable config 里的 displayModel)。与宿主读状态文件时同一
+ * 口径:显式指定的模型 > 解析出的路由模型 > 继承父会话模型。
+ */
+function taskDisplayModel(task, runtime) {
+  return task.model || task.routeModel || runtime.model;
+}
+
+/**
+ * 卡片 chip 的模型:批次里所有子任务跑同一个模型才显示,不一致就不猜 —— 与宿主侧读
+ * 状态文件时的 model:null(多模型批次)同义。
+ */
+function singleTaskDisplayModel(tasks, runtime) {
+  let found;
+  for (const task of tasks) {
+    const model = taskDisplayModel(task, runtime);
+    if (!model) continue;
+    if (found !== undefined && found !== model) return undefined;
+    found = model;
+  }
+  return found;
+}
+
+function resolveTaskModelRoutes(tasks, runtime) {
+  const availableModels = Object.keys(runtime.modelRoutes || {}).sort();
+  const availableModelHint = availableModels.length > 0
+    ? ' Available models: ' + availableModels.slice(0, 24).join(', ')
+      + (availableModels.length > 24 ? ', ...' : '') + '.'
+    : ' No models are available in this session.';
+  for (const task of tasks) {
+    if (!task.model && !task.provider) {
+      const currentRoutes = runtime.modelRoutes && Array.isArray(runtime.modelRoutes[runtime.model])
+        ? runtime.modelRoutes[runtime.model]
+        : [];
+      const currentRoute = currentRoutes.find(function (route) {
+        return route.provider === runtime.provider && route.model === runtime.model;
+      });
+      task.routeProvider = currentRoute ? currentRoute.provider : runtime.provider;
+      task.routeModel = currentRoute ? currentRoute.model : runtime.model;
+      task.routeSourceProviderId = currentRoute && currentRoute.sourceProviderId;
+      task.routeProxySessionAuth = !!(currentRoute && currentRoute.proxySessionAuth === true);
+      continue;
+    }
+    const modelId = task.model || runtime.model;
+    const candidates = runtime.modelRoutes && Array.isArray(runtime.modelRoutes[modelId])
+      ? runtime.modelRoutes[modelId]
+      : [];
+    if (task.provider) {
+      // 显式 provider 压过父 provider 与下面的 id 前缀推断。运行期 provider 名和 Cindy
+      // 来源 id 是两个命名空间:同一字符串可能同时命中两条**不同**的连接(ChatGPT 的
+      // openai-codex 与来源 id 为 openai-codex 的自定义连接),所以按路径身份取并集,
+      // 多于一条就拒绝派发 —— 绝不拿“模型名相等”去替调用方选来源(review)。
+      const runtimeMatches = candidates.filter(function (route) {
+        return route.provider === task.provider;
+      });
+      const matches = runtimeMatches.concat(candidates.filter(function (route) {
+        return route.sourceProviderId === task.provider && runtimeMatches.indexOf(route) < 0;
+      }));
+      if (matches.length > 1) {
+        throw new Error(
+          'subagent: provider "' + task.provider + '" matches ' + matches.length
+          + ' connections for model "' + modelId + '". Pass one of: '
+          + routeProviders(matches).join(', ') + '.',
+        );
+      }
+      const route = matches[0];
+      if (!route) {
+        if (candidates.length === 0) {
+          throw new Error(
+            'subagent: model "' + modelId + '" is not available in this session.' + availableModelHint,
+          );
+        }
+        throw new Error(
+          'subagent: provider "' + task.provider + '" does not offer model "' + modelId + '" in this session. '
+          + 'Providers for this model: ' + routeProviders(candidates).join(', ') + '.',
+        );
+      }
+      task.routeProvider = route.provider;
+      task.routeModel = route.model;
+      task.routeSourceProviderId = route.sourceProviderId;
+      task.routeProxySessionAuth = route.proxySessionAuth === true;
+      continue;
+    }
+    const explicitSource = task.model.startsWith('xai/')
+      ? 'xai'
+      : task.model.startsWith('chatgpt/')
+        ? 'openai'
+        : task.model.startsWith('claude-')
+          ? 'anthropic'
+          : '';
+    const sourceCandidates = explicitSource
+      ? candidates.filter(function (route) { return route.sourceProviderId === explicitSource; })
+      : [];
+    const currentProvider = candidates.filter(function (route) {
+      return route.provider === runtime.provider;
+    });
+    const route = sourceCandidates.length === 1
+      ? sourceCandidates[0]
+      : currentProvider.length === 1
+        ? currentProvider[0]
+        : candidates.length === 1
+          ? candidates[0]
+          : null;
+    // 未传 provider 时的**既有**顺序:模型 id 前缀隐含的来源 > 父会话 provider > 唯一候选。
+    // 本 PR 只给显式 provider 加分支,不调整它(review: 正文曾把这段误写成“父来源优先”)。
+    if (!route) {
+      if (candidates.length > 1) {
+        throw new Error(
+          'subagent: model "' + task.model + '" is available from multiple providers: '
+          + routeProviders(candidates).join(', ') + '. Pass provider to choose one, or switch the parent '
+          + 'to the intended provider before delegating.',
+        );
+      }
+      throw new Error(
+        'subagent: model "' + task.model + '" is not available in this session.'
+        + availableModelHint,
+      );
+    }
+    task.routeProvider = route.provider;
+    task.routeModel = route.model;
+    task.routeSourceProviderId = route.sourceProviderId;
+    task.routeProxySessionAuth = route.proxySessionAuth === true;
+  }
+}
+
+function deriveRouteProxySessionToken(task) {
+  if (task.routeProxySessionAuth !== true) return '';
+  const parentToken = process.env[SESSION_TOKEN_ENV];
+  const sourceProviderId = task.routeSourceProviderId;
+  if (
+    typeof parentToken !== 'string'
+    || !/^[A-Za-z0-9_-]{32,256}$/.test(parentToken)
+    || typeof sourceProviderId !== 'string'
+    || !/^[A-Za-z0-9._-]{1,128}$/.test(sourceProviderId)
+  ) {
+    throw new Error('subagent: provider-scoped proxy authentication is unavailable.');
+  }
+  return createHmac('sha256', parentToken)
+    .update('cindy.pi.subagent-route\0' + sourceProviderId)
+    .digest('base64url');
+}
+
+// 受邀者(另一个账号)的托管会话(CINDY_PI_HOSTED.guest)：子代理同样不读本机用户的说明文件与技能。
+function hostedGuestSession() {
+  try {
+    const raw = process.env.CINDY_PI_HOSTED;
+    return !!raw && JSON.parse(raw).guest === true;
+  } catch (err) {
+    return false;
+  }
+}
+
+function readDepth() {
+  const raw = process.env[DEPTH_ENV];
+  const parsed = typeof raw === 'string' ? Number.parseInt(raw, 10) : 0;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+function readPermissionSnapshot() {
+  const file = process.env[PERMISSION_FILE_ENV];
+  if (typeof file !== 'string' || file.length === 0) return { mode: 'ask' };
+  try {
+    const parsed = JSON.parse(readFileSync(file, 'utf8'));
+    return parsed && parsed.mode === 'bypassPermissions'
+      ? { mode: 'bypassPermissions' }
+      : { mode: 'ask' };
+  } catch (err) {
+    return { mode: 'ask' };
+  }
+}
+
+function copyManagedRipgrep(parentHome, childHome) {
+  const name = process.platform === 'win32' ? 'rg.exe' : 'rg';
+  const source = join(parentHome, 'bin', name);
+  try {
+    if (!statSync(source).isFile()) return;
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return;
+    throw error;
+  }
+  const destDir = join(childHome, 'bin');
+  mkdirSync(destDir, { recursive: true, mode: 0o700 });
+  const dest = join(destDir, name);
+  copyFileSync(source, dest);
+  try { chmodSync(dest, 0o755); } catch (err) { /* best effort on Windows */ }
+}
+
+function toolsFor(agent, permission) {
+  if (agent !== 'worker') return PROFILES[agent].tools;
+  // Ask/Auto are enforced by cindy-bridge inside the child. Its RPC UI request
+  // is forwarded through the durable runner to the parent Cindy approval UI.
+  return WRITE_TOOLS;
+}
+
+function toolsForTask(task, permission) {
+  return toolsFor(task.agent, permission);
+}
+
+function sleepSync(ms) {
+  try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch (err) { /* unsupported */ }
+}
+
+function writePrivateJson(file, value) {
+  const tmp = file + '.tmp-' + process.pid + '-' + randomUUID();
+  writeFileSync(tmp, JSON.stringify(value) + '\n', { mode: 0o600 });
+  // Replacing status.json races the Host reading it; on Windows that surfaces as
+  // a transient EPERM / EACCES / EBUSY sharing violation rather than a lost
+  // write, so retry briefly before giving the failure to the caller.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      renameSync(tmp, file);
+      break;
+    } catch (err) {
+      const code = err && err.code;
+      const transient = code === 'EPERM' || code === 'EACCES' || code === 'EBUSY';
+      if (!transient || attempt >= RENAME_RETRY_ATTEMPTS - 1) {
+        try { rmSync(tmp, { force: true }); } catch (cleanupError) { /* best effort */ }
+        throw err;
+      }
+      sleepSync(Math.min(RENAME_RETRY_STEP_MS * (attempt + 1), RENAME_RETRY_MAX_MS));
+    }
+  }
+  try { chmodSync(file, 0o600); } catch (err) { /* best effort on Windows */ }
+}
+
+function readDurableStatus(runId) {
+  const root = process.env[RUN_ROOT_ENV];
+  if (!root || typeof runId !== 'string' || !/^[0-9a-f-]{36}$/i.test(runId)) return null;
+  try {
+    const file = join(root, runId, 'status.json');
+    const stat = statSync(file);
+    if (!stat.isFile() || stat.size > 2 * 1024 * 1024) return null;
+    const status = JSON.parse(readFileSync(file, 'utf8'));
+    return status && status.version === 1 && status.runId === runId ? status : null;
+  } catch (err) { return null; /* transiently unreadable status */ }
+}
+
+function durableStatuses() {
+  const root = process.env[RUN_ROOT_ENV];
+  const runtimeOwnerId = process.env[OWNER_ID_ENV];
+  if (!root || !runtimeOwnerId) return [];
+  let entries;
+  try { entries = readdirSync(root, { withFileTypes: true }); } catch (err) { return []; }
+  const statuses = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !/^[0-9a-f-]{36}$/i.test(entry.name)) continue;
+    const status = readDurableStatus(entry.name);
+    // Only explicit list/management discovery scans history. Never expose
+    // legacy or foreign-owner results through the model's control plane.
+    if (status && status.runtimeOwnerId === runtimeOwnerId) statuses.push(status);
+  }
+  return statuses.sort(function (left, right) { return Number(right.startedAt || 0) - Number(left.startedAt || 0); });
+}
+
+function writeControlRequest(runDir, control) {
+  const controlDir = join(runDir, 'controls');
+  const runStat = lstatSync(runDir);
+  if (runStat.isSymbolicLink() || !runStat.isDirectory()) {
+    throw new Error('subagent run directory is unavailable');
+  }
+  try { mkdirSync(controlDir, { mode: 0o700 }); } catch (err) {
+    if (!err || err.code !== 'EEXIST') throw err;
+  }
+  const controlStat = lstatSync(controlDir);
+  if (controlStat.isSymbolicLink() || !controlStat.isDirectory()) {
+    throw new Error('subagent control directory is unavailable');
+  }
+  try { chmodSync(controlDir, 0o700); } catch (err) { /* best effort on Windows */ }
+  const requestId = randomUUID();
+  const requestedAt = Date.now();
+  controlWriteSequence = (controlWriteSequence + 1) % 1000;
+  writePrivateJson(join(controlDir, requestId + '.json'), {
+    version: 1,
+    seq: requestedAt * 1000 + controlWriteSequence,
+    requestId: requestId,
+    requestedAt: requestedAt,
+    ...control,
+  });
+  return requestId;
+}
+
+function isTerminalStatus(state) {
+  return state === 'completed' || state === 'failed' || state === 'stopped';
+}
+
+function selectedTasks(status, childId) {
+  const tasks = childId ? status.tasks.filter(function (task) { return task.childId === childId; }) : status.tasks;
+  if (!tasks.length) throw new Error('subagent: childId does not belong to this run');
+  return tasks;
+}
+
+function describeRun(status, childId) {
+  const sections = selectedTasks(status, childId).map(function (task) {
+    return '## ' + (task.title || task.agent) + ' [' + task.status + '] childId=' + task.childId
+      + (task.error ? '\nError: ' + task.error : '')
+      + '\n' + (task.output || '(no output)');
+  });
+  return 'runId=' + status.runId + ' [' + status.state + ']\n' + fitSectionsToBudget(sections).join('\n\n');
+}
+
+async function writeDurableControl(status, action, message, childId, signal) {
+  const root = process.env[RUN_ROOT_ENV];
+  if (!root) throw new Error('subagent: durable storage is unavailable');
+  if (signal && signal.aborted) throw new Error('subagent: control cancelled before delivery');
+  const runDir = join(root, status.runId);
+  const requestId = writeControlRequest(runDir, {
+    action: action, acknowledge: true,
+    ...(childId ? { childId: childId } : {}),
+    ...(message ? { message: message } : {}),
+  });
+  const receiptFile = join(runDir, 'control-receipts', requestId + '.json');
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    let receipt;
+    try { receipt = JSON.parse(readFileSync(receiptFile, 'utf8')); } catch (err) { /* not acknowledged yet */ }
+    if (receipt && receipt.requestId === requestId) {
+      if (receipt.accepted !== true) throw new Error('subagent: ' + action + ' rejected: ' + (receipt.reason || 'not accepted'));
+      return action + ' accepted by the runner for ' + (childId || status.runId) + '.';
+    }
+    if (signal && signal.aborted) break;
+    await new Promise(function (resolve) { setTimeout(resolve, 50); });
+  }
+  // The write may already have been consumed. Never tell the model to replay it.
+  throw new Error('subagent: control receipt unavailable; delivery is uncertain. Inspect the run before retrying. requestId=' + requestId);
+}
+
+async function managementResult(params, ctx, signal, delivery) {
+  const action = params.action;
+  if (action === 'capabilities') {
+    const runtime = readRuntimeSnapshot();
+    return JSON.stringify({ roles: Object.keys(PROFILES).map(function (agent) {
+      return { agent: agent, tools: toolsFor(agent).split(',') };
+    }), models: Object.keys(runtime.modelRoutes || {}),
+      modelProviders: modelProviderMap(runtime),
+      maxTasks: MAX_TASKS, concurrency: MAX_CONCURRENCY, context: ['fresh', 'fork'],
+      actions: ['run', 'list', 'get', 'wait', 'stop', 'steer', 'follow_up', 'resume'] });
+  }
+  if (!['list', 'get', 'wait', 'stop', 'steer', 'follow_up', 'resume'].includes(action)) {
+    throw new Error('subagent: unknown management action');
+  }
+  const statuses = durableStatuses();
+  if (action === 'list') {
+    if (statuses.length === 0) return 'No durable PI Subagent runs.';
+    return statuses.map(function (status) {
+      return status.runId + ' · ' + status.state + ' · ' + (status.title || status.description || status.taskId)
+        + '\n' + status.tasks.map(function (task) { return '  ' + task.childId + ' · ' + task.agent + ' · ' + task.status; }).join('\n');
+    }).join('\n');
+  }
+  const taskId = typeof params.taskId === 'string' ? params.taskId.trim() : '';
+  if (!taskId) throw new Error('subagent: action ' + action + ' requires taskId (runId or tool call id)');
+  const status = statuses.find(function (entry) { return entry.taskId === taskId || entry.runId === taskId; });
+  if (!status) throw new Error('subagent: durable task not found');
+  if (params.childId !== undefined && (typeof params.childId !== 'string' || !params.childId.trim())) {
+    throw new Error('subagent: childId must be a non-empty exact child id');
+  }
+  const childId = typeof params.childId === 'string' ? params.childId.trim() : '';
+  selectedTasks(status, childId);
+  if (action === 'get') {
+    if (!childId && isTerminalStatus(status.state)) delivery.consume(status.runId);
+    return describeRun(status, childId);
+  }
+  if (action === 'wait') {
+    const seconds = params.waitSeconds === undefined ? 30 : params.waitSeconds;
+    if (!Number.isInteger(seconds) || seconds < 0 || seconds > 60) throw new Error('subagent: waitSeconds must be from 0 to 60');
+    const deadline = Date.now() + seconds * 1000;
+    let current = status;
+    while (!selectedTasks(current, childId).every(function (task) { return isTerminalStatus(task.status); })) {
+      if (signal && signal.aborted) throw new Error('subagent: wait cancelled; children remain independently controllable');
+      if (Date.now() >= deadline) break;
+      await new Promise(function (resolve) { setTimeout(resolve, 100); });
+      current = durableStatuses().find(function (entry) { return entry.runId === status.runId; });
+      if (!current) throw new Error('subagent: run is no longer available');
+    }
+    if (!childId && isTerminalStatus(current.state)) delivery.consume(current.runId);
+    return describeRun(current, childId);
+  }
+  const message = typeof params.message === 'string' ? params.message.trim() : '';
+  if (action !== 'stop' && (!message || message.length > MAX_TASK_CHARS)) {
+    throw new Error('subagent: ' + action + ' requires a message up to ' + MAX_TASK_CHARS + ' characters');
+  }
+  if (action === 'resume') {
+    if (!isTerminalStatus(status.state)) throw new Error('subagent: run is still active; use steer or follow_up');
+    if (signal && signal.aborted) throw new Error('subagent: resume cancelled');
+    const resumed = await requestRunnerControl(ctx, 'resume', status.runId, { message: message, childId: childId || undefined });
+    if (typeof resumed.runId !== 'string' || !/^[0-9a-f-]{36}$/i.test(resumed.runId)) throw new Error('subagent: invalid resume receipt');
+    delivery.track(resumed.runId, undefined, params.notify !== false);
+    return 'Subagent resumed. runId=' + resumed.runId + '. Use wait/get to collect the result.';
+  }
+  if (isTerminalStatus(status.state)) {
+    if (action === 'stop') return 'Subagent is already terminal. ' + describeRun(status, childId);
+    throw new Error('subagent: durable task is already terminal; use action:resume to continue its retained session');
+  }
+  return writeDurableControl(status, action, message, childId, signal);
+}
+
+function writeApprovalControl(runDir, childId, approvalId, response) {
+  const control = {
+    action: 'approval',
+    childId: childId,
+    approvalId: approvalId,
+  };
+  if (typeof response === 'string') control.value = response;
+  else control.confirmed = response === true;
+  writeControlRequest(runDir, control);
+}
+
+async function waitForDurableRun(launched, signal, ctx, onStatus) {
+  const handledApprovals = new Set();
+  const approvalDecisions = new Map();
+  let stopWritten = false;
+  let stopDeadline = 0;
+  let nextHostPoll = 0;
+  for (;;) {
+    let status;
+    try { status = JSON.parse(readFileSync(join(launched.runDir, 'status.json'), 'utf8')); } catch (err) { status = null; }
+    if (signal && signal.aborted && !stopWritten) {
+      stopWritten = true;
+      // Abort must be bounded exactly like the run deadline is. Without its own
+      // grace window this branch consumed the single stopWritten latch, the
+      // deadline branch below could then never arm one, and a runner that never
+      // consumes the control file left this loop polling forever — the parent
+      // turn could not finish cancelling.
+      stopDeadline = Date.now() + STOP_GRACE_MS;
+      writeControlRequest(launched.runDir, { action: 'stop' });
+    }
+    if (status) {
+      onStatus(status);
+      for (const task of Array.isArray(status.tasks) ? status.tasks : []) {
+        const approval = task && task.pendingApproval;
+        if (!approval || typeof approval.id !== 'string') continue;
+        const key = String(task.childId) + ':' + approval.id;
+        if (handledApprovals.has(key)) continue;
+        let response = approvalDecisions.get(key);
+        if (response === undefined) {
+          response = approval.method === 'input' ? 'system-deny' : false;
+          try {
+            if (approval.method === 'input' && ctx && ctx.ui && typeof ctx.ui.input === 'function') {
+              const value = await ctx.ui.input(
+                approval.title || 'cindy:permission',
+                approval.placeholder || '{}',
+              );
+              response = typeof value === 'string' && value.length > 0 ? value : 'system-deny';
+            } else if (approval.method === 'confirm' && ctx && ctx.ui && typeof ctx.ui.confirm === 'function') {
+              response = await ctx.ui.confirm(
+                approval.title || 'cindy:permission',
+                approval.message || '{}',
+              );
+            }
+          } catch (err) {
+            response = approval.method === 'input' ? 'system-deny' : false;
+          }
+          approvalDecisions.set(key, response);
+        }
+        try {
+          writeApprovalControl(launched.runDir, String(task.childId), approval.id, response);
+          handledApprovals.add(key);
+          approvalDecisions.delete(key);
+        } catch (err) {
+          /* Retry mailbox delivery without asking the user a second time. */
+        }
+      }
+      if (status.state === 'completed' || status.state === 'failed' || status.state === 'stopped') return status;
+    }
+    if (Date.now() >= nextHostPoll) {
+      nextHostPoll = Date.now() + 1000;
+      try {
+        await requestRunnerControl(ctx, 'status', launched.runId);
+      } catch (err) {
+        if (err && err.runnerExited) {
+          let latest = null;
+          try { latest = JSON.parse(readFileSync(join(launched.runDir, 'status.json'), 'utf8')); } catch (readErr) { latest = null; }
+          if (latest && (latest.state === 'completed' || latest.state === 'failed' || latest.state === 'stopped')) {
+            onStatus(latest);
+            return latest;
+          }
+          const message = err instanceof Error ? err.message : String(err);
+          return launched.failureStatus(message);
+        }
+      }
+    }
+    if (Date.now() >= launched.deadlineAt && !stopWritten) {
+      stopWritten = true;
+      stopDeadline = Date.now() + STOP_GRACE_MS;
+      writeControlRequest(launched.runDir, { action: 'stop' });
+    } else if (stopDeadline > 0 && Date.now() >= stopDeadline) {
+      const message = signal && signal.aborted
+        ? 'Durable runner did not acknowledge the cancellation before its stop deadline.'
+        : 'Durable runner did not publish a terminal status before its deadline.';
+      // Reporting "stopped" while the runner keeps working is the real damage:
+      // the caller tells the user the task is over and the durable record hides
+      // the stop control, but the detached children go on editing the workspace
+      // and spending tokens for up to the run's own 24h bound. Terminate for
+      // real first, then synthesise the terminal status.
+      await launched.terminate(message);
+      return launched.failureStatus(message);
+    }
+    await new Promise(function (resolve) { setTimeout(resolve, 100); });
+  }
+}
+
+// Cross-process launch fence, written by the Host into the shared runs
+// directory while it is restarting for an update. The file name carries the
+// host pid that owns it, because this agent home is shared by dev, packaged and
+// every --passive launch: a single shared name let one updating instance
+// overwrite or delete another's fence, and the loser's own launcher then read a
+// fence naming somebody else, ignored it, and spawned right through the window.
+// We only obey the fence belonging to *our* host, and only while its process is
+// alive. Host side and full protocol: piSubagentLaunchFencePath in
+// pi-subagent-runs.ts.
+const LAUNCH_FENCE_PREFIX = '.launch-fence-';
+const LAUNCH_FENCE_SUFFIX = '.json';
+// Pre-per-host name, still read so a half-upgraded pair of instances does not
+// leave a gap. Removable once no shipped build writes the shared name.
+const LEGACY_LAUNCH_FENCE_FILENAME = '.launch-fence.json';
+const DELETED_TOMBSTONE_DIR = 'pi-subagent-deleted';
+
+// Same tolerance the Host uses: ps rounds to the second and samples after the
+// clock is read.
+const FENCE_START_TOLERANCE_SEC = 5;
+
+function hostProcessIsAlive(hostPid) {
+  try {
+    process.kill(hostPid, 0);
+    return true;
+  } catch (err) {
+    return !!err && err.code === 'EPERM';
+  }
+}
+
+function fenceNamesLiveHost(file, hostPid, hostStartTimeSec) {
+  let fence;
+  try {
+    fence = JSON.parse(readFileSync(file, 'utf8'));
+  } catch (err) {
+    // Only a genuinely absent file means "no fence". Every other failure —
+    // a Windows sharing conflict while the Host rewrites it, a permission
+    // error, or content that does not parse because we caught it mid-write —
+    // means the fence is temporarily unverifiable, and the window it exists to
+    // close is exactly the one we would spawn into. Fail closed instead: this
+    // is a transient condition and the caller is told to retry.
+    //
+    // Applied to the legacy shared name too, even though its file name cannot
+    // prove it is ours. Being unable to read it is precisely being unable to
+    // rule that out, and refusing costs a retry during another instance's
+    // update, while allowing costs a runner that survives the boundary sweep.
+    if (err && err.code === 'ENOENT') return false;
+    return hostProcessIsAlive(hostPid);
+  }
+  if (!fence || fence.version !== 1 || fence.hostPid !== hostPid) return false;
+  // A fence that outlived a host crash and had its pid recycled onto the host
+  // we belong to would otherwise block every launch for that host's whole life.
+  // Only compare when both sides recorded a start time; either side missing it
+  // falls back to the pid-only answer.
+  if (typeof fence.hostStartTimeSec === 'number' && hostStartTimeSec !== null) {
+    if (Math.abs(fence.hostStartTimeSec - hostStartTimeSec) > FENCE_START_TOLERANCE_SEC) return false;
+  }
+  return hostProcessIsAlive(hostPid);
+}
+
+function parentTaskDeletedTombstone(runRoot) {
+  const file = join(dirname(dirname(runRoot)), DELETED_TOMBSTONE_DIR, basename(runRoot));
+  try {
+    statSync(file);
+    return true;
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return false;
+    // Unreadable is fail-closed: a concurrent write of the tombstone is the
+    // window this exists to close.
+    return true;
+  }
+}
+
+function launchFenceBlocksSpawn(runRoot, runtimeOwnerId) {
+  const separator = runtimeOwnerId.indexOf(':');
+  if (separator <= 0) return false;
+  // Owner ids are <pid>:<scope> or <pid>.<startSec>:<scope>. Both segments are
+  // read here, deliberately without importing the Host's parser.
+  const host = runtimeOwnerId.slice(0, separator);
+  const dot = host.indexOf('.');
+  const hostPid = Number(dot < 0 ? host : host.slice(0, dot));
+  if (!Number.isSafeInteger(hostPid) || hostPid <= 0) return false;
+  let hostStartTimeSec = null;
+  if (dot >= 0) {
+    const parsedStart = Number(host.slice(dot + 1));
+    if (Number.isSafeInteger(parsedStart) && parsedStart > 0) hostStartTimeSec = parsedStart;
+  }
+  const fenceDir = dirname(runRoot);
+  const owned = join(fenceDir, LAUNCH_FENCE_PREFIX + String(hostPid) + LAUNCH_FENCE_SUFFIX);
+  if (fenceNamesLiveHost(owned, hostPid, hostStartTimeSec)) return true;
+  return fenceNamesLiveHost(join(fenceDir, LEGACY_LAUNCH_FENCE_FILENAME), hostPid, hostStartTimeSec);
+}
+
+async function requestRunnerControl(ctx, action, runId, options = {}) {
+  if (!ctx || !ctx.ui || typeof ctx.ui.input !== 'function') {
+    throw new Error('subagent: Cindy runner control is unavailable.');
+  }
+  const raw = await ctx.ui.input(
+    RUNNER_CONTROL_TITLE,
+    JSON.stringify({ ...options, action: action, runId: runId }),
+  );
+  let response;
+  try { response = JSON.parse(typeof raw === 'string' ? raw : '{}'); } catch (err) { response = null; }
+  if (response && response.exited === true) {
+    throw Object.assign(
+      new Error(typeof response.error === 'string' && response.error
+        ? response.error
+        : 'Durable runner exited'),
+      { runnerExited: true },
+    );
+  }
+  if (response && response.unconfirmed === true) {
+    throw Object.assign(
+      new Error('subagent: Cindy could not ' + action + ' the durable runner.'),
+      { unconfirmed: true },
+    );
+  }
+  if (!response || response.ok !== true) {
+    throw Object.assign(
+      new Error('subagent: Cindy could not ' + action + ' the durable runner.'),
+      { runnerRejected: !!response && response.ok === false && typeof response.error === 'string' },
+    );
+  }
+  return response;
+}
+
+async function launchDurableRun(binary, tasks, runtime, taskId, mode, context, displayTitle, interactiveOwner, timeoutMs, ctx) {
+  const runRoot = process.env[RUN_ROOT_ENV];
+  const runnerFile = process.env[RUNNER_FILE_ENV];
+  const configHome = process.env[CONFIG_HOME_ENV];
+  const sourcePermissionFile = process.env[PERMISSION_FILE_ENV];
+  const parentSessionId = process.env[PARENT_SESSION_ENV];
+  const runtimeOwnerId = process.env[OWNER_ID_ENV];
+  if (!runRoot || !runnerFile || !configHome || !sourcePermissionFile || !parentSessionId || !runtimeOwnerId) {
+    throw new Error('subagent: durable runner is unavailable for this session.');
+  }
+  const permission = readPermissionSnapshot();
+  const runId = randomUUID();
+  const runDir = join(runRoot, runId);
+  const permissionFile = join(runDir, 'permission.json');
+  const childConfigHome = join(runDir, 'pi-home');
+  const bridgeExtension = join(runDir, 'cindy-bridge.ts');
+  const childSessionRoot = join(runDir, 'sessions');
+  const config = {
+    version: 1,
+    runId: runId,
+    taskId: taskId,
+    parentSessionId: parentSessionId,
+    runtimeOwnerId: runtimeOwnerId,
+    parentPid: process.pid,
+    parentStartTimeSec: Math.round(Date.now() / 1000 - process.uptime()),
+    interactiveOwner: interactiveOwner,
+    runDir: runDir,
+    cwd: process.cwd(),
+    binary: binary,
+    childConfigHome: childConfigHome,
+    bridgeExtension: bridgeExtension,
+    permissionFile: permissionFile,
+    depth: readDepth() + 1,
+    mode: tasks.length > 1 ? 'parallel' : 'single',
+    context: context,
+    title: typeof displayTitle === 'string' && displayTitle.trim()
+      ? displayTitle.trim().slice(0, MAX_TITLE_CHARS)
+      : tasks.length === 1
+        ? (tasks[0].title || tasks[0].task.slice(0, MAX_TITLE_CHARS))
+        : tasks.map(function (task) {
+            return task.title || task.task.replace(/\s+/g, ' ').trim().slice(0, 60);
+          }).join(' · ').slice(0, MAX_TITLE_CHARS),
+    description: tasks.length === 1
+      ? (tasks[0].originalTask || tasks[0].task)
+      : tasks.map(function (task) {
+          return '## ' + (task.title || task.agent) + '\n' + (task.originalTask || task.task);
+        }).join('\n\n'),
+    concurrency: MAX_CONCURRENCY,
+    timeoutMs: timeoutMs,
+    tasks: tasks.map(function (task, index) {
+      const childId = runId + '-' + String(index + 1);
+      return {
+        childId: childId,
+        stepId: task.id,
+        dependsOn: task.dependsOn,
+        sessionId: childId,
+        sessionDir: childSessionRoot,
+        agent: task.agent,
+        title: task.title || task.task.slice(0, MAX_TITLE_CHARS),
+        task: task.task,
+        tools: toolsForTask(task, permission),
+        profilePrompt: task.profilePrompt,
+        provider: task.routeProvider || runtime.provider,
+        model: task.routeModel || runtime.model,
+        displayModel: taskDisplayModel(task, runtime),
+        sourceProviderId: task.routeSourceProviderId,
+        proxySessionAuth: task.routeProxySessionAuth === true,
+        thinking: task.thinking || undefined,
+        cwd: process.cwd(),
+      };
+    }),
+  };
+  if (hostedGuestSession()) config.guestIsolation = true;
+  const configPath = join(runDir, 'config.json');
+  const durableRunnerFile = join(runDir, 'runner.cjs');
+  try {
+    mkdirSync(runDir, { recursive: true, mode: 0o700 });
+    // Publish the intent *before* reading the fence, and read the fence before
+    // anything is spawned. That ordering is the whole mutual exclusion, and it
+    // needs no lock:
+    //
+    //   host:     write fence  ->  scan until stable
+    //   launcher: write runDir ->  read fence
+    //
+    // The two orders are opposite, so consider the only two outcomes. If the
+    // launcher reads no fence, the fence write happened after that read, and
+    // this runDir was written before it — so every scan the host performs (all
+    // of them after its fence write) sees this directory, counts it active
+    // (parsed as 'queued', or unreadable and therefore counted conservatively),
+    // and the relaunch is cancelled or the next reclaim round collects it. If
+    // the launcher reads a fence, it refuses and rolls back below. No
+    // interleaving lets a run escape both.
+    const launchStartedAt = Date.now();
+    writePrivateJson(join(runDir, 'status.json'), {
+      version: 1,
+      runId: runId,
+      taskId: taskId,
+      parentSessionId: parentSessionId,
+      runtimeOwnerId: runtimeOwnerId,
+      runnerInstanceId: 'launch-pending-' + runId,
+      state: 'queued',
+      title: config.title,
+      description: config.description,
+      startedAt: launchStartedAt,
+      updatedAt: launchStartedAt,
+      tasks: config.tasks.map(function (task) {
+        return {
+          childId: task.childId,
+          sessionId: task.sessionId,
+          agent: task.agent,
+          title: task.title,
+          status: 'queued',
+        };
+      }),
+    });
+    if (launchFenceBlocksSpawn(runRoot, runtimeOwnerId)) {
+      throw new Error('subagent: Cindy is restarting for an update; retry shortly.');
+    }
+    if (parentTaskDeletedTombstone(runRoot)) {
+      throw new Error('subagent: the parent task was deleted; this launch will not start.');
+    }
+    try { chmodSync(runDir, 0o700); } catch (err) { /* best effort on Windows */ }
+    copyFileSync(sourcePermissionFile, permissionFile);
+    try { chmodSync(permissionFile, 0o600); } catch (err) { /* best effort on Windows */ }
+    mkdirSync(childConfigHome, { recursive: true, mode: 0o700 });
+    copyFileSync(join(configHome, 'models.json'), join(childConfigHome, 'models.json'));
+    // Freeze the same learned rules as models.json for durable children.
+    const childCacheRules = join(childConfigHome, 'pi-cache-compatibility.json');
+    try {
+      copyFileSync(join(configHome, 'pi-cache-compatibility.json'), childCacheRules);
+      chmodSync(childCacheRules, 0o600);
+    } catch (error) {
+      if (!error || error.code !== 'ENOENT') throw error;
+    }
+    // Parent configHome is ephemeral. Durable children outlive it, so Pi native
+    // grep (PI_CODING_AGENT_DIR/bin) and the Cindy find override need a private copy.
+    copyManagedRipgrep(configHome, childConfigHome);
+    // Inherit the parent's frozen rules, not the possibly edited native user
+    // home. Child config outlives the parent when a durable run is detached.
+    for (const name of ${JSON.stringify(PI_GLOBAL_CONTEXT_FILE_NAMES)}) {
+      const childContextFile = join(childConfigHome, name);
+      try {
+        copyFileSync(join(configHome, name), childContextFile);
+      } catch (error) {
+        if (error && error.code === 'ENOENT') continue;
+        throw error;
+      }
+      try { chmodSync(childContextFile, 0o600); } catch (err) { /* best effort on Windows */ }
+      break;
+    }
+    copyFileSync(join(configHome, 'internal-extensions', 'cindy-bridge.ts'), bridgeExtension);
+    try { chmodSync(join(childConfigHome, 'models.json'), 0o600); } catch (err) { /* best effort on Windows */ }
+    try { chmodSync(bridgeExtension, 0o600); } catch (err) { /* best effort on Windows */ }
+    mkdirSync(childSessionRoot, { recursive: true, mode: 0o700 });
+    writePrivateJson(configPath, config);
+    copyFileSync(runnerFile, durableRunnerFile);
+    try { chmodSync(durableRunnerFile, 0o600); } catch (err) { /* best effort on Windows */ }
+    if (launchFenceBlocksSpawn(runRoot, runtimeOwnerId)) {
+      throw new Error('subagent: Cindy is restarting for an update; retry shortly.');
+    }
+    if (parentTaskDeletedTombstone(runRoot)) {
+      throw new Error('subagent: the parent task was deleted; this launch will not start.');
+    }
+  } catch (err) {
+    try { rmSync(runDir, { recursive: true, force: true }); } catch (_) { /* best effort cleanup */ }
+    throw err;
+  }
+  const failureStatus = function (message) {
+    const now = Date.now();
+    return {
+      version: 1,
+      runId: runId,
+      taskId: taskId,
+      parentSessionId: parentSessionId,
+      runtimeOwnerId: runtimeOwnerId,
+      runnerInstanceId: 'launch-error-' + runId,
+      state: 'failed',
+      title: config.title,
+      description: config.description,
+      startedAt: now,
+      updatedAt: now,
+      endedAt: now,
+      tasks: config.tasks.map(function (task) {
+        return {
+          childId: task.childId,
+          sessionId: task.sessionId,
+          agent: task.agent,
+          title: task.title,
+          status: 'failed',
+          error: String(message).slice(0, 4000),
+          endedAt: now,
+        };
+      }),
+    };
+  };
+  const persistFailureIfNeeded = function (message) {
+    try {
+      let current = null;
+      try { current = JSON.parse(readFileSync(join(runDir, 'status.json'), 'utf8')); } catch (err) { current = null; }
+      if (current && (current.state === 'completed' || current.state === 'failed' || current.state === 'stopped')) return;
+      writePrivateJson(join(runDir, 'status.json'), failureStatus(message));
+    } catch {
+      /* No safe fallback remains when both host launch and private status persistence fail. */
+    }
+  };
+  try {
+    await requestRunnerControl(ctx, 'launch', runId);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (!(err && err.unconfirmed)) persistFailureIfNeeded(message);
+    throw err;
+  }
+
+  const terminateRunner = async function (message) {
+    let unconfirmed = false;
+    try {
+      await requestRunnerControl(ctx, 'terminate', runId);
+    } catch (err) {
+      unconfirmed = Boolean(err && err.unconfirmed);
+      /* Host-side account and exit sweeps remain the final cleanup boundary. */
+    }
+    const hardDeadline = Date.now() + RUNNER_TERMINATE_GRACE_MS;
+    while (Date.now() < hardDeadline) {
+      try {
+        const current = JSON.parse(readFileSync(join(runDir, 'status.json'), 'utf8'));
+        if (current && (current.state === 'completed' || current.state === 'failed' || current.state === 'stopped')) {
+          return;
+        }
+      } catch (err) { /* keep waiting within the bounded grace */ }
+      await new Promise(function (resolve) { setTimeout(resolve, 50); });
+    }
+    if (!unconfirmed) persistFailureIfNeeded(message);
+  };
+  return {
+    runId: runId,
+    taskId: taskId,
+    runDir: runDir,
+    deadlineAt: Date.now()
+      + Math.max(10000, Number.isFinite(timeoutMs) ? timeoutMs : TASK_TIMEOUT_MS)
+      + 15000,
+    failureStatus: failureStatus,
+    terminate: terminateRunner,
+  };
+}
+
+function clampText(text, max) {
+  if (typeof text !== 'string') return '';
+  const trimmed = text.trim();
+  if (trimmed.length <= max) return trimmed;
+  return trimmed.slice(0, max - 1) + '…';
+}
+
+/**
+ * 调用级输出预算。单项 16k 之上还需要一道总闸:8 个任务拼起来 ~128k 字符会把父上下文
+ * 吃掉大半(review)。
+ *
+ * 先均分,再把短任务省下的额度让给超额任务 —— 常见形态是一个任务话多、其余很短,直接
+ * 均分会把长任务砍得没必要地狠。截断只切尾部,'## <agent> (failed)' 头部与失败诊断的
+ * 开头一定保留,不会因为超预算就丢掉"哪个任务失败了"这个信息。
+ */
+function fitSectionsToBudget(sections) {
+  let total = 0;
+  for (const section of sections) total += section.length;
+  if (total <= MAX_TOTAL_OUTPUT_CHARS || sections.length === 0) return sections;
+
+  let share = Math.floor(MAX_TOTAL_OUTPUT_CHARS / sections.length);
+  let surplus = 0;
+  let overCount = 0;
+  for (const section of sections) {
+    if (section.length <= share) surplus += share - section.length;
+    else overCount += 1;
+  }
+  if (overCount > 0) share += Math.floor(surplus / overCount);
+
+  return sections.map(function (section) {
+    return section.length <= share ? section : clampText(section, share);
+  });
+}
+
+/** Validate one task or a parallel fan-out. */
+function normalizeInvocation(params) {
+  const input = params && typeof params === 'object' ? params : {};
+  const raw = Array.isArray(input.tasks) && input.tasks.length > 0
+    ? input.tasks
+    : [{
+        agent: input.agent,
+        task: input.task,
+        title: input.title,
+      }];
+  if (raw.length > MAX_TASKS) {
+    throw new Error('subagent: at most ' + MAX_TASKS + ' tasks per call (got ' + raw.length + ')');
+  }
+  const tasks = raw.map(function (entry, index) {
+    const item = entry && typeof entry === 'object' ? entry : {};
+    const agent = typeof item.agent === 'string' ? item.agent.trim() : '';
+    const task = typeof item.task === 'string' ? item.task.trim() : '';
+    const title = typeof item.title === 'string' ? item.title.trim() : '';
+    const id = typeof item.id === 'string' && item.id.trim() ? item.id.trim() : 'step-' + String(index + 1);
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(id)) {
+      throw new Error('subagent: task ' + (index + 1) + ' has an invalid id');
+    }
+    if (!Object.prototype.hasOwnProperty.call(PROFILES, agent)) {
+      throw new Error('subagent: unknown agent "' + agent + '" (available: ' + profileNames() + ')');
+    }
+    if (!task) {
+      throw new Error('subagent: task ' + (index + 1) + ' is missing a task description');
+    }
+    if (task.length > MAX_TASK_CHARS) {
+      throw new Error('subagent: task ' + (index + 1) + ' exceeds ' + MAX_TASK_CHARS + ' characters');
+    }
+    if (title.length > MAX_TITLE_CHARS) {
+      throw new Error('subagent: task title exceeds ' + MAX_TITLE_CHARS + ' characters');
+    }
+    const model = typeof item.model === 'string' && item.model.trim()
+      ? item.model.trim()
+      : typeof input.model === 'string' && input.model.trim()
+        ? input.model.trim()
+        : '';
+    if (model.length > MAX_MODEL_CHARS) {
+      throw new Error('subagent: model id exceeds ' + MAX_MODEL_CHARS + ' characters');
+    }
+    const provider = typeof item.provider === 'string' && item.provider.trim()
+      ? item.provider.trim()
+      : typeof input.provider === 'string' && input.provider.trim()
+        ? input.provider.trim()
+        : '';
+    if (provider.length > MAX_MODEL_CHARS) {
+      throw new Error('subagent: provider id exceeds ' + MAX_MODEL_CHARS + ' characters');
+    }
+    const thinking = typeof item.thinking === 'string' && item.thinking.trim()
+      ? item.thinking.trim()
+      : typeof input.thinking === 'string' && input.thinking.trim()
+        ? input.thinking.trim()
+        : '';
+    if (thinking && ('|' + THINKING_LEVELS + '|').indexOf('|' + thinking + '|') < 0) {
+      throw new Error('subagent: unsupported thinking level "' + thinking + '".');
+    }
+    return {
+      id: id,
+      dependsOn: [],
+      agent: agent,
+      title: title,
+      task: task,
+      model: model,
+      provider: provider,
+      thinking: thinking,
+      customProfile: false,
+      customTools: 'read',
+      profilePrompt: PROFILES[agent].prompt,
+    };
+  });
+  const ids = new Set();
+  for (const task of tasks) {
+    if (ids.has(task.id)) throw new Error('subagent: duplicate task id "' + task.id + '"');
+    ids.add(task.id);
+  }
+  const timeoutSeconds = input.timeoutSeconds === undefined
+    ? DEFAULT_TIMEOUT_SECONDS
+    : Number(input.timeoutSeconds);
+  if (
+    !Number.isInteger(timeoutSeconds)
+    || timeoutSeconds < MIN_TIMEOUT_SECONDS
+    || timeoutSeconds > MAX_TIMEOUT_SECONDS
+  ) {
+    throw new Error(
+      'subagent: timeoutSeconds must be an integer from '
+      + MIN_TIMEOUT_SECONDS + ' to ' + MAX_TIMEOUT_SECONDS + '.',
+    );
+  }
+  return {
+    mode: tasks.length > 1 ? 'parallel' : 'single',
+    context: input.context === 'fork' ? 'fork' : 'fresh',
+    timeoutMs: timeoutSeconds * 1000,
+    tasks: tasks,
+  };
+}
+
+function emptyUsage() {
+  return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+}
+
+function mergeUsage(target, source) {
+  if (!source) return;
+  const keys = ['input', 'output', 'cacheRead', 'cacheWrite', 'cost'];
+  for (const key of keys) {
+    const value = source[key];
+    if (typeof value === 'number' && Number.isFinite(value) && value > 0) target[key] += value;
+  }
+}
+
+// Pi's pre-settlement boundary keeps the parent's turn (and permission scope)
+// open while async children finish. No idle wake, synthetic user prompt, or
+// host-side scheduler is involved. Bookkeeping survives extension reload.
+function createResultDelivery(pi) {
+  const pending = new Map();
+  const marker = 'cindy-subagent-delivery';
+  const consumed = function (runId) {
+    if (!pending.delete(runId)) return;
+    pi.appendEntry(marker, { runId: runId, state: 'consumed' });
+  };
+  const track = function (runId, deadlineAt, notify) {
+    if (!notify) return;
+    if (!Number.isFinite(deadlineAt)) {
+      let timeoutMs = DEFAULT_TIMEOUT_SECONDS * 1000;
+      try {
+        const config = JSON.parse(readFileSync(join(process.env[RUN_ROOT_ENV], runId, 'config.json'), 'utf8'));
+        if (Number.isFinite(config.timeoutMs) && config.timeoutMs > 0 && config.timeoutMs <= MAX_TIMEOUT_SECONDS * 1000) timeoutMs = config.timeoutMs;
+      } catch (error) { /* resume still has a bounded collection deadline */ }
+      deadlineAt = Date.now() + timeoutMs + 15000;
+    }
+    pending.set(runId, deadlineAt);
+    pi.appendEntry(marker, { runId: runId, state: 'pending', deadlineAt: deadlineAt });
+  };
+  // Older hosts can still load the tool, but cannot promise automatic delivery.
+  if (typeof pi.on === 'function') {
+    pi.on('session_start', function (event, ctx) {
+      pending.clear();
+      const entries = ctx.sessionManager.getBranch();
+      for (const entry of entries) {
+        if (entry.type === 'custom' && entry.customType === marker && entry.data) {
+          const data = entry.data;
+          if (typeof data.runId !== 'string') continue;
+          if (data.state === 'pending' && Number.isFinite(data.deadlineAt)) pending.set(data.runId, data.deadlineAt);
+          else pending.delete(data.runId);
+        }
+        if (entry.type === 'custom_message' && entry.customType === marker && Array.isArray(entry.details?.runIds)) {
+          for (const runId of entry.details.runIds) pending.delete(runId);
+        }
+      }
+    });
+    pi.on('agent_settled', function () {
+      // Aborted/error turns can skip before-settle entirely. Do not revive
+      // their notification intents on the next unrelated user request.
+      for (const runId of Array.from(pending.keys())) consumed(runId);
+    });
+    pi.on('agent_before_settle', async function (event, ctx) {
+      if (!pending.size || event.outcome !== 'completed') return;
+      // User/extension input already queued takes priority over waiting.
+      if (event.context?.pendingMessages?.length) return;
+      let nextHostPoll = 0;
+      while (pending.size) {
+        try {
+          await requestRunnerControl(ctx, 'delivery', pending.keys().next().value);
+        } catch (error) {
+          // Stop, close and account teardown revoke this turn's continuation.
+          // Durable children stay available through explicit list/get/resume.
+          for (const runId of Array.from(pending.keys())) consumed(runId);
+          return;
+        }
+        if (typeof ctx.hasPendingMessages === 'function' && ctx.hasPendingMessages()) return;
+        const ready = [];
+        const runIds = [];
+        const pollHost = Date.now() >= nextHostPoll;
+        if (pollHost) nextHostPoll = Date.now() + 1000;
+        for (const [runId, deadlineAt] of pending) {
+          // Poll only the pending set: completed history can be arbitrarily
+          // large and must not occupy Pi's event loop on every 250 ms tick.
+          const status = readDurableStatus(runId);
+          if (status && (!process.env[OWNER_ID_ENV] || status.runtimeOwnerId !== process.env[OWNER_ID_ENV])) {
+            ready.push('runId=' + runId + ': automatic result collection is unavailable because the run belongs to another runtime owner. Its output was not read into this conversation; this does not confirm the child stopped.');
+            runIds.push(runId);
+          } else if (status && isTerminalStatus(status.state)) {
+            ready.push(describeRun(status));
+            runIds.push(runId);
+          } else if (pollHost) {
+            try { await requestRunnerControl(ctx, 'status', runId); } catch (error) {
+              if (error && (error.runnerExited || error.runnerRejected)) {
+                ready.push('runId=' + runId + ': ' + error.message
+                  + (error.runnerRejected ? ' Automatic collection ended after the host rejected status access; this does not confirm the child stopped.' : ''));
+                runIds.push(runId);
+                continue;
+              }
+            }
+          }
+          if (!runIds.includes(runId) && Date.now() >= deadlineAt) {
+            ready.push('runId=' + runId + ': no terminal result was available before the delivery deadline. Use list/get to inspect; this does not confirm the child stopped.');
+            runIds.push(runId);
+          }
+        }
+        if (runIds.length) {
+          try { await requestRunnerControl(ctx, 'delivery', runIds[0]); } catch (error) {
+            for (const runId of Array.from(pending.keys())) consumed(runId);
+            return;
+          }
+          // The native boundary commits the result and continuation together.
+          // Abort during the hook suppresses continuation in Pi itself.
+          for (const runId of runIds) pending.delete(runId);
+          return { entries: [{ type: 'custom_message', customType: marker,
+            content: fitSectionsToBudget(ready).join('\n\n'), display: false,
+            details: { runIds: runIds } }], continue: true };
+        }
+        await new Promise(function (resolve) { setTimeout(resolve, 250); });
+      }
+    });
+  }
+  return { track: track, consume: consumed };
+}
+
+export default async function cindySubagent(pi: any) {
+  // depth > 0 = 本进程自己就是子代理:装上父存活看门狗,父进程(pi 会话)一消失就自杀。
+  // 必须在下面的深度早返回**之前**装 —— 子代理正是走那条早返回分支的。
+  if (readDepth() > 0) installParentWatchdog();
+  if (readDepth() >= MAX_DEPTH) return;
+  const binary = process.env[BINARY_ENV];
+  // 拿不到 pi 二进制路径就不注册:宁可没有这个工具,也不让模型调用一个必然失败的工具。
+  if (typeof binary !== 'string' || binary.trim().length === 0) return;
+  // host 未能持久化路由快照时会**不传**该 env → 本次会话完全不暴露子代理工具(fail-closed)。
+  const runtimeFile = process.env[RUNTIME_FILE_ENV];
+  if (typeof runtimeFile !== 'string' || runtimeFile.trim().length === 0) return;
+
+  const delivery = createResultDelivery(pi);
+
+  pi.registerTool({
+    name: TOOL_NAME,
+    label: 'Subagent',
+    description: 'Delegate work to a PI child with its own context and durable session. '
+      + 'Available roles: ' + profileNames() + '. Read-only roles cannot edit. worker uses the parent '
+      + 'permission mode; Ask/Auto requests are forwarded to Cindy approval. Pass model/thinking to override the '
+      + 'parent model for a child, and provider to choose which provider serves that model (see capabilities '
+      + 'modelProviders). Pass async:true for a detached background run that survives parent navigation. '
+      + 'Results are collected before this parent turn settles; notify:false leaves collection explicit. '
+      + 'Pass {agent, task} for one, or {tasks:[{agent, task}, ...]} to fan out in parallel. '
+      + 'Use action:capabilities/list/get/wait/stop/steer/follow_up/resume for durable runs. Select childId to control one child. Children cannot spawn further subagents.',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['run', 'capabilities', 'list', 'get', 'wait', 'stop', 'steer', 'follow_up', 'resume'],
+          description: 'Default run; other actions inspect or control durable runs.',
+        },
+        taskId: { type: 'string', description: 'Durable run id (or opaque task id) for get/wait/stop/steer/follow_up/resume.' },
+        childId: { type: 'string', description: 'Optional exact child id from list/get; omitted targets the whole run.' },
+        waitSeconds: { type: 'integer', minimum: 0, maximum: 60, description: 'Bounded wait for a result; default 30 seconds. Timeout does not stop the child.' },
+        message: { type: 'string', description: 'Direction for steer, follow_up (active run), or resume (terminal run).' },
+        agent: { type: 'string', description: 'Agent profile: ' + profileNames() },
+        task: {
+          type: 'string',
+          description: 'The exact investigation or implementation assignment.',
+        },
+        title: { type: 'string', description: 'Optional user-facing name describing the task value.' },
+        model: { type: 'string', description: 'Optional exact child model id.' },
+        provider: {
+          type: 'string',
+          description: 'Optional provider id for the child (from capabilities modelProviders). Must serve the chosen model and match exactly one connection. Without it, resolution keeps its existing order: a source implied by a xai/, chatgpt/ or claude- model id, then the parent provider.',
+        },
+        thinking: { type: 'string', description: 'Optional thinking level: ' + THINKING_LEVELS },
+        async: { type: 'boolean', description: 'Run in Cindy durable background mode.' },
+        notify: { type: 'boolean', description: 'Default true: collect async/resume results before the parent finishes. false: use wait/get explicitly.' },
+        timeoutSeconds: {
+          type: 'integer',
+          minimum: MIN_TIMEOUT_SECONDS,
+          maximum: MAX_TIMEOUT_SECONDS,
+          description: 'Whole-run timeout in seconds; defaults to 1800.',
+        },
+        isolation: {
+          type: 'string',
+          enum: ['inherit', 'require-worktree'],
+          description: 'Inherit cwd, or fail unless the parent Cindy task is already in a linked Git worktree.',
+        },
+        context: {
+          type: 'string',
+          enum: ['fresh', 'fork'],
+          description: 'fresh isolates the assignment; fork adds an immutable parent conversation snapshot.',
+        },
+        tasks: {
+          type: 'array',
+          description: 'Run several subagents in parallel (max ' + MAX_TASKS + ').',
+          items: {
+            type: 'object',
+            properties: {
+              agent: { type: 'string', description: 'Agent profile: ' + profileNames() },
+              title: { type: 'string', description: 'Optional user-facing name for this task.' },
+              task: { type: 'string' },
+              model: { type: 'string' },
+              provider: { type: 'string' },
+              thinking: { type: 'string' },
+            },
+            required: ['agent', 'task'],
+          },
+        },
+      },
+      additionalProperties: false,
+    },
+    async execute(toolCallId: string, params: unknown, signal: AbortSignal, onUpdate: any, ctx: any) {
+      const input = params && typeof params === 'object' ? params as Record<string, unknown> : {};
+      const action = typeof input.action === 'string' ? input.action : 'run';
+      if (action !== 'run') {
+        const text = await managementResult(input, ctx, signal, delivery);
+        return { content: [{ type: 'text', text: text }], details: { action: action } };
+      }
+      enforceIsolation(input);
+      const invocation = normalizeInvocation(params);
+      const mode = invocation.mode;
+      const context = invocation.context;
+      const snapshot = context === 'fork' ? parentContextSnapshot(ctx) : '';
+      const tasks = snapshot
+        ? invocation.tasks.map(function (task) {
+            return Object.assign({}, task, {
+              originalTask: task.task,
+              task: 'Parent task snapshot (immutable):\n\n' + snapshot + '\n\nAssignment:\n' + task.task,
+            });
+          })
+        : invocation.tasks;
+      const wantAsync = !!(params && typeof params === 'object' && (params as { async?: unknown }).async === true);
+      const runtime = readRuntimeSnapshot();
+      const startedAt = Date.now();
+      const label = tasks.map(function (t) { return t.agent; }).join(', ');
+      const taskId = String(toolCallId || 'subagent');
+      const totals = { toolUses: 0, tokens: 0, usage: emptyUsage(), usageSegments: [] as any[] };
+      const perTask = tasks.map(function () {
+        return { toolUses: 0, tokens: 0, usage: emptyUsage(), usageSegments: [] as any[] };
+      });
+
+      const report = function (status: string, summary?: string) {
+        if (typeof onUpdate !== 'function') return;
+        const details: Record<string, unknown> = {
+          taskId: taskId,
+          status: status,
+          agentName: label,
+          task: tasks.length === 1 ? (tasks[0].originalTask || tasks[0].task) : tasks.length + ' delegated tasks',
+          toolUses: totals.toolUses,
+          totalTokens: totals.tokens,
+          durationMs: Date.now() - startedAt,
+          // 委派用量的**累计**分量。父进程按 taskId 记住上次值、只把增量并进本 turn 的记账
+          // (register.ts 持久化的 session token/cost 因此包含子代理请求)。报累计而不是增量:
+          // 进度帧是 best-effort 的,丢一帧不该让那部分用量永久消失(review)。
+          usage: {
+            input: totals.usage.input,
+            output: totals.usage.output,
+            cacheRead: totals.usage.cacheRead,
+            cacheWrite: totals.usage.cacheWrite,
+            cost: totals.usage.cost,
+          },
+          usageSegments: totals.usageSegments.map(function (segment) {
+            return Object.assign({}, segment);
+          }),
+        };
+        details[MARKER] = 1;
+        if (summary) details.summary = summary;
+        // 前台(非 async)卡片的 model 只由这些进度帧喂,所以这里必须报子任务实际模型。
+        // 报 runtime.model 会让指定了别的模型的子代理在卡片上显示成父会话模型。
+        const cardModel = singleTaskDisplayModel(tasks, runtime);
+        if (cardModel) details.model = cardModel;
+        try {
+          onUpdate({ content: [{ type: 'text', text: status === 'running' ? 'Running subagent…' : status }], details: details });
+        } catch (err) {
+          /* progress is best-effort */
+        }
+      };
+
+      const recompute = function () {
+        let toolUses = 0;
+        let tokens = 0;
+        const usage = emptyUsage();
+        const usageSegments: any[] = [];
+        for (const entry of perTask) {
+          toolUses += entry.toolUses;
+          tokens += entry.tokens;
+          mergeUsage(usage, entry.usage);
+          if (Array.isArray(entry.usageSegments)) {
+            usageSegments.push.apply(usageSegments, entry.usageSegments);
+          }
+        }
+        totals.toolUses = toolUses;
+        totals.tokens = tokens;
+        totals.usage = usage;
+        totals.usageSegments = usageSegments;
+      };
+
+      // 两道**派发前**的失败关闭闸。注意它们排在 report 定义**之后**、report('running')
+      // **之前**:卡片状态机在没有任何 agent_task_update 时会按"有工具结果 = completed"兜底,
+      // 所以在这里直接 throw 会让卡片瞬间变绿 —— 明明这次委派被拒了(review)。必须先发一帧
+      // 终态 failed,再抛错。
+      //
+      // 使用点失败关闭:快照读不到(host 写失败后删除 / 目录只读 / 磁盘满)时拒绝派发,
+      // 而不是不带 --provider/--model 让子进程走 pi 默认解析 —— 后者会把 BYOM / 本地
+      // provider 的请求发到错误 endpoint。provider 恒由 host 写入,缺它即视为不可用。
+      if (!runtime.provider) {
+        report('failed', 'model routing snapshot unavailable');
+        throw new Error(
+          'subagent is unavailable: Cindy could not read this session\'s model routing snapshot, '
+          + 'so a subagent would run against the wrong provider. Tell the user; do the work yourself.',
+        );
+      }
+      // 模型切换的等待窗口(host 已写新路由、pi 侧尚未确认)里一律不派发。放行就意味着子进程
+      // 用一个**未经确认**的 provider 起来:切换若被拒,host 能回滚文件,却撤不回已经在跑的子
+      // 进程 —— 那才是真正撤不回的父子路由分叉(review)。宁可这一次委派失败。
+      if (runtime.pending) {
+        report('failed', 'model switch in progress; routing not confirmed');
+        throw new Error(
+          'subagent is unavailable right now: this session is switching model/provider and the new route '
+          + 'is not confirmed yet. Do this step yourself, or retry the delegation after the switch settles.',
+        );
+      }
+
+      try {
+        resolveTaskModelRoutes(tasks, runtime);
+      } catch (error) {
+        report('failed', 'child model override is unavailable');
+        throw error;
+      }
+
+      report('running');
+      const launched = await launchDurableRun(
+        binary,
+        tasks,
+        runtime,
+        taskId,
+        mode,
+        context,
+        typeof input.title === 'string' ? input.title : '',
+        wantAsync ? 'host' : 'extension',
+        invocation.timeoutMs,
+        ctx,
+      );
+      if (wantAsync) {
+        delivery.track(launched.runId, launched.deadlineAt, input.notify !== false);
+        return {
+          content: [{ type: 'text', text: LAUNCH_RECEIPT + ' runId=' + launched.runId + '; taskId=' + taskId + '. Use wait/get for results.' }],
+          details: { launched: true, taskId: taskId, runId: launched.runId },
+        };
+      }
+
+      const durableStatus = await waitForDurableRun(launched, signal, ctx, function (status) {
+        if (!Array.isArray(status.tasks)) return;
+        status.tasks.forEach(function (task, index) {
+          perTask[index] = {
+            toolUses: Number(task.toolUses || 0),
+            tokens: Number(task.usage && (
+              Number(task.usage.input || 0)
+              + Number(task.usage.output || 0)
+              + Number(task.usage.cacheRead || 0)
+              + Number(task.usage.cacheWrite || 0)
+            )),
+            usage: task.usage || emptyUsage(),
+            usageSegments: Array.isArray(task.usageSegments) ? task.usageSegments : [],
+          };
+        });
+        recompute();
+        report('running');
+      });
+      const results: any[] = durableStatus.tasks.map(function (task) {
+        return {
+          text: (task.error ? 'Error: ' + task.error + '\n' : '') + (task.output || '(no result)'),
+          isError: task.status !== 'completed',
+          toolUses: Number(task.toolUses || 0),
+          tokens: Number(task.usage && (
+            Number(task.usage.input || 0)
+            + Number(task.usage.output || 0)
+            + Number(task.usage.cacheRead || 0)
+            + Number(task.usage.cacheWrite || 0)
+          )),
+          usage: task.usage || emptyUsage(),
+          usageSegments: Array.isArray(task.usageSegments) ? task.usageSegments : [],
+        };
+      });
+      results.forEach(function (result, index) {
+        perTask[index] = {
+          toolUses: result.toolUses,
+          tokens: result.tokens,
+          usage: result.usage,
+          usageSegments: result.usageSegments,
+        };
+      });
+      recompute();
+
+      const failed = results.filter(function (r) { return r && r.isError; }).length;
+      const aborted = signal && signal.aborted === true;
+      const sections = results.map(function (result, index) {
+        const head = '## ' + tasks[index].agent + (result && result.isError ? ' (failed)' : '');
+        return head + '\n' + (result ? result.text : '(no result)');
+      });
+      const text = fitSectionsToBudget(sections).join('\n\n');
+      // 任一子任务失败即整卡 failed:部分成功不足以把批次报成完成(greptile P1)。
+      report(aborted ? 'stopped' : failed > 0 ? 'failed' : 'completed',
+        failed > 0 ? failed + ' of ' + results.length + ' subagents failed' : undefined);
+
+      if (failed === results.length && results.length > 0) {
+        throw new Error(text);
+      }
+      return {
+        content: [{ type: 'text', text: text }],
+        details: {
+          tasks: tasks.map(function (t, index) {
+            return {
+              agent: t.agent,
+              task: t.originalTask || t.task,
+              isError: results[index] ? results[index].isError === true : true,
+              toolUses: perTask[index].toolUses,
+              tokens: perTask[index].tokens,
+            };
+          }),
+        },
+      };
+    },
+  });
+}
+`;
+
+/**
+ * 最终注入的扩展源码 = 主体 + 看门狗段。
+ *
+ * 看门狗单独成段、拼在最后,是为了让它能在测试里被**原样执行**(真起进程验证"父死子亡"),
+ * 而不是只做字符串结构断言。函数声明会提升,所以放在末尾不影响主体调用。
+ */
+export const CINDY_SUBAGENT_EXTENSION_SOURCE =
+  CINDY_SUBAGENT_EXTENSION_BODY + CINDY_SUBAGENT_PARENT_WATCHDOG_SOURCE;

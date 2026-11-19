@@ -1,0 +1,23 @@
+{
+  "id": "imdb-search",
+  "match": [
+    "imdb.com"
+  ],
+  "description": "Search IMDb for movies, TV shows, and people",
+  "access": "read",
+  "adapter": "imdb/search",
+  "inputs": {
+    "query": {
+      "required": true,
+      "type": "str",
+      "description": "Search query"
+    },
+    "limit": {
+      "required": false,
+      "type": "int",
+      "default": 20,
+      "description": "Number of results"
+    }
+  },
+  "steps": []
+}

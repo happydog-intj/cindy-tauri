@@ -1,0 +1,17 @@
+{
+  "id": "yahoo-finance-quote",
+  "match": [
+    "finance.yahoo.com"
+  ],
+  "description": "Yahoo Finance 股票行情",
+  "access": "read",
+  "adapter": "yahoo-finance/quote",
+  "inputs": {
+    "symbol": {
+      "required": true,
+      "type": "str",
+      "description": "Stock ticker (e.g. AAPL, MSFT, TSLA)"
+    }
+  },
+  "steps": []
+}

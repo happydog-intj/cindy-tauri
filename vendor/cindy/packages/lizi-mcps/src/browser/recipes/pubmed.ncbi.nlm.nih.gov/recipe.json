@@ -1,0 +1,85 @@
+{
+  "id": "pubmed-search",
+  "match": [
+    "pubmed.ncbi.nlm.nih.gov",
+    "eutils.ncbi.nlm.nih.gov"
+  ],
+  "description": "Search PubMed articles with advanced filters",
+  "access": "read",
+  "adapter": "pubmed/search",
+  "inputs": {
+    "query": {
+      "required": true,
+      "type": "str",
+      "description": "Search query, e.g. \"machine learning cancer\""
+    },
+    "limit": {
+      "required": false,
+      "type": "int",
+      "default": 20,
+      "description": "Max results (1-100)"
+    },
+    "author": {
+      "required": false,
+      "type": "str",
+      "description": "Filter by author name"
+    },
+    "journal": {
+      "required": false,
+      "type": "str",
+      "description": "Filter by journal name"
+    },
+    "year-from": {
+      "required": false,
+      "type": "int",
+      "description": "Filter publication year from"
+    },
+    "year-to": {
+      "required": false,
+      "type": "int",
+      "description": "Filter publication year to"
+    },
+    "article-type": {
+      "required": false,
+      "type": "str",
+      "description": "Filter by publication type, e.g. Review or Clinical Trial"
+    },
+    "has-abstract": {
+      "required": false,
+      "type": "boolean",
+      "default": false,
+      "description": "Only include articles with abstracts"
+    },
+    "free-full-text": {
+      "required": false,
+      "type": "boolean",
+      "default": false,
+      "description": "Only include free full text articles"
+    },
+    "humans-only": {
+      "required": false,
+      "type": "boolean",
+      "default": false,
+      "description": "Only include human studies"
+    },
+    "english-only": {
+      "required": false,
+      "type": "boolean",
+      "default": false,
+      "description": "Only include English articles"
+    },
+    "sort": {
+      "required": false,
+      "type": "str",
+      "default": "relevance",
+      "description": "Sort by relevance, date, author, or journal",
+      "choices": [
+        "relevance",
+        "date",
+        "author",
+        "journal"
+      ]
+    }
+  },
+  "steps": []
+}

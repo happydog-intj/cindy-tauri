@@ -1,0 +1,330 @@
+/**
+ * PermissionPrompt
+ * ---------------------------------------------------------------------------
+ * F-PERM-2: Permission request card that replaces ChatInput when the SDK is
+ * waiting for user authorization to execute a tool.
+ *
+ * Layout:
+ *   title  → description → code block (tool input) → action buttons
+ *
+ * Keyboard shortcuts (registered on mount, removed on unmount):
+ *   Enter       → Allow once
+ *   Ctrl+Enter  → Always allow for session
+ *   Esc         → Deny
+ */
+
+import { useCallback, useEffect, useMemo, useRef } from 'react';
+import { useTranslation } from 'react-i18next';
+import { describePermissionAction, type PermissionActionSummary } from '@cindy/maker-shared/interaction';
+
+import { BotAvatar } from '@/features/bots/BotAvatar';
+import type { BotChatIdentity } from '@/features/bots/BotSessionContentHeader';
+
+import { shouldCardShortcutYield } from '@/lib/editableKeyboardTarget';
+import { cn } from '@/lib/utils';
+import { Tip } from '@/components/ui/tooltip';
+import { Button } from '@/components/ui/button';
+import type { PendingPermission } from '@/lib/makerChatStore';
+import { describeSessionPermissionScope } from '@/lib/permissionSuggestionScope';
+import { GHOST_INSTALL_CONSENT_TOOL_NAME } from '../../../shared/ghostInstallConsent';
+
+// ---------------------------------------------------------------------------
+// Props
+// ---------------------------------------------------------------------------
+
+interface PermissionPromptProps {
+  permission: PendingPermission;
+  companion?: BotChatIdentity | null;
+  onRespond: (result: CCAgentPermissionResult) => void;
+}
+
+// ---------------------------------------------------------------------------
+// Tool input → display text
+// ---------------------------------------------------------------------------
+
+// harness 无关:命令 / 文件 / 插件 / 浏览器的归类与手机、IM 共用 describePermissionAction;
+// 认不出的工具回退成格式化 JSON。
+export function formatToolInput(toolName: string, input: Record<string, unknown>): string {
+  if (toolName.toLowerCase() === 'cindy.media.download' && typeof input.source === 'string') return input.source;
+  const action = describePermissionAction(toolName, input);
+  if (action.kind !== 'tool') return action.preview;
+  const text = JSON.stringify(input, null, 2);
+  return text.length > 500 ? text.slice(0, 500) + '...' : text;
+}
+
+const ACTION_TITLE_KEYS: Record<Exclude<PermissionActionSummary['kind'], 'tool' | 'plugin'>, string> = {
+  command: 'newChat.permissionPrompt.titleCommand',
+  'file-read': 'newChat.permissionPrompt.titleFileRead',
+  'file-write': 'newChat.permissionPrompt.titleFileWrite',
+  browser: 'newChat.permissionPrompt.titleBrowser',
+};
+
+function filterSessionScopedSuggestions(suggestions?: unknown[]): unknown[] {
+  if (!Array.isArray(suggestions)) return [];
+  return suggestions.filter((suggestion) =>
+    !!suggestion &&
+    typeof suggestion === 'object' &&
+    !Array.isArray(suggestion) &&
+    (suggestion as Record<string, unknown>).destination === 'session'
+  );
+}
+
+// Button supplies geometry, focus and disabled behavior. Permission keeps its
+// historic local aliases (including a separately themed Allow once action).
+// DS-9: user chose existing emphasis, neutral information and current density.
+const actionClass = 'h-auto min-h-9 max-w-full gap-2 px-3 py-1.5';
+const secondaryActionClass = cn(
+  actionClass,
+  '[--button-face-border:var(--chat-input-border)] [--button-face-bg:transparent] text-[var(--chat-input-text)]',
+  'enabled:hover:[--button-face-bg:var(--perm-code-bg)]',
+  'enabled:active:[--button-face-bg:color-mix(in_srgb,var(--perm-code-bg)_90%,var(--chat-input-text))]',
+);
+const allowActionClass = cn(
+  actionClass,
+  '[--button-face-border:var(--chat-input-border)] [--button-face-bg:var(--perm-allow-btn-bg)] text-[var(--perm-allow-btn-text)]',
+  'enabled:hover:[--button-face-bg:color-mix(in_srgb,var(--perm-allow-btn-bg)_90%,var(--perm-allow-btn-text))]',
+  'enabled:active:[--button-face-bg:color-mix(in_srgb,var(--perm-allow-btn-bg)_80%,var(--perm-allow-btn-text))]',
+);
+
+// ---------------------------------------------------------------------------
+// Component
+// ---------------------------------------------------------------------------
+
+export function PermissionPrompt({ permission, onRespond, companion }: PermissionPromptProps) {
+  const { t } = useTranslation();
+  const cardRef = useRef<HTMLDivElement>(null);
+  const { toolName, input, title, displayName, description, suggestions, autoReviewUnavailable,
+    autoReviewReason, submitting, submissionFailed } = permission;
+  const isMediaDownload = toolName === 'cindy.media.download';
+  // 插件安装确认由 Host 渲染成纯文本：首行是版本与来源，其余是权限清单。手机按原样
+  // 逐行显示；这里首行作说明，清单放进可滚动区域，不显示内部参数。
+  const isPluginInstallConsent = toolName === GHOST_INSTALL_CONSENT_TOOL_NAME;
+  const [consentHead, ...consentBody] = isPluginInstallConsent
+    ? (description ?? '').split('\n')
+    : [];
+  const promptDescription = autoReviewUnavailable
+    ? t('newChat.permissionPrompt.autoReviewUnavailable')
+    : isPluginInstallConsent
+      ? consentHead
+      : description;
+
+  // Say what will happen ("run this command") instead of an internal tool name or an
+  // English harness title; unknown tools keep the previous wording.
+  const action = describePermissionAction(toolName, input);
+  const displayTitle = action.kind === 'plugin' && action.subject
+    ? t('newChat.permissionPrompt.titlePlugin', { plugin: action.subject })
+    : action.kind !== 'tool' && action.kind !== 'plugin'
+      ? t(ACTION_TITLE_KEYS[action.kind])
+      : displayName
+        ? t('agentIsland.native.permissionPromptTitleWithTool', { toolName: displayName })
+        : title || t('agentIsland.native.permissionPromptTitleWithTool', { toolName });
+  const codeContent = isPluginInstallConsent
+    ? consentBody.join('\n')
+    : formatToolInput(toolName, input);
+  const sessionSuggestions = useMemo(() => filterSessionScopedSuggestions(suggestions), [suggestions]);
+  const canAlwaysAllowForSession = sessionSuggestions.length > 0;
+  // 这个按钮加的是 agent 给的一条具体规则(Bash 多为 `curl:*` 这类前缀模式),
+  // 范围远小于「总是允许」的字面。把范围写到按钮上,别让用户猜。
+  // 描述不全时返回 null(见该函数顶注:点击会转发**全部** suggestions,文案漏项就是说谎),
+  // 此时退回不声称范围的原文案。分隔符按当前语言取 —— 顿号不能漏进英文句子。
+  const scopeLabels = useMemo(
+    () => describeSessionPermissionScope(sessionSuggestions),
+    [sessionSuggestions],
+  );
+  const allowScope = scopeLabels?.join(t('newChat.permissionPrompt.ruleSeparator')) ?? null;
+
+  // ── Action handlers ──
+
+  const handleAllowOnce = useCallback(() => {
+    if (submitting) return;
+    onRespond({
+      behavior: 'allow',
+    });
+  }, [onRespond, submitting]);
+
+  const handleAlwaysAllow = useCallback(() => {
+    if (submitting) return;
+    if (!canAlwaysAllowForSession) {
+      handleAllowOnce();
+      return;
+    }
+    onRespond({
+      behavior: 'allow',
+      updatedPermissions: sessionSuggestions,
+      decisionClassification: 'user_permanent',
+    });
+  }, [canAlwaysAllowForSession, handleAllowOnce, onRespond, sessionSuggestions, submitting]);
+
+  const handleDeny = useCallback(() => {
+    if (submitting) return;
+    onRespond({
+      behavior: 'deny',
+      message: 'User denied',
+      decisionClassification: 'user_reject',
+    });
+  }, [onRespond, submitting]);
+
+  // ── Keyboard shortcuts ──
+
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      // 按键已有归属时不替用户做授权决定：输入法组字、正在打字、刚被菜单处理的 Esc、
+      // 焦点在「拒绝」等按钮上的回车（交给按钮本身激活）都让位。
+      if (e.key !== 'Enter' && e.key !== 'Escape') return;
+      const shortcutKind =
+        e.key === 'Escape' ? 'dismiss' : e.ctrlKey || e.metaKey ? 'modifiedActivate' : 'activate';
+      if (shouldCardShortcutYield(e, shortcutKind, cardRef.current)) return;
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        handleAlwaysAllow();
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        handleAllowOnce();
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        handleDeny();
+      }
+    };
+
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [handleAllowOnce, handleAlwaysAllow, handleDeny]);
+
+  // ── Render ──
+
+  return (
+    <div
+      ref={cardRef}
+      className={cn(
+        'w-full max-w-[914px] rounded-xl border p-4',
+        'border-[var(--chat-input-border)] bg-[var(--chat-input-bg)]',
+      )}
+    >
+      {/* Keep the request in the conversation, with the exact operation below. */}
+      <div className="flex items-center gap-2.5">
+        {companion ? <BotAvatar bot={companion} size="sm" /> : null}
+        <div className="min-w-0">
+          <p className="text-15 font-semibold leading-tight text-[var(--chat-input-text)]">
+            {companion ? t('bots.permissionRequest', { name: companion.name }) : displayTitle}
+          </p>
+          {companion ? (
+            <p className="mt-1 text-12 text-[var(--status-bar-meta)]">{displayTitle}</p>
+          ) : null}
+        </div>
+      </div>
+
+      {/* Description */}
+      {autoReviewUnavailable && permission.sourceDescription && (
+        <p className="mt-1.5 whitespace-pre-wrap break-words text-13 font-normal text-[var(--status-bar-meta)]">
+          {permission.sourceDescription}
+        </p>
+      )}
+      {promptDescription && (
+        <p className="mt-1.5 whitespace-pre-wrap break-words text-13 font-normal leading-tight text-[var(--status-bar-meta)]">
+          {promptDescription}
+        </p>
+      )}
+      {/* Why Auto stopped to ask: the reviewer's own explanation, in the user's language. */}
+      {!autoReviewUnavailable && autoReviewReason && (
+        <p className="mt-1.5 whitespace-pre-wrap break-words text-13 font-normal leading-snug text-[var(--chat-input-text)]">
+          {t('newChat.permissionPrompt.autoReviewReason', { reason: autoReviewReason })}
+        </p>
+      )}
+
+      {/* Code block */}
+      <div
+        className={cn(
+          'mt-3 overflow-auto rounded-[8px] border px-3.5 py-2.5',
+          'border-[var(--perm-code-border)] bg-[var(--perm-code-bg)]',
+          isPluginInstallConsent
+            ? 'max-h-[240px] text-13 leading-relaxed text-[var(--chat-input-text)]'
+            : 'max-h-[120px] font-mono text-[length:calc(var(--app-code-font-size)_-_1px)] leading-relaxed text-[var(--chat-input-text)]',
+        )}
+      >
+        {isPluginInstallConsent ? (
+          <p className="whitespace-pre-wrap break-words">{codeContent}</p>
+        ) : (
+          <pre className="whitespace-pre-wrap break-all">{codeContent}</pre>
+        )}
+      </div>
+
+      {/* Action buttons — inline text + kbd badges, right-aligned.
+          flex-wrap:带范围的「本对话都允许 …」按钮会比原来长,窄宽(doc rail portal)
+          下允许整行折行,而不是把 Deny / Allow once 挤出容器。 */}
+      {(submitting || submissionFailed) && (
+        <p role="status" className="mt-3 text-13 text-[var(--status-bar-meta)]">
+          {t(submitting ? 'newChat.permissionPrompt.submitting' : 'newChat.permissionPrompt.submissionFailed')}
+        </p>
+      )}
+      <div className="mt-4 flex flex-wrap items-center justify-end gap-2 [&_button:disabled]:cursor-wait [&_button:disabled]:opacity-50">
+        {/* Deny */}
+        <Button
+          pressFeedback={false}
+          variant="secondary"
+          size="lg"
+          onClick={handleDeny}
+          disabled={submitting}
+          className={secondaryActionClass}
+        >
+          <span>{t(isMediaDownload ? 'newChat.mediaDownload.defer' : 'agentIsland.native.deny')}</span>
+          <kbd className="rounded-[4px] border border-[var(--chat-input-border)] bg-[var(--perm-code-bg)] px-1.5 py-[1px] text-11 font-normal text-[var(--status-bar-meta)]">
+            Esc
+          </kbd>
+        </Button>
+
+        {canAlwaysAllowForSession && (
+          // 有具体规则就把范围写进按钮(`本对话都允许 Bash(curl:*)`),没有则退回原文案。
+          // tooltip 补两件按钮里放不下的事:完整规则(长命令会被 truncate)、以及
+          // 「作用于整个对话」——用户容易把「本对话」读成「这一次来回」。
+          // 列不出范围时(Codex 的会话级放行只给一个不带规则的标记,范围由 app-server 定)
+          // 换成只讲时效的说法:一条都没列出还说「只限这里列出的范围」就是虚假安心。
+          <Tip
+            text={
+              allowScope
+                ? `${allowScope}\n${t('newChat.permissionPrompt.alwaysAllowScopedHint')}`
+                : t('newChat.permissionPrompt.alwaysAllowSessionHint')
+            }
+            side="top"
+            contentClassName="max-w-[320px] whitespace-pre-line break-all text-left"
+          >
+            <Button
+              pressFeedback={false}
+              variant="secondary"
+              size="lg"
+              onClick={handleAlwaysAllow}
+              disabled={submitting}
+              className={cn(secondaryActionClass, 'min-w-0 max-w-[min(100%,460px)]')}
+            >
+              <span className="min-w-0 truncate">
+                {allowScope
+                  ? t('newChat.permissionPrompt.alwaysAllowScoped', { scope: allowScope })
+                  : t('agentIsland.native.alwaysAllowForSession')}
+              </span>
+              <kbd className="shrink-0 rounded-[4px] border border-[var(--chat-input-border)] bg-[var(--perm-code-bg)] px-1.5 py-[1px] text-11 font-normal text-[var(--status-bar-meta)]">
+                Ctrl
+              </kbd>
+              <kbd className="-ml-1 shrink-0 rounded-[4px] border border-[var(--chat-input-border)] bg-[var(--perm-code-bg)] px-1.5 py-[1px] text-11 font-normal text-[var(--status-bar-meta)]">
+                Enter
+              </kbd>
+            </Button>
+          </Tip>
+        )}
+
+        {/* Allow once (primary) */}
+        <Button
+          pressFeedback={false}
+          variant="secondary"
+          size="lg"
+          onClick={handleAllowOnce}
+          disabled={submitting}
+          className={allowActionClass}
+        >
+          <span>{t(isMediaDownload ? 'newChat.mediaDownload.allow' : 'agentIsland.native.allowOnce')}</span>
+          <kbd className="rounded-[4px] border border-[var(--perm-allow-kbd-border)] bg-[var(--perm-allow-kbd-bg)] px-1.5 py-[1px] text-11 font-normal text-[var(--perm-allow-btn-text)] opacity-70">
+            Enter
+          </kbd>
+        </Button>
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,24 @@
+{
+  "id": "arxiv-search",
+  "match": [
+    "arxiv.org",
+    "export.arxiv.org"
+  ],
+  "description": "Search arXiv papers",
+  "access": "read",
+  "adapter": "arxiv/search",
+  "inputs": {
+    "query": {
+      "required": true,
+      "type": "str",
+      "description": "Search keyword (e.g. \"attention is all you need\")"
+    },
+    "limit": {
+      "required": false,
+      "type": "int",
+      "default": 10,
+      "description": "Max results (max 25)"
+    }
+  },
+  "steps": []
+}

@@ -1,0 +1,1321 @@
+import { getPluginToolUi } from '@cindy/plugin-protocol';
+import { pluginHasToolUi } from '@cindy/plugin-protocol';
+import type { PreparedPluginContribution } from '../../../shared/pluginContributions';
+import { PluginShareButton } from './PluginShareButton';
+import { Button } from '@/components/ui/button';
+import { GithubAccountCard } from '@/features/cc-agent/GithubAccountCard';
+import { shouldShowOpenPathError } from '../../../shared/openPathResult';
+/**
+ * Plugin detail presentation for configuration, Tools, permissions, and factual metadata.
+ *
+ * Inputs: the renderer-safe Plugin detail model plus the installed Ghost when available.
+ * Outputs: accessible detail interactions, Host-owned configuration rows, a wrapping responsive
+ * action hero with the shared Switch, and the sticky top bar with back and macOS window dragging.
+ * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ */
+
+import { useId, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
+import * as Dialog from '@radix-ui/react-dialog';
+import {
+  AppWindow,
+  AlertTriangle,
+  ArrowUp,
+  ChevronDown,
+  Copy,
+  Download,
+  MessageCircle,
+  FolderOpen,
+  LayoutTemplate,
+  MoreVertical,
+  Shield,
+  type LucideIcon,
+  Trash2,
+  X,
+} from 'lucide-react';
+import { useTranslation } from 'react-i18next';
+
+import { PluginUsageCard } from './PluginUsageCard';
+import { PluginSharedUsage } from './PluginSharedUsage';
+import type { PluginMarketItem } from '../../../shared/pluginMarket';
+import { GhostLibrarySection } from './GhostLibrarySection';
+import { GhostHandoffFilesSection } from './GhostHandoffFilesSection';
+import { PluginBackgroundTasksSection } from './PluginBackgroundTasksSection';
+import { PluginControlPointsSection } from './PluginControlPointsSection';
+import { PluginTaskPrefs } from '@/cindy-brain/PluginTaskPrefs';
+import { GhostSettingsWebview } from '@/cindy-brain/GhostSettingsWebview';
+import { WINDOW_NO_DRAG_STYLE } from '@/components/layout/windowDrag';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
+import { Switch } from '@/components/ui/switch';
+import { toast } from '@/lib/toast';
+import { cn } from '@/lib/utils';
+import {
+  declaredGhostControlPoints,
+  ghostDeclaresHiddenTasks,
+  ghostToolDeclaresHandoff,
+  ghostTrustLabelKey,
+  isUserInstallReservedGhostId,
+  type GhostPermissionItem,
+  type GhostToolDecl,
+  type InstalledGhost,
+} from '../../../shared/ghost';
+import { type GhostPluginDetail } from './lib/ghostPluginViewModel';
+import { GhostPluginIcon } from './GhostPluginIcon';
+import {
+  hasPluginPlacementMemory,
+  useGlobalTabs,
+} from '@/features/right-sidebar/globalTabs';
+import {
+  openPluginInSidebar,
+  resetPluginPlacementAndReturn,
+} from '@/features/right-sidebar/pluginPlacement';
+import { useTabGroupAssignments } from '@/features/right-sidebar/tabGroups';
+import { useInstalledGhosts } from '@/cindy-brain/useInstalledGhosts';
+import { installedGhostStoragePart } from '../../../shared/pluginIdentity';
+import { ghostPluginSummary } from './lib/ghostPluginDetailModel';
+import { ghostPrimaryAction } from './lib/ghostPluginViewModel';
+import { permissionItemIcon } from './lib/permissionItemIcon';
+import { PluginDetailTopBar, usePluginDetailScrolled } from './PluginDetailTopBar';
+import './plugin-motion.css';
+
+interface GhostPluginDetailViewProps {
+  /** Remote configuration section, including its heading or disabled notice. */
+  remoteConfiguration?: ReactNode;
+  remote?: boolean;
+  remoteFileUpdate?: boolean;
+  ghost: InstalledGhost | null;
+  /** Only a verified server-market association can offer public sharing. */
+  sharePluginId?: string;
+  detail: GhostPluginDetail;
+  marketItem?: PluginMarketItem | null;
+  panelStatus: string | null;
+  enabledOverride?: boolean;
+  onBack: () => void;
+  usageOwnerKey?: string;
+  confirmClearUsage?: () => Promise<boolean>;
+  publishingSection?: ReactNode;
+  onToggle: (enabled: boolean) => void;
+  /** 主动作:面板型「使用」/ 指令或 Host 能力型「对话」;纯工具型不渲染主按钮。 */
+  onUse: () => void;
+  /** main-view 入口偏好只影响侧边栏，不改变插件启用态或路由资格。 */
+  mainViewSidebarVisible?: boolean;
+  onMainViewSidebarVisibleChange?: (visible: boolean) => void;
+  /** 头部更新 CTA:市场有新版本时走市场更新确认流。 */
+  onUpdate: () => void;
+  /**
+   * 安装记录缺失或损坏时的恢复入口。可选:仅插件页宿主注入；未注入时按钮不出现，
+   * 门控见下方 `needsReapproval && !detail.builtin && onReapprove`。
+   */
+  onReapprove?: () => void;
+  /** ⋮ 菜单的兜底路径:从本地 .cindy 文件更新。 */
+  onUpdateFromFile: () => void;
+  /** 市场存在新版本时的目标版本号;设置后头部展示显著的更新按钮。 */
+  updateVersion?: string;
+  updateBusy?: boolean;
+  onUninstall: () => void;
+  /** 导出 .cindy;当前详情非已装插件(纯市场视图)时缺省,菜单项不渲染。 */
+  onExport?: () => void;
+  /** Opens publishing; package preparation and submission belong to the dialog. */
+  onContribute?: () => void;
+  contributionBusy?: boolean;
+  publishingPreview?: PreparedPluginContribution;
+  contributionUnavailableReason?: string;
+  toggleDisabled: boolean;
+  onIconLoadError?: () => void;
+}
+
+const DETAIL_SECTION_CLASS = 'mt-10';
+const DETAIL_SECTION_HEADING_CLASS =
+  'text-18 font-medium leading-[1.444] text-[var(--text-primary)]';
+const DETAIL_SECTION_CONTENT_CLASS = 'mt-5 max-w-[760px]';
+const DETAIL_SURFACE_CLASS =
+  'border border-[color-mix(in_srgb,var(--border-default)_72%,transparent)] bg-[color-mix(in_srgb,var(--surface-elevated)_82%,var(--surface))]';
+const DETAIL_SURFACE_INTERACTIVE_CLASS =
+  'transition-[background-color,border-color,transform] duration-150 hover:border-[var(--border-default)] hover:bg-[color-mix(in_srgb,var(--surface-elevated)_96%,var(--surface))] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)] active:scale-[0.99]';
+
+/** Installed Ghost detail surface, ordered around configuration and capability review. */
+export function GhostPluginDetailView({
+  remote = false,
+  remoteFileUpdate = false,
+  remoteConfiguration,
+  ghost,
+  sharePluginId,
+  detail,
+  panelStatus,
+  enabledOverride,
+  onBack,
+  publishingSection,
+  onToggle,
+  onUse,
+  marketItem,
+  usageOwnerKey,
+  confirmClearUsage,
+  mainViewSidebarVisible = true,
+  onMainViewSidebarVisibleChange,
+  onUpdate,
+  onReapprove,
+  onUpdateFromFile,
+  updateVersion,
+  updateBusy = false,
+  onUninstall,
+  onExport,
+  onContribute,
+  contributionBusy = false,
+  publishingPreview,
+  contributionUnavailableReason,
+  toggleDisabled,
+  onIconLoadError,
+}: GhostPluginDetailViewProps) {
+  const { t } = useTranslation();
+  const { scrolled, onScroll } = usePluginDetailScrolled();
+  const enableSwitchId = useId();
+  const publicationBlocked = publishingPreview?.preflight?.actions.canSubmit === false;
+  const [githubConnectionVersion, setGithubConnectionVersion] = useState(0);
+  const [taskApprovalPending, setTaskApprovalPending] = useState(false);
+  // 未批准的安装不可运行；恢复入口与普通停用区分。
+  const needsReapproval = detail.approvalState !== 'approved';
+  const enabled = (enabledOverride ?? detail.enabled) && !needsReapproval;
+  const primaryAction = ghostPrimaryAction(detail);
+  const primaryEnabled =
+    enabled &&
+    (primaryAction === 'panel' ||
+      (primaryAction === 'command' && detail.canUse));
+  // Local imports with the same id cannot use the host gh credential. Match the
+  // official receipt before advertising that connection in this plugin's UI.
+  const hasGithubConnection =
+    !remote && detail.ghostId === 'cindy-github' &&
+    Boolean(ghost) &&
+    ghost?.trust?.level === 'cindy-official' &&
+    ghost.trust.publisherSigned &&
+    ghost.trust.publisherVerified &&
+    ghost.trust.reviewed &&
+    ghost.trust.publisherName === 'Cindy Plugin Market';
+  const hasConfiguration =
+    hasGithubConnection ||
+    detail.hasMainView ||
+    detail.hasSettingsUi ||
+    detail.hasTaskPreferences;
+  const summary = hasGithubConnection
+    ? t('ccAgent.gitContext.pr.setup.account.summary')
+    : ghostPluginSummary(detail.description, detail.ghostId);
+  // 远程文件更新按目标 Host 能力判断，不能使用控制端的 DEV 状态。
+  const localUpdateAvailable = remote
+    ? remoteFileUpdate && !isUserInstallReservedGhostId(detail.ghostId)
+    : import.meta.env.DEV || !isUserInstallReservedGhostId(detail.ghostId);
+  const hasAdditionalActions = localUpdateAvailable || onExport !== undefined;
+  const localShareAvailable = !remote && ghost?.publishingSource?.kind === 'local' &&
+    ghost.approval.state === 'approved' && ghost.namespaceState === 'confirmed' && ghost.namespace === null &&
+    !ghost.builtin && !isUserInstallReservedGhostId(ghost.manifest.id);
+
+  return (
+    <main
+      className="app-wallpaper-surface plugin-motion-root h-full min-h-0 w-full overflow-y-auto bg-[var(--surface)] [scrollbar-gutter:stable_both-edges]"
+      onScroll={onScroll}
+    >
+      <PluginDetailTopBar
+        label={t('settings.ghosts.detail.backToList')}
+        onBack={onBack}
+        scrolled={scrolled}
+        actions={sharePluginId ? <PluginShareButton pluginId={sharePluginId} /> : localShareAvailable && ghost ? <PluginShareButton ghost={ghost} /> : undefined}
+      />
+      <article className="plugin-detail-frame mx-auto w-full max-w-[824px] px-8 pb-16 pt-5 max-[760px]:px-6">
+        <PluginDetailHeader
+          id={detail.id}
+          name={detail.name}
+          description={summary}
+          author={detail.author}
+          version={detail.version}
+          marketItem={marketItem}
+          iconDataUrl={detail.iconDataUrl}
+          onIconLoadError={onIconLoadError}
+          actions={
+            <div
+              className="plugin-detail-actions flex min-w-0 flex-wrap items-center gap-1.5"
+              style={WINDOW_NO_DRAG_STYLE}
+            >
+              {needsReapproval && !detail.builtin && onReapprove ? (
+                <Button
+                  variant="secondary"
+                  size="lg"
+                  type="button"
+                  onClick={onReapprove}
+                  disabled={updateBusy}
+                >
+                  {t('settings.ghosts.reapproval.action')}
+                </Button>
+              ) : updateVersion ? (
+                // 更新提级(设计定稿):有新版本时黑色主 CTA 直达市场更新确认流。
+                <Button
+                  variant="cta"
+                  size="lg"
+                  loading={updateBusy}
+                  type="button"
+                  onClick={onUpdate}
+                  disabled={updateBusy}
+                  aria-label={
+                    updateVersion === detail.version
+                      ? t('settings.ghosts.market.update')
+                      : t('settings.ghosts.market.updateTo', { version: updateVersion })
+                  }
+                  aria-busy={updateBusy || undefined}
+                >
+                  <>
+                    <ArrowUp size={14} aria-hidden="true" />
+                    {updateVersion === detail.version
+                      ? t('settings.ghosts.market.update')
+                      : t('settings.ghosts.market.updateTo', { version: updateVersion })}
+                  </>
+                </Button>
+              ) : null}
+              {!remote && primaryAction !== 'manage' ? (
+                <Button
+                  variant={updateVersion ? 'secondary' : 'cta'}
+                  size="lg"
+                  type="button"
+                  onClick={onUse}
+                  disabled={!primaryEnabled}
+                  title={!enabled ? t('settings.ghosts.detail.useDisabled') : undefined}
+                  className="plugin-detail-primary-action min-w-[88px] whitespace-nowrap"
+                >
+                  {primaryAction === 'command' ? (
+                    <MessageCircle size={14} aria-hidden="true" />
+                  ) : null}
+                  {t(
+                    primaryAction === 'panel'
+                      ? 'settings.ghosts.detail.useAction'
+                      : 'settings.ghosts.detail.chatAction',
+                  )}
+                </Button>
+              ) : null}
+              {!publicationBlocked && onContribute ? (
+                <Button
+                  variant="secondary"
+                  size="lg"
+                  onClick={onContribute}
+                  loading={contributionBusy}
+                  disabled={Boolean(contributionUnavailableReason)}
+                  title={contributionUnavailableReason}
+                >
+                  {t('settings.ghosts.contribution.publishPlugin')}
+                </Button>
+              ) : null}
+              {/* 启用开关带明确文字(设计定稿):状态一目了然,点文字同样可切换。 */}
+              <label
+                htmlFor={enableSwitchId}
+                className={cn(
+                  'flex shrink-0 items-center gap-2 rounded-full py-1 pl-3 pr-1 transition-colors duration-150',
+                  'hover:bg-[var(--surface-hover-soft)]',
+                  toggleDisabled || needsReapproval ? 'cursor-not-allowed' : 'cursor-pointer',
+                )}
+              >
+                <span
+                  className={cn(
+                    'text-12',
+                    (toggleDisabled || needsReapproval) && 'opacity-60',
+                    enabled ? 'text-[var(--text-secondary)]' : 'text-[var(--text-tertiary)]',
+                  )}
+                >
+                  {t(
+                    enabled
+                      ? 'settings.ghosts.detail.enabledLabel'
+                      : 'settings.ghosts.detail.disabledLabel',
+                  )}
+                </span>
+                <Switch
+                  id={enableSwitchId}
+                  checked={enabled}
+                  disabled={toggleDisabled || needsReapproval}
+                  onCheckedChange={onToggle}
+                  aria-label={t('settings.ghosts.enableAria', { name: detail.name })}
+                />
+              </label>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label={t('settings.ghosts.detail.moreActions')}
+                    className="grid size-10 shrink-0 place-items-center rounded-full text-[var(--text-secondary)] transition-colors duration-150 hover:bg-[var(--surface-hover-soft)] hover:text-[var(--text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)] data-[state=open]:bg-[var(--surface-chip)]"
+                  >
+                    <MoreVertical size={18} aria-hidden="true" />
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent
+                  align="end"
+                  sideOffset={8}
+                  className="w-56 p-1.5"
+                >
+                  {localUpdateAvailable ? (
+                    <DropdownMenuItem
+                      onSelect={onUpdateFromFile}
+                      disabled={updateBusy}
+                    >
+                      {t('settings.ghosts.detail.updateFromFile')}
+                    </DropdownMenuItem>
+                  ) : null}
+                  {onExport ? (
+                    <DropdownMenuItem
+                      onSelect={onExport}
+                      className="gap-2.5"
+                    >
+                      <Download size={15} aria-hidden="true" />
+                      {t('settings.ghosts.detail.exportPackage')}
+                    </DropdownMenuItem>
+                  ) : null}
+                  {hasAdditionalActions ? (
+                    <DropdownMenuSeparator />
+                  ) : null}
+                  <DropdownMenuItem
+                    onSelect={onUninstall}
+                    disabled={updateBusy}
+                    variant="danger"
+                    className="gap-2.5"
+                  >
+                    <Trash2 size={15} aria-hidden="true" />
+                    {t('settings.ghosts.uninstall')}
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
+          }
+        >
+
+          {needsReapproval ? (
+            <div className={cn('mt-5 rounded-xl px-4 py-3.5', DETAIL_SURFACE_CLASS)} role="status">
+              <p className="text-13 font-medium text-[var(--text-primary)]">
+                {t('settings.ghosts.reapproval.noticeTitle')}
+              </p>
+              <p className="mt-1 text-13 leading-5 text-[var(--text-secondary)]">
+                {t(
+                  detail.builtin
+                    ? 'settings.ghosts.reapproval.bodyBuiltinRestart'
+                    : detail.approvalState === 'invalid'
+                      ? 'settings.ghosts.reapproval.bodyInvalid'
+                      : 'settings.ghosts.reapproval.bodyLegacy',
+                )}
+              </p>
+            </div>
+          ) : null}
+        </PluginDetailHeader>
+
+        {ghost && !remote ? (
+          <PluginUsageCard
+            key={`${usageOwnerKey ?? 'local'}:${detail.id}`}
+            ghostId={detail.id}
+            confirmClear={confirmClearUsage}
+          />
+        ) : null}
+
+        {remote ? remoteConfiguration : hasConfiguration ? (
+          <section
+            className={hasGithubConnection ? 'mt-6' : DETAIL_SECTION_CLASS}
+            aria-labelledby={hasGithubConnection ? undefined : 'ghost-configuration-title'}
+          >
+            {!hasGithubConnection && (
+              <DetailSectionHeader
+                id="ghost-configuration-title"
+                title={t('settings.ghosts.detail.configurationTitle')}
+              />
+            )}
+            <div
+              className={cn(
+                hasGithubConnection ? 'max-w-[760px]' : DETAIL_SECTION_CONTENT_CLASS,
+                'space-y-3',
+              )}
+            >
+              {detail.hasMainView ? (
+                <div
+                  className={cn(
+                    DETAIL_SURFACE_CLASS,
+                    'flex min-h-20 items-center gap-3 rounded-xl px-5 py-4',
+                  )}
+                >
+                  <AppWindow
+                    size={18}
+                    className="shrink-0 text-[var(--text-tertiary)]"
+                    aria-hidden="true"
+                  />
+                  <div className="min-w-0 flex-1">
+                    <p className="text-14 font-medium leading-[1.571] text-[var(--text-primary)]">
+                      {t('settings.ghosts.detail.sidebarEntryTitle')}
+                    </p>
+                    <p className="mt-0.5 text-13 leading-5 text-[var(--text-secondary)]">
+                      {t('settings.ghosts.detail.sidebarEntryDescription', {
+                        title: detail.mainViewTitle ?? detail.name,
+                      })}
+                    </p>
+                  </div>
+                  <Switch
+                    checked={mainViewSidebarVisible}
+                    onCheckedChange={onMainViewSidebarVisibleChange}
+                    aria-label={t('settings.ghosts.detail.showInSidebar')}
+                  />
+                </div>
+              ) : null}
+              {detail.hasSettingsUi ? (
+                ghost ? (
+                  <>
+                    {ghost.oauthScopeStale ? <OauthScopeStaleBadge /> : null}
+                    <GhostSettingsWebview
+                      reloadKey={githubConnectionVersion}
+                      account={
+                        hasGithubConnection ? (
+                          <GithubAccountCard
+                            onConnected={() => setGithubConnectionVersion((version) => version + 1)}
+                          />
+                        ) : undefined
+                      }
+                      ghost={ghost}
+                      title={t('settings.ghosts.detail.settingsTitle', { name: detail.name })}
+                      appearance="plugin"
+                    />
+                  </>
+                ) : (
+                  <div
+                    className={cn(
+                      DETAIL_SURFACE_CLASS,
+                      'flex min-h-20 items-center gap-3 rounded-xl px-5 py-4',
+                    )}
+                  >
+                    <LayoutTemplate
+                      size={18}
+                      className="shrink-0 text-[var(--text-tertiary)]"
+                      aria-hidden="true"
+                    />
+                    <div className="min-w-0">
+                      <p className="text-14 font-medium leading-[1.571] text-[var(--text-primary)]">
+                        {t('settings.ghosts.detail.settingsTitle', { name: detail.name })}
+                      </p>
+                      <p className="mt-0.5 text-13 leading-5 text-[var(--text-secondary)]">
+                        {t('settings.ghosts.detail.settingsUnavailableUntilRestore')}
+                      </p>
+                    </div>
+                  </div>
+                )
+              ) : null}
+              {ghost?.manifest.routineEvents ? (
+                <p className="text-13 text-[var(--text-secondary)]">
+                  {t('routines.pluginCapability')}
+                </p>
+              ) : null}
+              {detail.hasTaskPreferences ? (
+                <PluginTaskPrefs ghostId={detail.id} appearance="plugin"
+                  showTaskRows={detail.hasPluginTasks}
+                  legacyDefault={ghost?.manifest.agent?.errand === true && !ghost.manifest.agent?.tasks && !ghost.manifest.workspace} />
+              ) : null}
+            </div>
+          </section>
+        ) : null}
+
+        <PluginBackgroundTasksSection
+          ghostId={detail.id}
+          installed={ghost !== null}
+          hiddenTasksDeclared={ghostDeclaresHiddenTasks(ghost?.manifest)}
+        />
+
+        {ghost && !remote ? (
+          <PluginControlPointsSection
+            ghostId={detail.id}
+            declared={declaredGhostControlPoints(ghost.manifest).length > 0}
+          />
+        ) : null}
+
+        {detail.tools.length > 0 ? <ToolsSection tools={detail.tools} /> : null}
+
+        {detail.permissions.length > 0 ? <PermissionSummary items={detail.permissions} /> : null}
+        {ghost && pluginHasToolUi(ghost.manifest) && <section className="mt-4 space-y-3">
+          <h3 className="text-14 font-medium text-[var(--text-primary)]">{t('settings.ghosts.perm.mcpUi')}</h3>
+          {ghost.manifest.tools?.filter(tool => getPluginToolUi(ghost.manifest)?.tools[tool.name]).map(tool => <div key={tool.name} className="text-13 text-[var(--text-secondary)]">
+            <p>{tool.name}</p>
+            <p className="break-all text-12">{getPluginToolUi(ghost.manifest)?.tools[tool.name].visibility && !getPluginToolUi(ghost.manifest)?.tools[tool.name].visibility!.includes('model') ? t('settings.ghosts.perm.mcpAppOnly') : `ghost_call: ${tool.name}`}</p>
+          </div>)}
+          {!remote && enabled && ghost.uiCapabilityApproved !== true && <Button variant="secondary" size="sm" disabled={taskApprovalPending} onClick={async () => {
+            setTaskApprovalPending(true);
+            try { await window.electronAPI.ghosts.requestUiApproval(detail.id); }
+            catch { toast.error(t('settings.ghosts.errors.generic')); }
+            finally { setTaskApprovalPending(false); }
+          }}>{t('settings.ghosts.installConsent.updateNeedsConsent')}</Button>}
+        </section>}
+
+        {!remote && enabled && ghost?.manifest.agent?.tasks === true && ghost.taskCapabilityApproved !== true ? (
+          <Button variant="secondary" size="sm" className="mt-4" disabled={taskApprovalPending} onClick={async () => {
+            setTaskApprovalPending(true);
+            try {
+              await window.electronAPI.ghosts.requestTaskApproval(detail.id);
+            } catch {
+              toast.error(t('settings.ghosts.errors.generic'));
+            } finally {
+              setTaskApprovalPending(false);
+            }
+          }}>
+            {t('settings.ghosts.perm.agentTasksRequest')}
+          </Button>
+        ) : null}
+        {!remote && enabled && ghost?.manifest.agent?.observe === true && ghost.observeCapabilityApproved !== true ? (
+          <Button variant="secondary" size="sm" className="mt-4" disabled={taskApprovalPending} onClick={async () => {
+            setTaskApprovalPending(true);
+            try {
+              await window.electronAPI.ghosts.requestTaskApproval(detail.id, 'observe');
+            } catch {
+              toast.error(t('settings.ghosts.errors.generic'));
+            } finally {
+              setTaskApprovalPending(false);
+            }
+          }}>
+            {t('settings.ghosts.perm.agentObserveRequest')}
+          </Button>
+        ) : null}
+
+        {!remote ? <GhostLibrarySection ghostId={detail.id} enabled={ghost?.manifest.library === true} /> : null}
+        {!remote ? (
+          <GhostHandoffFilesSection
+            ghostId={detail.id}
+            declared={(ghost?.manifest.tools ?? []).some((tool) => ghostToolDeclaresHandoff(tool))}
+          />
+        ) : null}
+
+        {publishingSection}
+
+        <DetailsSection detail={remote ? { ...detail, installDir: null } : detail} panelStatus={panelStatus} />
+      </article>
+    </main>
+  );
+}
+
+/** 宿主侧非阻塞角标；重新连接动作继续复用插件设置区已有入口。 */
+export function OauthScopeStaleBadge() {
+  const { t } = useTranslation();
+  return (
+    <div
+      role="status"
+      className="inline-flex w-fit max-w-full items-center gap-1.5 rounded-full bg-[var(--warning-bg-soft)] px-3 py-1.5 text-12 leading-5 text-[var(--text-secondary)]"
+    >
+      <AlertTriangle size={13} className="shrink-0 text-[var(--warning-fg)]" aria-hidden="true" />
+      <span>{t('settings.ghosts.detail.oauthScopeStale')}</span>
+    </div>
+  );
+}
+
+export function PluginDetailHeader({
+  id,
+  name,
+  description,
+  author,
+  version,
+  marketItem,
+  iconDataUrl,
+  actions,
+  children,
+  onIconLoadError,
+}: {
+  id: string;
+  name: string;
+  description: string;
+  author?: string | null;
+  version?: string;
+  marketItem?: PluginMarketItem | null;
+  iconDataUrl?: string;
+  actions?: ReactNode;
+  children?: ReactNode;
+  onIconLoadError?: () => void;
+}) {
+  const { t } = useTranslation();
+  const [descriptionExpanded, setDescriptionExpanded] = useState(false);
+  const [descriptionOverflows, setDescriptionOverflows] = useState(false);
+  const descriptionRef = useRef<HTMLParagraphElement>(null);
+  useLayoutEffect(() => {
+    setDescriptionExpanded(false);
+    const description = descriptionRef.current;
+    if (!description) return;
+    const measure = () => {
+      const computedStyle = window.getComputedStyle(description);
+      const lineHeight = Number.parseFloat(computedStyle.lineHeight);
+      const width = description.getBoundingClientRect().width;
+      if (!Number.isFinite(lineHeight) || width <= 0) {
+        setDescriptionOverflows(false);
+        return;
+      }
+
+      // Chromium reports the clamped element's scrollHeight as the visible height.
+      // Measure an unclamped, off-screen clone so the affordance only appears when
+      // the complete description genuinely exceeds three lines.
+      const measurement = description.cloneNode(true) as HTMLParagraphElement;
+      measurement.classList.remove('line-clamp-3');
+      Object.assign(measurement.style, {
+        position: 'fixed',
+        left: '-10000px',
+        top: '0',
+        width: `${width}px`,
+        height: 'auto',
+        maxHeight: 'none',
+        overflow: 'visible',
+        visibility: 'hidden',
+        pointerEvents: 'none',
+        WebkitLineClamp: 'unset',
+        WebkitBoxOrient: 'initial',
+      });
+      document.body.appendChild(measurement);
+      const fullHeight = measurement.getBoundingClientRect().height;
+      measurement.remove();
+      setDescriptionOverflows(fullHeight > lineHeight * 3 + 1);
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(description);
+    return () => observer.disconnect();
+  }, [id, description]);
+  return (
+    <header>
+      <div className="plugin-detail-hero grid grid-cols-[64px_minmax(0,1fr)_auto] items-center gap-3">
+        <GhostPluginIcon
+          iconDataUrl={iconDataUrl}
+          iconId={id}
+          iconName={name}
+          size="detail"
+          onIconLoadError={onIconLoadError}
+        />
+        <div className="min-w-0">
+          <h1 className="truncate text-28 font-medium leading-[1.214] text-[var(--text-primary)]">
+            {name}
+          </h1>
+          <GhostPluginMetadata author={author} version={version} marketItem={marketItem} />
+        </div>
+
+        {actions}
+      </div>
+      <div className="mt-5">
+        <p
+          ref={descriptionRef}
+          className={cn(
+            'text-14 leading-[1.571] text-[var(--text-secondary)]',
+            !descriptionExpanded && 'line-clamp-3',
+          )}
+        >
+          {description}
+        </p>
+        {descriptionOverflows ? (
+          <button
+            type="button"
+            onClick={() => setDescriptionExpanded((expanded) => !expanded)}
+            aria-expanded={descriptionExpanded}
+            className="mt-1.5 rounded-full text-13 leading-5 text-[var(--text-secondary)] transition-colors duration-150 hover:text-[var(--text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring-soft)]"
+          >
+            {t(
+              descriptionExpanded
+                ? 'settings.ghosts.detail.descriptionCollapse'
+                : 'settings.ghosts.detail.descriptionExpand',
+            )}
+          </button>
+        ) : null}
+      </div>
+      {children}
+    </header>
+  );
+}
+
+/** Compact factual metadata with one shared color and stable product order. */
+export function GhostPluginMetadata({
+  author,
+  version,
+  marketItem,
+}: {
+  author?: string | null;
+  version?: string;
+  marketItem?: PluginMarketItem | null;
+}) {
+  const { t } = useTranslation();
+  if (!author && !version && !marketItem) return null;
+  return (
+    <div className="plugin-detail-metadata mt-2 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-13 leading-5 text-[var(--text-tertiary)]">
+      {author ? (
+        <>
+          <span className="min-w-0 truncate">
+            {t('settings.ghosts.detail.byAuthor', { author })}
+          </span>
+          {version ? <MetadataDivider /> : null}
+        </>
+      ) : null}
+      {version ? <span className="shrink-0">v{version}</span> : null}
+      {marketItem ? <PluginSharedUsage detail={marketItem} /> : null}
+    </div>
+  );
+}
+
+function MetadataDivider() {
+  return (
+    <span className="shrink-0" aria-hidden="true">
+      ·
+    </span>
+  );
+}
+
+export function DetailSectionHeader({
+  id,
+  title,
+  action,
+}: {
+  id: string;
+  title: string;
+  action?: ReactNode;
+}) {
+  return (
+    <div className="flex min-h-[26px] items-center justify-between gap-4">
+      <h2 id={id} className={DETAIL_SECTION_HEADING_CLASS}>
+        {title}
+      </h2>
+      {action}
+    </div>
+  );
+}
+
+function SectionTextAction({
+  expanded,
+  onClick,
+  children,
+}: {
+  expanded?: boolean;
+  onClick: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      aria-expanded={expanded}
+      onClick={onClick}
+      className="shrink-0 rounded-md px-1 py-0.5 text-13 text-[var(--text-secondary)] transition-colors duration-150 hover:text-[var(--text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)]"
+    >
+      {children}
+    </button>
+  );
+}
+
+export function ToolsSection({
+  tools,
+}: {
+  tools: readonly (Pick<GhostToolDecl, 'name' | 'description'> & Partial<GhostToolDecl>)[];
+}) {
+  const { t } = useTranslation();
+  const [expanded, setExpanded] = useState(false);
+  const canExpand = tools.length > 6;
+  return (
+    <section className={DETAIL_SECTION_CLASS} aria-labelledby="ghost-tools-title">
+      <DetailSectionHeader
+        id="ghost-tools-title"
+        title={t('settings.ghosts.detail.toolsTitle')}
+        action={
+          canExpand ? (
+            <SectionTextAction expanded={expanded} onClick={() => setExpanded((value) => !value)}>
+              {t(
+                expanded
+                  ? 'settings.ghosts.detail.collapseTools'
+                  : 'settings.ghosts.detail.viewAllTools',
+              )}
+            </SectionTextAction>
+          ) : undefined
+        }
+      />
+      <div
+        className={cn(
+          DETAIL_SECTION_CONTENT_CLASS,
+          'flex flex-wrap gap-2',
+          !expanded && canExpand && 'max-h-8 overflow-hidden',
+        )}
+      >
+        {tools.map((tool) => (
+          <ToolDescriptionChip key={tool.name} tool={tool} />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+/** A Tool exposes only its author-provided description after explicit activation. */
+export function ToolDescriptionChip({ tool }: { tool: Pick<GhostToolDecl, 'name' | 'description'> & Partial<GhostToolDecl> }) {
+  const { t } = useTranslation();
+  return (
+    <Popover>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          aria-label={t('settings.ghosts.detail.openTool', { name: tool.name })}
+          className={cn(
+            DETAIL_SURFACE_CLASS,
+            DETAIL_SURFACE_INTERACTIVE_CLASS,
+            'inline-flex h-8 max-w-full items-center rounded-full px-3 text-[var(--text-secondary)] hover:text-[var(--text-primary)]',
+          )}
+        >
+          <code className="truncate font-mono text-13 leading-[1.385]">{tool.name}</code>
+        </button>
+      </PopoverTrigger>
+      <PopoverContent
+        align="start"
+        sideOffset={8}
+        className={cn(
+          DETAIL_SURFACE_CLASS,
+          'z-[10000] w-[320px] rounded-xl p-4 text-[var(--text-primary)] shadow-[var(--shadow-menu)] data-[state=open]:animate-none data-[state=closed]:animate-none',
+        )}
+      >
+        <p className="text-13 leading-5 text-[var(--text-secondary)]">
+          {tool.description || t('settings.ghosts.detail.noToolDescription')}
+        </p>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+export function PermissionSummary({ items }: { items: readonly GhostPermissionItem[] }) {
+  const { t } = useTranslation();
+  return (
+    <PluginPermissionSummary
+      items={items
+        .filter((item) => item.kind !== 'tool')
+        .map((item) => ({
+          key: item.key,
+          title: t('settings.ghosts.perm.' + item.labelKey, item.labelArgs),
+          descriptions: [
+            item.detailKey ? t('settings.ghosts.perm.' + item.detailKey, item.detailArgs) : '',
+            item.detail ?? '',
+          ].filter(Boolean),
+          icon: permissionItemIcon(item),
+        }))}
+    />
+  );
+}
+
+interface PluginPermissionFact {
+  key: string;
+  title: string;
+  descriptions: readonly string[];
+  icon?: LucideIcon;
+}
+
+export function PluginPermissionSummary({
+  items: permissionItems,
+}: {
+  items: readonly PluginPermissionFact[];
+}) {
+  const { t } = useTranslation();
+  const [dialogOpen, setDialogOpen] = useState(false);
+  if (permissionItems.length === 0) return null;
+  const permissionCardLabel = `${t('settings.ghosts.detail.permissionsTitle')}: ${permissionItems
+    .map((item) => item.title)
+    .join(', ')}`;
+  return (
+    <section className={DETAIL_SECTION_CLASS} aria-labelledby="ghost-permissions-title">
+      <DetailSectionHeader
+        id="ghost-permissions-title"
+        title={t('settings.ghosts.detail.permissionsTitle')}
+        action={
+          <SectionTextAction onClick={() => setDialogOpen(true)}>
+            {t('settings.ghosts.detail.viewAllPermissions')}
+          </SectionTextAction>
+        }
+      />
+      <button
+        type="button"
+        aria-label={permissionCardLabel}
+        onClick={() => setDialogOpen(true)}
+        className={cn(
+          DETAIL_SURFACE_CLASS,
+          DETAIL_SURFACE_INTERACTIVE_CLASS,
+          DETAIL_SECTION_CONTENT_CLASS,
+          'grid w-full grid-cols-2 gap-x-8 gap-y-0 rounded-xl p-4 text-left',
+        )}
+      >
+        {permissionItems.map((item) => {
+          const Icon = item.icon ?? Shield;
+          return (
+            <span
+              key={item.key}
+              className="flex min-h-9 min-w-0 items-center gap-2.5 text-[var(--text-primary)]"
+            >
+              <Icon
+                size={20}
+                strokeWidth={1.8}
+                className="shrink-0 text-[var(--text-secondary)]"
+                aria-hidden="true"
+              />
+              <span className="min-w-0 break-words text-13 font-normal leading-5">
+                {item.title}
+              </span>
+            </span>
+          );
+        })}
+      </button>
+      <PermissionDetailDialog
+        open={dialogOpen}
+        onOpenChange={setDialogOpen}
+        items={permissionItems}
+      />
+    </section>
+  );
+}
+
+function PermissionDetailRow({ item }: { item: PluginPermissionFact }) {
+  const Icon = item.icon ?? Shield;
+  return (
+    <div className="flex items-start gap-3 py-4 first:pt-0 last:pb-0">
+      <Icon
+        size={18}
+        strokeWidth={1.8}
+        className="mt-0.5 shrink-0 text-[var(--text-secondary)]"
+        aria-hidden="true"
+      />
+      <div className="min-w-0 flex-1">
+        <p className="break-words text-14 font-medium leading-[1.571] text-[var(--text-primary)]">
+          {item.title}
+        </p>
+        {item.descriptions.map((description, index) => (
+          <p
+            key={index}
+            className="mt-1 whitespace-pre-line break-words text-13 leading-5 text-[var(--text-secondary)]"
+          >
+            {description}
+          </p>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+export function DetailsSection({
+  detail,
+  panelStatus,
+}: {
+  detail: GhostPluginDetail;
+  panelStatus: string | null;
+}) {
+  const { t } = useTranslation();
+  const trustLabelKey = ghostTrustLabelKey(detail.trust);
+  const globalTabs = useGlobalTabs();
+  useTabGroupAssignments();
+  const installedGhost = useInstalledGhosts().find(
+    (ghost) => installedGhostStoragePart(ghost) === detail.id,
+  );
+  const inSidebar = globalTabs.some(
+    (tab) => (tab.state as { instanceId?: string } | null)?.instanceId === detail.id,
+  );
+  // 用户拖过 / 弹过 / 已套过默认边:给「恢复默认位置」。
+  const canResetPlacement = hasPluginPlacementMemory(detail.id);
+  const placementActionClass =
+    'shrink-0 rounded-md px-2 py-1 text-12 text-[var(--text-secondary)] transition-colors hover:bg-[var(--surface-hover-soft)] hover:text-[var(--text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)]';
+  const facts: Array<{
+    key: string;
+    label: string;
+    value: string;
+    monospace?: boolean;
+    action?: ReactNode;
+    fullWidth?: boolean;
+  }> = [
+    {
+      key: 'version',
+      label: t('settings.ghosts.detail.infoVersion'),
+      value: `v${detail.version}`,
+    },
+    ...(detail.author
+      ? [
+          {
+            key: 'author',
+            label: t('settings.ghosts.detail.infoAuthor'),
+            value: detail.author,
+          },
+        ]
+      : []),
+    {
+      key: 'trust',
+      label: t('settings.ghosts.detail.infoTrust'),
+      value: t(`settings.ghosts.trust.${trustLabelKey}`, {
+        publisher: detail.trust.publisherName ?? t('settings.ghosts.trust.unknownPublisher'),
+      }),
+    },
+    {
+      key: 'identifier',
+      label: t('settings.ghosts.detail.infoId'),
+      value: detail.ghostId,
+      monospace: true,
+    },
+    ...(detail.contents.length > 0
+      ? [
+          {
+            key: 'contents',
+            label: t('settings.ghosts.detail.infoContents'),
+            value: detail.contents
+              .map((content) => t(`settings.ghosts.contents.${content}`))
+              .join(' · '),
+          },
+        ]
+      : []),
+    {
+      key: 'panel',
+      label: t('settings.ghosts.detail.infoPanel'),
+      value:
+        detail.panelMinWidth === null
+          ? t('settings.ghosts.detail.panelNone')
+          : panelStatus || t('settings.ghosts.detail.panelDismissed'),
+      // 停靠形态面板关掉页签后,这里是除右侧栏「+」菜单外的另一个重开入口
+      // (这类插件没有左侧栏入口)。已在侧栏、停用、tab 形态或无面板时不渲染。
+      // 「恢复默认位置」:清掉用户的放置记忆(拖到的边 / 弹过窗口),回到插件声明的默认边。
+      ...(detail.panelMinWidth !== null && !detail.tabPanel
+        ? {
+            action: (
+              <span className="flex shrink-0 items-center gap-1">
+                {detail.enabled && !inSidebar && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (installedGhost) void openPluginInSidebar(installedGhost, 'panel');
+                    }}
+                    className={placementActionClass}
+                  >
+                    {t('settings.ghosts.detail.openInSidebar')}
+                  </button>
+                )}
+                {canResetPlacement && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (installedGhost) void resetPluginPlacementAndReturn(installedGhost);
+                    }}
+                    className={placementActionClass}
+                  >
+                    {t('settings.ghosts.detail.resetPlacement')}
+                  </button>
+                )}
+              </span>
+            ),
+          }
+        : {}),
+    },
+    ...(detail.installDir
+      ? [
+          {
+            key: 'location',
+            label: t('settings.ghosts.detail.infoLocation'),
+            value: detail.installDir,
+            fullWidth: true,
+            action: (
+              <div className="flex shrink-0 items-center gap-0.5">
+                <button
+                  type="button"
+                  onClick={() => {
+                    void navigator.clipboard.writeText(detail.installDir ?? '').then(
+                      () => toast.success(t('settings.ghosts.detail.locationCopied')),
+                      () => toast.error(t('settings.ghosts.detail.locationCopyFailed')),
+                    );
+                  }}
+                  title={t('settings.ghosts.detail.copyLocation')}
+                  aria-label={t('settings.ghosts.detail.copyLocation')}
+                  className="grid size-7 shrink-0 place-items-center rounded-md text-[var(--text-tertiary)] transition-colors hover:bg-[var(--surface-hover-soft)] hover:text-[var(--text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)]"
+                >
+                  <Copy size={14} aria-hidden="true" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const installDir = detail.installDir;
+                    if (!installDir) return;
+                    void window.electronAPI.openPath(installDir).then(
+                      (result) => {
+                        if (shouldShowOpenPathError(result))
+                          toast.error(t('settings.ghosts.errors.generic'));
+                      },
+                      () => toast.error(t('settings.ghosts.errors.generic')),
+                    );
+                  }}
+                  title={t('settings.ghosts.detail.openLocation')}
+                  aria-label={t('settings.ghosts.detail.openLocation')}
+                  className="grid size-7 shrink-0 place-items-center rounded-md text-[var(--text-tertiary)] transition-colors hover:bg-[var(--surface-hover-soft)] hover:text-[var(--text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)]"
+                >
+                  <FolderOpen size={14} aria-hidden="true" />
+                </button>
+              </div>
+            ),
+          },
+        ]
+      : []),
+  ];
+  return <PluginDetailFactsSection facts={facts} />;
+}
+
+export function PluginDetailFactsSection({
+  facts,
+}: {
+  facts: readonly {
+    key: string;
+    label: string;
+    value: string;
+    monospace?: boolean;
+    action?: ReactNode;
+    fullWidth?: boolean;
+  }[];
+}) {
+  const { t } = useTranslation();
+  return (
+    <section className={DETAIL_SECTION_CLASS} aria-labelledby="ghost-details-title">
+      <DetailSectionHeader id="ghost-details-title" title={t('settings.ghosts.detail.infoTitle')} />
+      <div className={cn(DETAIL_SECTION_CONTENT_CLASS, 'grid grid-cols-3 gap-x-10 gap-y-7')}>
+        {facts.map((fact) => (
+          <div key={fact.key} className={cn('min-w-0', fact.fullWidth && 'col-span-full')}>
+            <p className="truncate text-13 leading-5 text-[var(--text-secondary)]">{fact.label}</p>
+            <ExpandableDetailValue
+              label={fact.label}
+              value={fact.value}
+              monospace={fact.monospace}
+              action={fact.action}
+            />
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+/** One-line fact value that reveals its complete text in place only when it overflows. */
+function ExpandableDetailValue({
+  label,
+  value,
+  monospace,
+  action,
+}: {
+  label: string;
+  value: string;
+  monospace?: boolean;
+  action?: ReactNode;
+}) {
+  const { t } = useTranslation();
+  const valueRef = useRef<HTMLDivElement>(null);
+  const [expanded, setExpanded] = useState(false);
+  const [overflows, setOverflows] = useState(false);
+
+  useLayoutEffect(() => {
+    if (expanded) return;
+    const valueElement = valueRef.current;
+    if (!valueElement) return;
+    const measure = () => {
+      setOverflows(valueElement.scrollWidth > valueElement.clientWidth + 1);
+    };
+    measure();
+    if (typeof ResizeObserver === 'undefined') {
+      window.addEventListener('resize', measure);
+      return () => window.removeEventListener('resize', measure);
+    }
+    const observer = new ResizeObserver(measure);
+    observer.observe(valueElement);
+    return () => observer.disconnect();
+  }, [expanded, value]);
+
+  const toggleLabel = t(
+    expanded
+      ? 'settings.ghosts.detail.collapseInfoValue'
+      : 'settings.ghosts.detail.expandInfoValue',
+    { label },
+  );
+
+  return (
+    <div className="mt-0.5 flex min-w-0 items-start gap-1">
+      <div
+        ref={valueRef}
+        className={cn(
+          'min-w-0 flex-1 text-14 leading-[1.571] text-[var(--text-primary)]',
+          expanded ? 'whitespace-pre-wrap break-words' : 'truncate whitespace-nowrap',
+          monospace && 'font-mono text-13',
+        )}
+        title={!expanded ? value : undefined}
+      >
+        {value}
+      </div>
+      {action}
+      {overflows ? (
+        <button
+          type="button"
+          onClick={() => setExpanded((value) => !value)}
+          aria-expanded={expanded}
+          aria-label={toggleLabel}
+          title={toggleLabel}
+          className="grid size-7 shrink-0 place-items-center rounded-full text-[var(--text-tertiary)] transition-colors duration-150 hover:bg-[var(--surface-hover-soft)] hover:text-[var(--text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)]"
+        >
+          <ChevronDown
+            size={15}
+            strokeWidth={1.7}
+            className={cn('transition-transform duration-150', expanded && 'rotate-180')}
+            aria-hidden="true"
+          />
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+function DialogFrame({ children }: { children: ReactNode }) {
+  return (
+    <Dialog.Portal>
+      <Dialog.Overlay
+        className="modal-scrim fixed inset-0 z-[10000]"
+        style={WINDOW_NO_DRAG_STYLE}
+      />
+      <Dialog.Content
+        onPointerDownOutside={(event) => event.preventDefault()}
+        className="modal-panel fixed left-1/2 top-1/2 z-[10000] flex max-h-[70vh] w-[calc(100vw-48px)] max-w-[560px] -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden text-[var(--text-primary)] focus:outline-none"
+        style={WINDOW_NO_DRAG_STYLE}
+      >
+        {children}
+      </Dialog.Content>
+    </Dialog.Portal>
+  );
+}
+
+function DialogCloseButton() {
+  const { t } = useTranslation();
+  return (
+    <Dialog.Close
+      aria-label={t('settings.ghosts.detail.closeDialog')}
+      className="grid size-9 shrink-0 place-items-center rounded-full text-[var(--text-secondary)] hover:bg-[var(--surface-hover-soft)] hover:text-[var(--text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)]"
+    >
+      <X size={17} aria-hidden="true" />
+    </Dialog.Close>
+  );
+}
+
+/** Complete non-Tool permission inventory with host- and manifest-provided descriptions. */
+function PermissionDetailDialog({
+  open,
+  onOpenChange,
+  items,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  items: readonly PluginPermissionFact[];
+}) {
+  const { t } = useTranslation();
+  return (
+    <Dialog.Root open={open} onOpenChange={onOpenChange}>
+      <DialogFrame>
+        <div className="flex items-start gap-4 border-b-[0.5px] border-[var(--border-default)] px-6 py-5">
+          <div className="min-w-0 flex-1">
+            <Dialog.Title className="text-18 font-medium">
+              {t('settings.ghosts.detail.permissionsTitle')}
+            </Dialog.Title>
+            <Dialog.Description className="mt-1 text-13 leading-5 text-[var(--text-tertiary)]">
+              {t('settings.ghosts.detail.permissionsDialogDescription', {
+                count: items.length,
+              })}
+            </Dialog.Description>
+          </div>
+          <DialogCloseButton />
+        </div>
+        <div className="overflow-y-auto px-6 py-5">
+          <div className="divide-y-[0.5px] divide-[var(--border-default)]">
+            {items.map((item) => (
+              <PermissionDetailRow key={item.key} item={item} />
+            ))}
+          </div>
+        </div>
+      </DialogFrame>
+    </Dialog.Root>
+  );
+}

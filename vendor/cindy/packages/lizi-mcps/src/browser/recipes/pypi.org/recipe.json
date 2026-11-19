@@ -1,0 +1,20 @@
+{
+  "id": "pypi-package",
+  "match": [
+    "pypi.org"
+  ],
+  "description": "Single PyPI package metadata (latest version, license, homepage, classifiers)",
+  "access": "read",
+  "adapter": "pypi/package",
+  "adapterInputMap": {
+    "package": "name"
+  },
+  "inputs": {
+    "package": {
+      "required": true,
+      "type": "str",
+      "description": "PyPI package name (e.g. \"requests\", \"pandas\")"
+    }
+  },
+  "steps": []
+}

@@ -1,0 +1,75 @@
+{
+  "id": "linuxdo-latest",
+  "match": [
+    "linux.do"
+  ],
+  "description": "linux.do 话题列表（需登录；支持全站、标签、分类）",
+  "access": "read",
+  "adapter": "linux-do/feed",
+  "inputs": {
+    "view": {
+      "required": false,
+      "type": "str",
+      "default": "latest",
+      "description": "View type",
+      "choices": [
+        "latest",
+        "hot",
+        "top"
+      ]
+    },
+    "tag": {
+      "required": false,
+      "type": "str",
+      "description": "Tag name, slug, or id"
+    },
+    "category": {
+      "required": false,
+      "type": "str",
+      "description": "Category name, slug, id, or parent/name path"
+    },
+    "limit": {
+      "required": false,
+      "type": "int",
+      "default": 20,
+      "description": "Number of items (per_page)"
+    },
+    "order": {
+      "required": false,
+      "type": "str",
+      "default": "default",
+      "description": "Sort order",
+      "choices": [
+        "default",
+        "created",
+        "activity",
+        "views",
+        "posts",
+        "category",
+        "likes",
+        "op_likes",
+        "posters"
+      ]
+    },
+    "ascending": {
+      "required": false,
+      "type": "boolean",
+      "default": false,
+      "description": "Sort ascending (default: desc)"
+    },
+    "period": {
+      "required": false,
+      "type": "str",
+      "description": "Time period (only for --view top)",
+      "choices": [
+        "all",
+        "daily",
+        "weekly",
+        "monthly",
+        "quarterly",
+        "yearly"
+      ]
+    }
+  },
+  "steps": []
+}

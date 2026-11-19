@@ -1,0 +1,23 @@
+{
+  "id": "ctrip-suggest",
+  "match": [
+    "ctrip.com"
+  ],
+  "description": "搜索携程目的地、景区、火车站和地标联想结果",
+  "access": "read",
+  "adapter": "ctrip/search",
+  "inputs": {
+    "query": {
+      "required": true,
+      "type": "str",
+      "description": "Search keyword (city, scenic spot, landmark)"
+    },
+    "limit": {
+      "required": false,
+      "type": "str",
+      "default": 15,
+      "description": "Number of results (1-50)"
+    }
+  },
+  "steps": []
+}

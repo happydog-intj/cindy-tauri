@@ -11,7 +11,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const cindyDir = path.resolve(process.argv[2] ?? process.env.CINDY_DIR ?? path.join(root, '..', 'cindy'));
+const cindyDir = path.resolve(process.argv[2] ?? process.env.CINDY_DIR ?? path.join(root, 'vendor', 'cindy'));
 const desktopDir = path.join(cindyDir, 'apps', 'desktop');
 const preloadSrc = path.join(desktopDir, 'src', 'preload', 'preload.ts');
 const rendererDist = path.join(desktopDir, '.vite', 'renderer', 'main_window');

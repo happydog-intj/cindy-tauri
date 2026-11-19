@@ -1,0 +1,205 @@
+import { RemoteBotSessionView } from '@/features/bots/RemoteBotSessionView';
+import { createHashRouter, Navigate } from 'react-router-dom';
+
+import { MainLayout } from '@/components/layout/MainLayout';
+import { MainEntryRedirect } from '@/components/layout/MainEntryRedirect';
+import { RouteErrorFallback } from '@/components/error/RouteErrorFallback';
+import { SidebarWindowLayout } from '@/components/layout/SidebarWindowLayout';
+import { SettingsView } from '@/components/settings/SettingsView';
+import { LoginPage } from '@/components/login/LoginPage';
+import { AddAccountLoginPage } from '@/components/login/AddAccountLoginPage';
+import { ProtectedRoute } from '@/components/auth/ProtectedRoute';
+import { GuestRoute } from '@/components/auth/GuestRoute';
+import { LocalDbGate } from '@/components/auth/LocalDbGate';
+import { CCAgentFeatureLayout } from '@/features/cc-agent/CCAgentFeatureLayout';
+import { CCAgentIndexRedirect } from '@/features/cc-agent/CCAgentIndexRedirect';
+import { SecondaryWindowBootGate } from '@/features/cc-agent/SecondaryWindowBootGate';
+import { CCAgentSessionView } from '@/features/cc-agent/CCAgentSessionView';
+import { NewMakerDraftRoute } from '@/features/cc-agent/NewMakerDraftRoute';
+import { OrcaWorkflowRoute } from '@/features/cc-agent/OrcaWorkflowRoute';
+import { WorkdirBrowseRoute } from '@/features/cc-agent/workdir-browse/WorkdirBrowseRoute';
+import { IssueTrackerFeatureLayout } from '@/features/issue-tracker/IssueTrackerFeatureLayout';
+import { SkillhubFeatureLayout } from '@/features/skillhub/SkillhubFeatureLayout';
+import { SkillhubLocalLayout } from '@/features/skillhub/SkillhubLocalLayout';
+import { SkillhubDetailRoute, LegacySkillDetailRedirect } from '@/features/skillhub/SkillhubDetailRoute';
+import { SkillhubMarketListView } from '@/features/skillhub/SkillhubMarketListView';
+import { MakerExperimentalView } from '@/features/maker-experimental/MakerExperimentalView';
+import { SchedulerPage } from '@/features/scheduler';
+import { GhostPluginPage } from '@/features/plugin/GhostPluginPage';
+import { BotsFeatureLayout } from '@/features/bots/BotsFeatureLayout';
+import { BotsListView } from '@/features/bots/BotsListView';
+import { BotsHomeView } from '@/features/bots/BotsHomeView';
+import { BotHistorySessionView } from '@/features/bots/BotHistorySessionView';
+import { BotRosterView } from '@/features/bots/BotRosterView';
+import { BotMarketRoute } from '@/features/bots/BotMarketDialog';
+import { BotSessionView } from '@/features/bots/BotSessionView';
+import { BotDirectMessageView } from '@/features/bots/BotDirectMessageView';
+import { BotGroupChatView } from '@/features/bots/BotGroupChatView';
+import { GhostMainViewFeatureLayout } from '@/features/plugin/GhostMainViewFeatureLayout';
+
+/**
+ * 三层路由架构：
+ *
+ *   GuestRoute (未登录)
+ *    └── /login                    → LoginPage
+ *
+ *   ProtectedRoute (已登录) — 校验 canEnterApp（真登出或换号窗口）
+ *    └── LocalDbGate               → 等 localDb.ensureReady（按 userId 切库）
+ *         └── MainLayout            → 主功能区
+ *              ├── /                → Restore account's last top-level entry
+ *              ├── /cc-agent/...    → CCAgentFeatureLayout
+ *              ├── /bots/...        → BotsFeatureLayout
+ *              └── /settings        → SettingsView
+ *
+ * LocalDbGate 下沉在路由层：AuthProvider 在 RouterProvider 之外无法 useNavigate。
+ */
+export const router = createHashRouter([
+  {
+    path: '/login',
+    element: <GuestRoute />,
+    // 登录线渲染崩溃时的全屏兜底(没有它 react-router 会渲染开发者默认错误页)。
+    errorElement: <RouteErrorFallback />,
+    children: [{ index: true, element: <LoginPage /> }],
+  },
+  {
+    path: '/',
+    element: <ProtectedRoute />,
+    // 最外层兜底:MainLayout / 各 Gate 自身崩溃、或下层没有更近 errorElement 时
+    // 冒泡到这里,全屏展示可恢复错误页(2026-07-09 React #130 事故的直接止血层)。
+    errorElement: <RouteErrorFallback />,
+    children: [
+      {
+        path: 'add-account',
+        element: <AddAccountLoginPage />,
+      },
+      {
+        // 主功能区入口 —— 经过 LocalDbGate（localDb 就绪）才能进
+        element: <LocalDbGate />,
+        children: [
+          // 右侧栏独立子窗口(?sidebarWindow=1)的根路由 —— 与 MainLayout 平级,
+          // 只挂 SidebarWindowLayout(50px chrome + RightSidebarShell),不挂完整壳。
+          {
+            path: 'sidebar-window',
+            element: <SidebarWindowLayout />,
+            errorElement: <RouteErrorFallback variant="section" />,
+          },
+          {
+            element: <MainLayout />,
+            children: [
+              {
+                // pathless wrapper:内容区(cc-agent / skillhub / settings …)渲染
+                // 崩溃时错误只占 outlet,保住 MainLayout 的导航 chrome,用户仍能
+                // 切到其它页面;MainLayout 自身崩溃才冒泡到根级全屏兜底。
+                errorElement: <RouteErrorFallback variant="section" />,
+                children: [
+                  { index: true, element: <MainEntryRedirect /> },
+                  {
+                    path: 'cc-agent',
+                    element: <CCAgentFeatureLayout />,
+                    children: [
+                      { index: true, element: <CCAgentIndexRedirect /> },
+                      // 「在新窗口打开」副窗的启动网关(静态段,必须在 :sessionId 之前匹配)。
+                      // 读 ?bootSession=<id> → resolveSessionRoute → navigate(replace),
+                      // 让 Orca lead/worker 副窗首屏即落到分屏路由,见 SecondaryWindowBootGate。
+                      { path: 'boot', element: <SecondaryWindowBootGate /> },
+                      // delayed-create: /cc-agent/new 是 transient draft 路由(无后端 session),
+                      // 必须在 :sessionId 之前匹配,否则会被当作 sessionId='new' 进入 SessionView。
+                      { path: 'new', element: <NewMakerDraftRoute /> },
+                      // 兼容旧 deep link:新建入口已收敛到同一个可切换 workspace 的创建页。
+                      { path: 'new-dialogue', element: <Navigate to="/cc-agent/new" replace /> },
+                      // Scheduled — 调度任务列表（与 new 同一层级，必须在 :sessionId 之前）
+                      { path: 'scheduled', element: <SchedulerPage /> },
+                      // Workdir File Browser — 文件树视图(vscode-style),sidebar 自动 swap。
+                      // 静态段 'files' 必须在 :sessionId 之前匹配。
+                      { path: 'files/:sessionId', element: <WorkdirBrowseRoute /> },
+                      { path: 'orca/new', element: <Navigate to="/cc-agent/new" replace /> },
+                      { path: 'orca/:sessionId', element: <OrcaWorkflowRoute /> },
+                      { path: ':sessionId', element: <CCAgentSessionView /> },
+                    ],
+                  },
+                  {
+                    path: 'bots',
+                    element: <BotsFeatureLayout />,
+                    children: [
+                      { index: true, element: <BotsHomeView /> },
+                      { path: 'list', element: <BotsListView /> },
+                      // 阵容是主区的一页,不是浮在对话上的模态。静态段排在 :botId
+                      // 之前(React Router 也按静态优先定级),所以 /bots/roster 不会
+                      // 被当成一个叫 "roster" 的伙伴。
+                      { path: 'roster', element: <BotRosterView /> },
+                      { path: 'market/:packageId?', element: <BotMarketRoute /> },
+                      // 伙伴群聊是独立对象(不是某位伙伴的任务),静态段 'groups' 同样排在
+                      // :botId 之前,/bots/groups/<id> 不会被当成一个叫 "groups" 的伙伴。
+                      { path: 'groups/:groupId', element: <BotGroupChatView /> },
+                      { path: 'remote/:deviceId/:botId', element: <RemoteBotSessionView /> },
+                      { path: 'remote/:deviceId/:botId/session/:sessionId', element: <RemoteBotSessionView /> },
+                      { path: 'remote/:deviceId/:botId/history/:sessionId', element: <BotHistorySessionView /> },
+                      // 伙伴私聊只从双方时间线里的消息入口打开，不出现在左侧伙伴列表。
+                      { path: ':botId/direct/:threadId', element: <BotDirectMessageView /> },
+                      { path: ':botId', element: <BotsHomeView /> },
+                      { path: ':botId/session/:sessionId', element: <BotSessionView /> },
+                      { path: ':botId/history/:sessionId', element: <BotHistorySessionView /> },
+                    ],
+                  },
+                  {
+                    // Issue Tracker — 已迁移至 GitHub，此处仅保留引导页
+                    path: 'issues',
+                    element: <IssueTrackerFeatureLayout />,
+                  },
+                  {
+                    // SkillHub v0.2 —— Local skills (v0.2.1) + Market (v0.2.3)
+                    path: 'skillhub',
+                    element: <SkillhubFeatureLayout />,
+                    children: [
+                      { index: true, element: <Navigate to="/skillhub/local" replace /> },
+                      {
+                        element: <SkillhubLocalLayout />,
+                        children: [
+                          { path: 'detail', element: <SkillhubDetailRoute /> },
+                          {
+                            path: 'local',
+                            children: [
+                              { index: true, element: null },
+                              { path: 'by-path', element: <LegacySkillDetailRedirect /> },
+                              { path: ':kind/global/:name', element: <LegacySkillDetailRedirect /> },
+                              { path: ':kind/project/:projectHash/:name', element: <LegacySkillDetailRedirect /> },
+                            ],
+                          },
+                        ],
+                      },
+                      {
+                        path: 'market',
+                        children: [
+                          { index: true, element: <SkillhubMarketListView /> },
+                          // Existing market bookmarks resolve to the shared detail page.
+                          {
+                            path: 'manage/:name',
+                            element: <LegacySkillDetailRedirect market />,
+                          },
+                          { path: ':name', element: <LegacySkillDetailRedirect market /> },
+                          {
+                            path: ':kind/:name',
+                            element: <LegacySkillDetailRedirect market />,
+                          },
+                        ],
+                      },
+                    ],
+                  },
+                  { path: 'settings', element: <SettingsView /> },
+                  { path: 'plugins', element: <GhostPluginPage /> },
+                  { path: 'apps/:ghostId', element: <GhostMainViewFeatureLayout /> },
+                  {
+                    path: 'billing',
+                    element: <Navigate to="/settings?tab=billing" replace />,
+                  },
+                  // Maker IPC / agent event 链路诊断页(独立路由,不影响标准 chat)。
+                  { path: 'maker-experimental', element: <MakerExperimentalView /> },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  },
+]);

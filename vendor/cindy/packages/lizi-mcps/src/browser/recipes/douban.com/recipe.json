@@ -1,0 +1,38 @@
+{
+  "id": "douban-search",
+  "match": [
+    "douban.com",
+    "search.douban.com"
+  ],
+  "description": "搜索豆瓣电影、图书或音乐",
+  "access": "read",
+  "adapter": "douban/search",
+  "adapterInputMap": {
+    "query": "keyword"
+  },
+  "inputs": {
+    "type": {
+      "required": false,
+      "type": "str",
+      "default": "movie",
+      "description": "搜索类型（movie=电影, book=图书, music=音乐）",
+      "choices": [
+        "movie",
+        "book",
+        "music"
+      ]
+    },
+    "query": {
+      "required": true,
+      "type": "str",
+      "description": "搜索关键词"
+    },
+    "limit": {
+      "required": false,
+      "type": "int",
+      "default": 20,
+      "description": "返回结果数量"
+    }
+  },
+  "steps": []
+}

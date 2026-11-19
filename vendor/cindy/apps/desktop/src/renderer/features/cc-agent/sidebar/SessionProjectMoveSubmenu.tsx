@@ -1,0 +1,98 @@
+import { Folder, FolderPlus, MessageCircle, Plus } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
+import { sessionProjectDirectory } from '@cindy/maker-shared/worktree-paths';
+import type { Session } from '@/lib/ccAgent.types';
+
+import type { FolderPickerOption } from '@/components/new-chat/FolderPickerPopover';
+import { DropdownMenuItem, DropdownMenuSeparator } from '@/components/ui/dropdown-menu';
+
+export interface SessionProjectMoveSubmenuProps {
+  heading?: string;
+  projectOptions: readonly FolderPickerOption[];
+  currentSession?: Pick<Session, 'projectDir' | 'workingDir'>;
+  isDialogue: boolean;
+  onSelectProject: (workingDir: string) => void;
+  onBrowseProject?: () => void;
+  /** Create a folder under the projects root and move this task (and its dialogue files) there. */
+  onNewProject?: () => void;
+  onMoveToDialogue?: () => void;
+}
+
+function normalizePath(value: string | null | undefined): string | null {
+  if (!value) return null;
+  return value.replace(/\\/g, '/').replace(/\/+$/, '') || value;
+}
+
+export function SessionProjectMoveSubmenu({
+  heading,
+  projectOptions,
+  currentSession,
+  isDialogue,
+  onSelectProject,
+  onBrowseProject,
+  onNewProject,
+  onMoveToDialogue,
+}: SessionProjectMoveSubmenuProps) {
+  const { t } = useTranslation();
+  const normalizedCurrent = normalizePath(
+    !isDialogue && currentSession ? sessionProjectDirectory(currentSession) : null,
+  );
+
+  return (
+    <>
+      <div className="px-3 py-1.5 text-xs font-medium text-[var(--cmd-palette-item-meta)]">
+        {heading ?? t('ccAgent.sidebar.sessionMenu.moveToProjectHeading')}
+      </div>
+      <div className="pending-queue-scroll -mr-1 max-h-[224px] overflow-x-hidden overflow-y-auto pr-1">
+        {projectOptions.length > 0 ? (
+          projectOptions.map((project) => {
+            const isCurrent = normalizePath(project.path) === normalizedCurrent;
+            return (
+              <DropdownMenuItem
+                key={project.path}
+                disabled={isCurrent}
+                onSelect={() => onSelectProject(project.path)}
+                // Two-line rows; px-3 lines the text up with the px-3 heading above.
+                className="h-auto min-h-9 px-3 py-2"
+              >
+                <Folder size={16} className="mr-2 shrink-0 text-[var(--folder-item-icon)]" />
+                <div className="flex min-w-0 flex-1 flex-col">
+                  <span className="truncate">{project.name}</span>
+                  {project.description && (
+                    <span className="truncate text-xs text-[var(--cmd-palette-item-meta)]">
+                      {project.description}
+                    </span>
+                  )}
+                </div>
+              </DropdownMenuItem>
+            );
+          })
+        ) : (
+          <div className="px-3 py-2 text-sm text-[var(--cmd-palette-item-meta)]">
+            {t('ccAgent.sidebar.sessionMenu.noProjects')}
+          </div>
+        )}
+      </div>
+      {(onBrowseProject || onNewProject || onMoveToDialogue) && <DropdownMenuSeparator />}
+      {onBrowseProject && (
+        <DropdownMenuItem onSelect={onBrowseProject} className="h-8 px-3">
+          <FolderPlus size={16} className="mr-2 shrink-0 text-[var(--folder-item-icon)]" />
+          {t('ccAgent.sidebar.sessionMenu.browseProjectFolder')}
+        </DropdownMenuItem>
+      )}
+      {onNewProject && (
+        <DropdownMenuItem onSelect={onNewProject} className="h-8 px-3">
+          <Plus size={16} className="mr-2 shrink-0 text-[var(--folder-item-icon)]" />
+          {t('ccAgent.sidebar.sessionMenu.newProject')}
+        </DropdownMenuItem>
+      )}
+      {onMoveToDialogue && <DropdownMenuSeparator />}
+      {onMoveToDialogue && (
+        <DropdownMenuItem disabled={isDialogue} onSelect={onMoveToDialogue} className="h-8 px-3">
+          <MessageCircle size={16} className="mr-2 shrink-0 text-[var(--folder-item-icon)]" />
+          {t('ccAgent.sidebar.sessionMenu.moveToDialogue')}
+        </DropdownMenuItem>
+      )}
+    </>
+  );
+}

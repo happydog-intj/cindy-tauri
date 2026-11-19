@@ -1,0 +1,54 @@
+{
+  "id": "pixiv-search",
+  "match": [
+    "pixiv.net",
+    "www.pixiv.net"
+  ],
+  "description": "Search Pixiv illustrations by keyword",
+  "access": "read",
+  "adapter": "pixiv/search",
+  "inputs": {
+    "query": {
+      "required": true,
+      "type": "str",
+      "description": "Search keyword or tag"
+    },
+    "limit": {
+      "required": false,
+      "type": "int",
+      "default": 20,
+      "description": "Number of results"
+    },
+    "order": {
+      "required": false,
+      "type": "str",
+      "default": "date_d",
+      "description": "Sort order",
+      "choices": [
+        "date_d",
+        "date",
+        "popular_d",
+        "popular_male_d",
+        "popular_female_d"
+      ]
+    },
+    "mode": {
+      "required": false,
+      "type": "str",
+      "default": "all",
+      "description": "Search mode",
+      "choices": [
+        "all",
+        "safe",
+        "r18"
+      ]
+    },
+    "page": {
+      "required": false,
+      "type": "int",
+      "default": 1,
+      "description": "Page number"
+    }
+  },
+  "steps": []
+}

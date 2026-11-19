@@ -1,0 +1,2816 @@
+import { CatalogDeviceScope, type CatalogDeviceControl } from './useCatalogDevice';
+import { RemotePluginPage } from './RemotePluginPage';
+import { LocalPluginShareView } from './LocalPluginShareView';
+import { PluginVersionFacts } from './PluginVersionFacts';
+import { useSignInToCindy } from '@/hooks/useSignInToCindy';
+import { rememberContributionIntent, consumeContributionIntent, matchesContributionIntent } from './lib/contributionIntent';
+import { MyPluginsPage, contributionErrorKey, type MyPluginsPageCache, type PluginSubmitOptions } from './MyPluginsPage';
+import { localPublishingUnavailableKey } from './lib/ghostPluginDetailModel';
+import { PluginPublishDialog, type PluginPublishDialogRequest } from './PluginPublishDialog';
+import { featureRetirementById, type FeatureRetirement } from '../../../shared/featureRetirements';
+import { RetiredFeatureDetail } from './RetiredFeatureDetail';
+import { Button } from '@/components/ui/button';
+/**
+ * Plugin catalog and detail coordinator backed by the latest Ghost host APIs.
+ *
+ * Inputs: installed Ghost snapshots and user actions. `embedded` mounts the same
+ * catalog inside Settings; `onSelectCatalogTab` keeps Plugins / Skills in-panel.
+ * Outputs: the Plugin list/detail UI, recommendation-aware return navigation, and Plugin action flows.
+ * Publishing preparation starts in the shared dialog; submission stays in-place until confirmed.
+ * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ */
+
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type KeyboardEvent,
+  type ReactNode,
+} from 'react';
+import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
+import {
+  AlertTriangle,
+  ArrowUp,
+  Bot,
+  ChevronDown,
+  ChevronRight,
+  MessageCircle,
+  ShieldAlert,
+  SlidersHorizontal,
+} from 'lucide-react';
+import { useTranslation } from 'react-i18next';
+
+import { WINDOW_NO_DRAG_STYLE } from '@/components/layout/windowDrag';
+import { useConfirmDialog } from '@/components/ui/confirm-dialog-provider';
+import { toast } from '@/lib/toast';
+import { extractIpcError } from '@/utils/ipcError';
+import { useAuth } from '@/contexts/AuthContext';
+import { usePluginReviewUpdates } from '@/contexts/PluginReviewUpdatesContext';
+import { readInstalledGhostsSnapshot, useInstalledGhosts } from '@/cindy-brain/useInstalledGhosts';
+import {
+  cancelPendingPluginSuggestion,
+  getPendingPluginSuggestion,
+  readyPendingPluginSuggestion,
+  subscribePendingPluginSuggestion,
+} from '@/features/cc-agent/pendingPluginSuggestion';
+import { readPluginRecommendationSnapshot } from '@/features/cc-agent/pluginHomeSuggestions';
+import { NEW_MAKER_DRAFT_KEY } from '@/features/cc-agent/newMakerDraftKeys';
+import { CINDY_PLUGIN_CREATOR_NAME } from '../../../shared/cindyBuiltInSkills';
+import { dbToMakerAgentKind, normalizeDbAgentKind } from '../../../shared/agentKindConversion';
+import { isSlashCommandUnavailable, loadAllCommands } from '@/lib/slashCommands';
+import {
+  getDraft as getComposerDraft,
+  plainTextToTiptapDoc,
+  saveDraft as saveComposerDraft,
+} from '@/lib/composerDraftStore';
+import { getDraft as getWorkspaceDraft, resetDraftWorkspaceTargets } from '@/state/newMakerDraft';
+import { ghostInstallErrorKey } from '@/cindy-brain/installErrorKey';
+import { installGhostFromFile, pickAndUpdateGhost } from '@/cindy-brain/installFlow';
+import { SegmentedControl } from '@/components/ui/segmented-control';
+import { cn, basename } from '@/lib/utils';
+import { AttentionDot } from '@/components/sidebar/AttentionDot';
+import {
+  useGhostUnread,
+  useGhostUnreadEntries,
+  useGhostUnreadSummary,
+} from '@/cindy-brain/ghostUnreadStore';
+import { getLastWorkingDir, subscribeToLastWorkingDir } from '@/state/lastWorkingDir';
+import { useGlobalTabs } from '@/features/right-sidebar/globalTabs';
+import { resolveSystemLocale } from '../../../shared/locale';
+import {
+  ghostInstallApprovalToken,
+  isUserInstallReservedGhostId,
+  type GhostSetupStatus,
+  type InstalledGhost,
+} from '../../../shared/ghost';
+import {
+  createPluginLogicalIdentity,
+  findInstalledGhostByIdentity,
+  findInstalledGhostByInstanceId,
+  installedGhostStoragePart,
+} from '../../../shared/pluginIdentity';
+import type {
+  PluginMarketDetail,
+  PluginMarketInstallOptions,
+  PluginMarketItem,
+  PluginMarketSnapshot,
+} from '../../../shared/pluginMarket';
+import type { LegacyGhostRecoveryStatus } from '../../../shared/legacyGhostRecovery';
+import {
+  toGhostPluginDetail,
+  toGhostPluginListItem,
+  filterGhostPluginItems,
+  ghostWebviewOwnerKey,
+  ghostPrimaryAction,
+  marketPresentationForInstalledGhost,
+  installedVisibleCount,
+  nextOpenPanelIdForOwner,
+  sortInstalledForDisplay,
+  type GhostPluginListItem,
+} from './lib/ghostPluginViewModel';
+import { MyPublishesSection } from './MyPublishesSection';
+import { ignoredRoundStorageKey, isBatchFinished, updateRoundKey } from './lib/updateAllModel';
+import {
+  getUpdateAllBatchState,
+  reconcileUpdateAllBatch,
+  setUpdateAllBatchHooks,
+  startUpdateAllBatch,
+  subscribeUpdateAllBatch,
+} from './lib/updateAllController';
+import { formatSetupGateDescription } from './lib/ghostSetupGateModel';
+import {
+  PLUGIN_MANAGEMENT_CARD_GRID_CLASS,
+  PLUGIN_INSTALLED_CARD_GRID_CLASS,
+  PluginManagementLayout,
+  InstalledCatalogHeader,
+  CatalogTargetControls,
+  CatalogManagementNotice,
+  PluginManagementPage,
+} from './PluginManagementLayout';
+import { usePluginListScrollRestoration } from './lib/usePluginListScrollRestoration';
+import { GhostPagePanelHost } from './GhostPagePanelHost';
+import { GhostPluginActions } from './GhostPluginActions';
+import { GhostPluginDetailView } from './GhostPluginDetailView';
+import { PluginSharedUsage } from './PluginSharedUsage';
+import {
+  currentMainViewVisibilityOwner,
+  readMainViewSidebarVisible,
+  useMainViewVisibilityRevision,
+  writeMainViewSidebarVisible,
+} from '@/cindy-brain/mainViewVisibilityStore';
+import { UpdateAllDialog } from './UpdateAllDialog';
+import { GhostPluginIcon } from './GhostPluginIcon';
+import { MarketPluginDetailView } from './MarketPluginDetailView';
+import { PluginProjectMenu, usePluginRecentWorkdirs } from './PluginScopePicker';
+import {
+  canOfferMarketInstall,
+  ghostReapprovalRoute,
+  marketItemForInstalledGhost,
+  marketItemMatchesInstalledGhost,
+  marketReviewTargetsInstalledGhost,
+  pluginPresentationOrigin,
+  pluginUpdateForInstalledVersion,
+  type PluginPresentationOrigin,
+} from './lib/pluginMarketPresentation';
+import { AddMarketplaceDialog } from './AddMarketplaceDialog';
+import {
+  pluginMarketErrorKey,
+  pluginMarketOrganizationAccessErrorKey,
+} from './lib/pluginMarketErrorKey';
+import { usePluginIconRefresh } from './lib/usePluginIconRefresh';
+import { usePluginMarketIcon } from './lib/usePluginMarketIcon';
+import { usePluginMarketForegroundRefresh } from './lib/usePluginMarketForegroundRefresh';
+import { usePluginMarketLocaleRefresh } from './lib/usePluginMarketLocaleRefresh';
+import './plugin-motion.css';
+
+const PLUGIN_CATALOG_TOOLBAR_CLASS =
+  'plugin-catalog-toolbar mb-5 flex items-center justify-between gap-4';
+type PluginPresentationFilter = 'all' | PluginPresentationOrigin;
+
+type PresentedGhostPluginItem = GhostPluginListItem & {
+  origin: PluginPresentationOrigin;
+  marketItem: PluginMarketItem | null;
+  author: string | null;
+  /** 市场存在更新时的市场记录;列表卡片据此显示更新徽标与直达入口。 */
+  marketUpdate: PluginMarketItem | null;
+};
+
+function findInstalledRetirementReplacement(
+  ghosts: readonly InstalledGhost[],
+  marketItems: readonly PluginMarketItem[],
+  target: FeatureRetirement['replacement'],
+): InstalledGhost | undefined {
+  if (!target) return undefined;
+  const marketItem = marketItems.find((item) => item.pluginId === target.marketId);
+  // IDs may change before all installations update. Reuse either ID in the
+  // market row's namespace; without a row the existing root-only fallback stays.
+  for (const ghostId of [target.ghostId, ...(target.previousGhostIds ?? [])]) {
+    const installed = marketItem
+      ? ghosts.find((ghost) => marketItemMatchesInstalledGhost({ ...marketItem, ghostId }, ghost))
+      : findInstalledGhostByIdentity(ghosts, createPluginLogicalIdentity(null, ghostId));
+    if (installed) return installed;
+  }
+  return undefined;
+}
+
+/** 推荐区来源过滤:本地装的必然在已安装区,不设「本地」档(设计定稿)。 */
+const RECOMMENDED_FILTERS: readonly PluginPresentationFilter[] = [
+  'all',
+  'public',
+  'organization',
+  'custom',
+];
+
+/** 已安装区默认只展开一屏内的前 8 个，其余通过显式操作渐进展示。 */
+const MAX_VISIBLE_INSTALLED_PLUGINS = 8;
+/** 折叠入口只预览前三个隐藏插件，避免头像堆叠反过来抢占操作文案。 */
+const MAX_COLLAPSED_INSTALLED_PLUGIN_PREVIEWS = 3;
+
+/**
+ * 本期隐藏「我的发布」二级 tab，避免与「已安装」争抢顶层布局。
+ * 重新开放前必须先定首个 tab 的标签；当前「概览」仅为已被用户否掉的占位词，并非定案。
+ */
+export const SHOW_MY_PUBLISHES_SECTION = false;
+
+/**
+ * Product gate for the whole secondary tab experience. The overview stays mounted while tabs
+ * switch, and a disabled gate returns it without an extra wrapper or hidden publishing effects.
+ */
+export function MyPublishesSectionVisibilityGate({
+  visible,
+  overviewLabel,
+  publishesLabel,
+  tabsAriaLabel,
+  publishes,
+  children,
+}: {
+  visible: boolean;
+  overviewLabel: string;
+  publishesLabel: string;
+  tabsAriaLabel: string;
+  publishes: ReactNode;
+  children: ReactNode;
+}) {
+  const [activeTab, setActiveTab] = useState<'overview' | 'publishes'>('overview');
+  const id = useId();
+  const overviewTabId = `${id}-overview-tab`;
+  const overviewPanelId = `${id}-overview-panel`;
+  const publishesTabId = `${id}-publishes-tab`;
+  const publishesPanelId = `${id}-publishes-panel`;
+
+  if (!visible) return <>{children}</>;
+
+  return (
+    <>
+      <div
+        role="tablist"
+        aria-label={tabsAriaLabel}
+        className="mt-5 flex items-end gap-6 border-b border-[var(--border-default)]"
+      >
+        {([
+          ['overview', overviewLabel, overviewTabId, overviewPanelId],
+          ['publishes', publishesLabel, publishesTabId, publishesPanelId],
+        ] as const).map(([tab, label, tabId, panelId]) => {
+          const active = activeTab === tab;
+          return (
+            <button
+              key={tab}
+              id={tabId}
+              type="button"
+              role="tab"
+              aria-selected={active}
+              aria-controls={panelId}
+              onClick={() => setActiveTab(tab)}
+              className={cn(
+                '-mb-px select-none border-b-2 px-0.5 pb-2.5 pt-1 text-13 font-medium transition-colors',
+                'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)]',
+                active
+                  ? 'border-[var(--text-primary)] text-[var(--text-primary)]'
+                  : 'border-transparent text-[var(--text-secondary)] hover:text-[var(--text-primary)]',
+              )}
+            >
+              {label}
+            </button>
+          );
+        })}
+      </div>
+      <div
+        id={overviewPanelId}
+        role="tabpanel"
+        aria-labelledby={overviewTabId}
+        hidden={activeTab !== 'overview'}
+      >
+        {children}
+      </div>
+      <div
+        id={publishesPanelId}
+        role="tabpanel"
+        aria-labelledby={publishesTabId}
+        hidden={activeTab !== 'publishes'}
+      >
+        {publishes}
+      </div>
+    </>
+  );
+}
+
+/** Keeps the installed-section disclosure rule deterministic and directly testable. */
+function visibleInstalledPluginItems<T>(items: readonly T[]): T[] {
+  return items.slice(0, MAX_VISIBLE_INSTALLED_PLUGINS);
+}
+
+function collapsedInstalledPluginPreviewItems<T>(items: readonly T[]): T[] {
+  return items.slice(0, MAX_COLLAPSED_INSTALLED_PLUGIN_PREVIEWS);
+}
+
+type InstalledPluginPreviewItem = Pick<PresentedGhostPluginItem, 'id' | 'name' | 'iconDataUrl'>;
+
+function InstalledPluginOverflow({
+  id,
+  expanded,
+  children,
+}: {
+  id: string;
+  expanded: boolean;
+  children: ReactNode;
+}) {
+  return (
+    <div
+      id={id}
+      className="plugin-installed-overflow"
+      data-expanded={expanded}
+      aria-hidden={!expanded}
+      inert={!expanded}
+    >
+      <div className="plugin-installed-overflow-clip">{children}</div>
+    </div>
+  );
+}
+
+function InstalledPluginDisclosure({
+  expanded,
+  controlsId,
+  totalCount,
+  previewItems,
+  onToggle,
+  onIconLoadError,
+}: {
+  expanded: boolean;
+  controlsId: string;
+  totalCount: number;
+  previewItems: readonly InstalledPluginPreviewItem[];
+  onToggle: () => void;
+  onIconLoadError?: () => void;
+}) {
+  const { t } = useTranslation();
+  const collapsedPreviewItems = collapsedInstalledPluginPreviewItems(previewItems);
+
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      aria-expanded={expanded}
+      aria-controls={controlsId}
+      className="mt-3 inline-flex items-center gap-2.5 rounded-full px-3 py-1.5 text-12 text-[var(--text-secondary)] transition-colors duration-150 hover:bg-[var(--surface-hover-soft)] hover:text-[var(--text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)]"
+    >
+      {!expanded ? (
+        <span className="plugin-installed-preview-stack" aria-hidden="true">
+          {collapsedPreviewItems.map((item, index) => (
+            <span
+              key={item.id}
+              className="plugin-installed-preview-card"
+              style={{ zIndex: index + 1 }}
+            >
+              <GhostPluginIcon
+                iconDataUrl={item.iconDataUrl}
+                iconId={item.id}
+                iconName={item.name}
+                onIconLoadError={onIconLoadError}
+                size="mini"
+              />
+            </span>
+          ))}
+        </span>
+      ) : null}
+      <span className="inline-flex items-center gap-1.5">
+        {t(
+          expanded
+            ? 'settings.ghosts.page.installedCollapse'
+            : 'settings.ghosts.page.installedExpand',
+          expanded ? undefined : { count: totalCount },
+        )}
+        <ChevronDown
+          size={13}
+          aria-hidden="true"
+          className={cn(
+            'transition-transform duration-150 motion-reduce:transition-none',
+            expanded && 'rotate-180',
+          )}
+        />
+      </span>
+    </button>
+  );
+}
+
+/** Test-only access to the installed-section layout contract. */
+export const __installedPluginLayoutForTests = {
+  MAX_VISIBLE_INSTALLED_PLUGINS,
+  MAX_COLLAPSED_INSTALLED_PLUGIN_PREVIEWS,
+  visibleInstalledPluginItems,
+  InstalledPluginOverflow,
+  InstalledPluginDisclosure,
+};
+
+/** 市场首装成功后打开已装详情；更新或来源替换继续停留在当前页面。 */
+export function shouldOpenInstalledDetailAfterMarketSuccess(isUpdate: boolean): boolean {
+  return !isUpdate;
+}
+
+function installedGhostMarketKeyFor(ghosts: readonly InstalledGhost[]): string {
+  return ghosts
+    .map((ghost) => `${ghost.manifest.id}\0${ghost.manifest.version}`)
+    .sort()
+    .join('\0');
+}
+
+/** 读「忽略本轮更新」的持久值(键按数据归属分桶,见 ignoredRoundStorageKey)。 */
+function readIgnoredRound(storageKey: string): string {
+  try {
+    return window.localStorage.getItem(storageKey) ?? '';
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Ghost-backed Plugin page.
+ *
+ * This is the first bridge from the existing Plugin product surface to the
+ * real Ghost runtime. The page deliberately keeps the previous list/detail
+ * interaction shape, while every displayed field comes from InstalledGhost.
+ */
+export function GhostPluginPage(props: { embedded?: boolean; active?: boolean; onSelectCatalogTab?: (tab: 'plugins' | 'skills') => void } = {}) {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const snapshotId = searchParams.get('share');
+  const closeShare = (ghost?: InstalledGhost) => {
+    const next = new URLSearchParams(searchParams); next.delete('share');
+    if (ghost) next.set('ghost', installedGhostStoragePart(ghost));
+    setSearchParams(next, { replace: true });
+  };
+  return <CatalogDeviceScope>{(device, online, generation, deviceControl) => snapshotId !== null
+    ? <LocalPluginShareView key={`${generation}:${snapshotId}:${device?.deviceId ?? 'local'}`} snapshotId={snapshotId}
+        deviceControl={deviceControl} onBack={() => closeShare()} onInstalled={closeShare} />
+    : device
+    ? <RemotePluginPage key={`${generation}:${device.deviceId}`} device={device} online={online} deviceControl={deviceControl} {...props} />
+    : <LocalGhostPluginPage deviceControl={deviceControl} {...props} />}</CatalogDeviceScope>;
+}
+
+function LocalGhostPluginPage({
+  embedded = false,
+  deviceControl,
+  onSelectCatalogTab,
+}: {
+  embedded?: boolean;
+  deviceControl?: CatalogDeviceControl;
+  onSelectCatalogTab?: (tab: 'plugins' | 'skills') => void;
+} = {}) {
+  const { i18n, t } = useTranslation();
+  const marketLocale = resolveSystemLocale(i18n.resolvedLanguage ?? i18n.language);
+  const navigate = useNavigate();
+  const location = useLocation();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const { confirm } = useConfirmDialog();
+
+  const showPluginMarketActionError = useCallback(
+    async (error: unknown) => {
+      // 用户在安装确认框里取消不是失败，不弹错误提示。
+      if (extractIpcError(error)?.code === 'MUTATION_CANCELLED') return;
+      toast.error(t(pluginMarketErrorKey(error)));
+    },
+    [t],
+  );
+  const { user, mode, dataOwnerId, dataOwnerGeneration } = useAuth();
+  const reviewUnread = usePluginReviewUpdates().updates.filter(item => item.unread);
+  const signInForContribution = useSignInToCindy('/plugins?myPlugins=1');
+  const contributionOwner = JSON.stringify([dataOwnerId, dataOwnerGeneration, user?.id, mode]);
+  const contributionOwnerRef = useRef(contributionOwner);
+  contributionOwnerRef.current = contributionOwner;
+  const contributionMounted = useRef(true);
+  useEffect(() => {
+    contributionMounted.current = true;
+    return () => { contributionMounted.current = false; };
+  }, []);
+  const contributionCache = useRef<MyPluginsPageCache>({});
+  const [contributionBusy, setContributionBusy] = useState(false);
+  const [submissionRevision, setSubmissionRevision] = useState(0);
+  const contributing = useRef<string | null>(null);
+  const [publicationDialog, setPublicationDialog] = useState<PluginPublishDialogRequest | null>(null);
+  const publicationDialogSequence = useRef(0);
+  const [recommendationNonce] = useState(() => searchParams.get('recommendation'));
+  const pendingRecommendation = useSyncExternalStore(
+    subscribePendingPluginSuggestion,
+    getPendingPluginSuggestion,
+  );
+  const recommendation =
+    pendingRecommendation?.nonce === recommendationNonce &&
+    pendingRecommendation.ownerId === dataOwnerId
+      ? pendingRecommendation
+      : null;
+  const recommendationPageMounted = useRef(false);
+  useEffect(() => {
+    recommendationPageMounted.current = true;
+    if (getPendingPluginSuggestion()?.ownerId !== dataOwnerId) cancelPendingPluginSuggestion();
+    return () => {
+      recommendationPageMounted.current = false;
+      queueMicrotask(() => {
+        if (!recommendationPageMounted.current && getPendingPluginSuggestion()?.phase === 'setup') {
+          cancelPendingPluginSuggestion(recommendationNonce ?? undefined);
+        }
+      });
+    };
+  }, [dataOwnerId, recommendationNonce]);
+  const continueRecommendation = useCallback(
+    (nonce: string | undefined, ghostId: string) => {
+      if (!recommendationPageMounted.current || !nonce) return false;
+      const snapshot = readPluginRecommendationSnapshot();
+      if (
+        snapshot.ownerId !== dataOwnerId ||
+        !snapshot.sources.some((s) => s.ghostId === ghostId && s.enabled)
+      )
+        return false;
+      const ready = readyPendingPluginSuggestion(nonce, dataOwnerId, ghostId);
+      if (!ready) return false;
+      navigate('/cc-agent/new', { state: { pluginSuggestionNonce: ready }, flushSync: true });
+      return true;
+    },
+    [dataOwnerId, navigate],
+  );
+  const recommendationNotice = recommendation ? (
+    <div
+      role="status"
+      className="flex shrink-0 items-center justify-between gap-3 border-b border-[var(--border-default)] px-4 py-3 text-13 text-[var(--text-secondary)]"
+    >
+      <span>
+        {t('newChat.pluginSuggestions.pending', { task: recommendation.suggestion.label })}
+      </span>
+      <Button
+        variant="secondary"
+        tone="quiet"
+        size="sm"
+        compact
+        type="button"
+        onClick={() => cancelPendingPluginSuggestion(recommendation.nonce)}
+      >
+        {t('newChat.pluginSuggestions.cancel')}
+      </Button>
+    </div>
+  ) : null;
+  const showEnterprise = user?.membershipKind === 'org';
+  const contributor = mode === 'cloud' && (user?.membershipKind === 'personal' || user?.membershipKind === 'org');
+  const ghosts = useInstalledGhosts();
+  useMainViewVisibilityRevision();
+  const installedGhostMarketKey = useMemo(
+    () => installedGhostMarketKeyFor(ghosts),
+    [ghosts],
+  );
+  const installedGhostLocationsKey = ghosts
+    .map((ghost) => `${ghost.manifest.id}\0${ghost.dir}`)
+    .sort()
+    .join('\0');
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [query, setQuery] = useState('');
+  const [installedExpanded, setInstalledExpanded] = useState(false);
+  const installedOverflowId = useId();
+  const [marketSnapshot, setMarketSnapshot] = useState<PluginMarketSnapshot | null>(null);
+  const [openPanelId, setOpenPanelId] = useState<string | null>(null);
+  // 数据归属键:面板宿主按它失效(定义要早于消费点)。
+  const panelOwnerKey = ghostWebviewOwnerKey(mode, dataOwnerId);
+  const ignoredRoundKey = ignoredRoundStorageKey(mode, dataOwnerId);
+  const [ignoredRound, setIgnoredRound] = useState(() => readIgnoredRound(ignoredRoundKey));
+  // 账号 / 本地云模式切换:换桶重读,不把上一个身份的「忽略本轮」带进来。
+  useEffect(() => {
+    setIgnoredRound(readIgnoredRound(ignoredRoundKey));
+  }, [ignoredRoundKey]);
+  const [originFilter, setOriginFilter] = useState<PluginPresentationFilter>('all');
+  const [marketDetail, setMarketDetail] = useState<PluginMarketDetail | null>(null);
+  const contributionViewKey = JSON.stringify([location.key, selectedId, marketDetail?.pluginId]);
+  const contributionView = useRef({ key: contributionViewKey, token: {} });
+  if (contributionView.current.key !== contributionViewKey)
+    contributionView.current = { key: contributionViewKey, token: {} };
+  // 列表与详情是互斥分支;列表节点会卸载,返回时需显式恢复进入前的滚动位置。
+  const pluginCatalogVisible = marketDetail === null && selectedId === null && !searchParams.has('myPlugins') && !searchParams.has('share');
+  const {
+    listRef: pluginCatalogListRef,
+    onListScroll: onPluginCatalogScroll,
+    capture: capturePluginCatalogScroll,
+    requestRestore: requestPluginCatalogScrollRestore,
+    clearPendingRestore: clearPluginCatalogScrollRestore,
+  } = usePluginListScrollRestoration(pluginCatalogVisible);
+  const [marketBusyId, setMarketBusyId] = useState<string | null>(null);
+  // 市场操作的同步互斥锁。React state 在提交前有窗口期,快速连点会让多个回调
+  // 都读到 null;ref 先到先得,state 只驱动按钮禁用等 UI 展示。每次占锁都返回
+  // 唯一 lease,避免账号/模式切换后的旧异步流程误释放新流程持有的同 pluginId 锁。
+  const marketBusyLockRef = useRef<{ pluginId: string } | null>(null);
+  const acquireMarketBusy = useCallback((pluginId: string) => {
+    if (marketBusyLockRef.current !== null) return null;
+    const lease = { pluginId };
+    marketBusyLockRef.current = lease;
+    setMarketBusyId(pluginId);
+    return lease;
+  }, []);
+  const releaseMarketBusy = useCallback((lease: { pluginId: string }) => {
+    if (marketBusyLockRef.current !== lease) return;
+    marketBusyLockRef.current = null;
+    setMarketBusyId((current) => (current === lease.pluginId ? null : current));
+  }, []);
+  const isMarketBusyLeaseActive = useCallback(
+    (lease: { pluginId: string }) => marketBusyLockRef.current === lease,
+    [],
+  );
+  const marketRefreshRequestRef = useRef(0);
+  const lastMarketRefreshAtRef = useRef(0);
+  const marketDetailRequestRef = useRef(0);
+  const installedGhostMarketKeyRef = useRef(installedGhostMarketKey);
+  const legacyRecoveryStatusRequestRef = useRef(0);
+  const legacyRecoveryRetryRequestRef = useRef(0);
+  const [legacyRecoveryStatus, setLegacyRecoveryStatus] =
+    useState<LegacyGhostRecoveryStatus | null>(null);
+  const [legacyRecoveryRetrying, setLegacyRecoveryRetrying] = useState(false);
+  const refreshMarket = useCallback(async (preserveOnError = false) => {
+    installedGhostMarketKeyRef.current = installedGhostMarketKeyFor(readInstalledGhostsSnapshot());
+    const requestId = ++marketRefreshRequestRef.current;
+    const owner = contributionOwnerRef.current;
+    try {
+      const snapshot = await window.electronAPI.pluginMarket.snapshot();
+      if (requestId !== marketRefreshRequestRef.current || contributionOwnerRef.current !== owner) return;
+      // Main intentionally represents market outages as data so the initial page can render a
+      // non-blocking empty state. During icon renewal, convert that fulfilled unavailable result
+      // back into a failure: the catch path preserves the visible snapshot and the hook retries.
+      if (preserveOnError && snapshot.unavailableReason !== null) {
+        throw new Error(snapshot.unavailableReason);
+      }
+      setMarketSnapshot(snapshot);
+      lastMarketRefreshAtRef.current = Date.now();
+    } catch (error) {
+      if (requestId !== marketRefreshRequestRef.current || contributionOwnerRef.current !== owner) return;
+      setMarketSnapshot((current) =>
+        preserveOnError && current
+          ? current
+          : {
+              items: [],
+              unavailableReason: error instanceof Error ? error.message : String(error),
+              customSourceNames: [],
+              unavailableCustomSourceNames: [],
+            },
+      );
+      // Background icon renewal keeps the current snapshot visible, but must still report
+      // failure to the renewal hook so it can schedule a bounded retry.
+      if (preserveOnError) throw error;
+    }
+  }, []);
+  useEffect(() => {
+    clearPluginCatalogScrollRestore();
+    setMarketSnapshot(null);
+    setMarketDetail(null);
+    marketBusyLockRef.current = null;
+    setMarketBusyId(null);
+    marketDetailRequestRef.current += 1;
+    void refreshMarket();
+  }, [clearPluginCatalogScrollRestore, refreshMarket, mode, dataOwnerId, dataOwnerGeneration]);
+  const refreshMarketOnForeground = useCallback(() => refreshMarket(true), [refreshMarket]);
+  usePluginMarketForegroundRefresh(refreshMarketOnForeground, lastMarketRefreshAtRef);
+  useEffect(() => {
+    return window.electronAPI.pluginMarket.onUpdateConsentHoldsChanged(() => {
+      void refreshMarket(true).catch(() => undefined);
+    });
+  }, [refreshMarket]);
+  useEffect(() => {
+    if (
+      installedGhostMarketKeyRef.current === installedGhostMarketKey ||
+      marketBusyLockRef.current !== null
+    ) {
+      return;
+    }
+    // 已装集合或版本变化(装/卸/后台更新)时刷新市场;排序是反应式的。
+    // 安装广播早于市场账本提交；等待事务收尾，由成功刷新消费，失败/取消后补刷。
+    void refreshMarket(true).catch(() => undefined);
+  }, [installedGhostMarketKey, marketBusyId, refreshMarket]);
+  const activeSessionWorkingDir = useSyncExternalStore(
+    subscribeToLastWorkingDir,
+    getLastWorkingDir,
+    getLastWorkingDir,
+  );
+  const recentWorkdirs = usePluginRecentWorkdirs();
+  const [scopeDir, setScopeDir] = useState<string | null>(null);
+  const scopeDirRef = useRef<string | null>(scopeDir);
+  scopeDirRef.current = scopeDir;
+  const [projectDisabled, setProjectDisabled] = useState<Set<string>>(() => new Set());
+  const handlePickScope = useCallback((dir: string | null) => {
+    setScopeDir(dir);
+    if (!dir) {
+      setProjectDisabled(new Set());
+      return;
+    }
+    try {
+      setProjectDisabled(new Set(window.electronAPI.ghosts.workdirPrefsSync(dir).disabled));
+    } catch {
+      setProjectDisabled(new Set());
+    }
+  }, []);
+  useEffect(() => {
+    if (!recommendation) return;
+    const target = recommendation.suggestion.pluginId
+      ? findInstalledGhostByInstanceId(ghosts, recommendation.suggestion.pluginId)
+      : undefined;
+    handlePickScope(target?.enabled ? recommendation.workingDir : null);
+  }, [recommendation?.nonce, handlePickScope]);
+  const effectiveEnabled = useCallback(
+    (id: string, globallyEnabled: boolean) =>
+      scopeDir === null ? globallyEnabled : globallyEnabled && !projectDisabled.has(id),
+    [projectDisabled, scopeDir],
+  );
+  const [recentGhostIds, setRecentGhostIds] = useState(
+    () => window.electronAPI.ghosts.recentUsageSync().ids,
+  );
+  useEffect(
+    () =>
+      window.electronAPI.ghosts.onChanged(() => {
+        const dir = scopeDirRef.current;
+        if (dir) {
+          try {
+            setProjectDisabled(new Set(window.electronAPI.ghosts.workdirPrefsSync(dir).disabled));
+          } catch {
+            // Keep the current project snapshot if another window races the read.
+          }
+        }
+      }),
+    [],
+  );
+  useEffect(
+    () =>
+      window.electronAPI.ghosts.onRecentUsageChanged(({ ids }) => {
+        setRecentGhostIds(ids);
+      }),
+    [],
+  );
+  useEffect(() => {
+    legacyRecoveryStatusRequestRef.current += 1;
+    legacyRecoveryRetryRequestRef.current += 1;
+    setLegacyRecoveryRetrying(false);
+  }, [dataOwnerId, mode]);
+  useEffect(() => {
+    const requestId = ++legacyRecoveryStatusRequestRef.current;
+    if (mode !== 'cloud' || !dataOwnerId) {
+      setLegacyRecoveryStatus(null);
+      return;
+    }
+    void window.electronAPI.ghosts
+      .legacyRecoveryStatus()
+      .then((status) => {
+        if (requestId !== legacyRecoveryStatusRequestRef.current) return;
+        setLegacyRecoveryStatus(status.state === 'none' ? null : status);
+      })
+      .catch(() => {
+        if (requestId === legacyRecoveryStatusRequestRef.current) {
+          setLegacyRecoveryStatus(null);
+        }
+      });
+  }, [dataOwnerId, installedGhostLocationsKey, mode]);
+  // /plugins?ghost=<id> 深链:直接打开该插件详情(配置就绪弹窗等入口复用;
+  // 读后即清参数,避免从详情返回列表后又被同一参数拉回详情)。
+  useEffect(() => {
+    const target = searchParams.get('ghost');
+    if (!target) return;
+    setSelectedId(target);
+    const next = new URLSearchParams(searchParams);
+    next.delete('ghost');
+    setSearchParams(next, { replace: true });
+  }, [searchParams, setSearchParams]);
+  // /plugins?panel=<id> 深链:打开该插件的页签面板(装入流程「立即开启并
+  // 打开面板」从其它视图跳转进来)。合法性由 openPanelGhost 统一裁决:
+  // 非 tab 形态或未启用的目标会被下方失效 effect 自动清掉。
+  useEffect(() => {
+    const target = searchParams.get('panel');
+    if (!target) return;
+    setOpenPanelId(target);
+    const next = new URLSearchParams(searchParams);
+    next.delete('panel');
+    setSearchParams(next, { replace: true });
+  }, [searchParams, setSearchParams]);
+  // 引用稳定:批次对账 effect 以它为依赖,裸 `?? []` 每次渲染都是新数组会空转。
+  const marketItems = useMemo(() => marketSnapshot?.items ?? [], [marketSnapshot]);
+  const customSourceNames = useMemo(
+    () => marketSnapshot?.customSourceNames ?? [],
+    [marketSnapshot?.customSourceNames],
+  );
+  const [addMarketplaceOpen, setAddMarketplaceOpen] = useState(false);
+  const allInstalledItems = useMemo<PresentedGhostPluginItem[]>(
+    () =>
+      ghosts
+        // cindy-mivo was renamed to xd-mivo. Older user data can still
+        // contain both ids; keep the canonical entry from rendering twice.
+        .filter(
+          (ghost) =>
+            ghost.manifest.id !== 'cindy-mivo' ||
+            !ghosts.some((candidate) => candidate.manifest.id === 'xd-mivo'),
+        )
+        .map((ghost) => {
+          const marketItem = marketItemForInstalledGhost(marketItems, ghost);
+          const presentation = marketPresentationForInstalledGhost(ghost, marketItem);
+          return {
+            ...toGhostPluginListItem(ghost, presentation),
+            origin: pluginPresentationOrigin(marketItem),
+            marketItem,
+            // 服务端的空署名代表匿名；公域来源缺少可信投影时也不回退包内作者。
+            author: presentation
+              ? presentation.author
+              : ghost.publishingSource?.kind === 'public-market' ||
+                  (marketItem?.sourceType === 'server' && marketItem.scope === 'public')
+                ? null
+                : ghost.manifest.author ?? null,
+            // 同版本展示刷新由 main 标成 installed;legacy-unresolved 仍保留
+            // update-available,以便用户用市场包替换未验证的本地字节。
+            marketUpdate: ghost.retirement ? null : pluginUpdateForInstalledVersion(marketItem),
+          };
+        }),
+    [ghosts, marketItems],
+  );
+  const installedItems = useMemo(
+    () =>
+      showEnterprise
+        ? allInstalledItems
+        : allInstalledItems.filter((item) => item.origin !== 'organization'),
+    [allInstalledItems, showEnterprise],
+  );
+  const publishableInstalledItems = useMemo(() => {
+    const eligible = new Set(ghosts.filter((ghost) =>
+      ghost.publishingSource?.kind === 'local' &&
+      !localPublishingUnavailableKey(ghost, marketItemForInstalledGhost(marketItems, ghost)),
+    ).map(installedGhostStoragePart));
+    return allInstalledItems.filter((item) => eligible.has(item.id));
+  }, [ghosts, marketItems, allInstalledItems]);
+  const searchedInstalledItems = useMemo(
+    () => filterGhostPluginItems(installedItems, query),
+    [installedItems, query],
+  );
+  const searchedAvailableMarketItems = useMemo(() => {
+    const normalizedQuery = query.trim().toLocaleLowerCase();
+    return marketItems.filter((item) => {
+      if (item.installState === 'installed' || item.installState === 'update-available') {
+        return false;
+      }
+      if (!showEnterprise && pluginPresentationOrigin(item) === 'organization') return false;
+      return `${item.name} ${item.description ?? ''} ${item.ghostId} ${item.author ?? ''}`
+        .toLocaleLowerCase()
+        .includes(normalizedQuery);
+    });
+  }, [marketItems, query, showEnterprise]);
+  const recommendedFilters = useMemo(
+    () =>
+      RECOMMENDED_FILTERS.filter((filter) => {
+        if (filter === 'organization') return showEnterprise;
+        // 未添加任何自定义市场时不显示"自定义"档(与组织档的隐藏模式一致)。
+        if (filter === 'custom') return customSourceNames.length > 0;
+        return true;
+      }),
+    [customSourceNames.length, showEnterprise],
+  );
+  const effectiveOriginFilter =
+    !showEnterprise && originFilter === 'organization'
+      ? 'all'
+      : originFilter === 'custom' && customSourceNames.length === 0
+        ? 'all'
+        : originFilter;
+  const availableMarketItems = useMemo(
+    () =>
+      effectiveOriginFilter === 'all'
+        ? searchedAvailableMarketItems
+        : searchedAvailableMarketItems.filter(
+            (item) => pluginPresentationOrigin(item) === effectiveOriginFilter,
+          ),
+    [effectiveOriginFilter, searchedAvailableMarketItems],
+  );
+  // 「自定义」档内按来源市场分组(≥2 个源时展示小标题);组顺序沿用市场添加顺序。
+  const organizationAccessErrorKey = pluginMarketOrganizationAccessErrorKey(
+    marketSnapshot?.organizationAccessError,
+  );
+  const customGroups = useMemo(() => {
+    if (effectiveOriginFilter !== 'custom') return null;
+    const groups = new Map<string, PluginMarketItem[]>();
+    for (const item of availableMarketItems) {
+      const key = item.sourceMarketName ?? '';
+      const list = groups.get(key);
+      if (list) {
+        list.push(item);
+      } else {
+        groups.set(key, [item]);
+      }
+    }
+    return [...groups.entries()].sort((a, b) => {
+      const aIndex = customSourceNames.indexOf(a[0]);
+      const bIndex = customSourceNames.indexOf(b[0]);
+      return (
+        (aIndex === -1 ? Number.MAX_SAFE_INTEGER : aIndex) -
+        (bIndex === -1 ? Number.MAX_SAFE_INTEGER : bIndex)
+      );
+    });
+  }, [availableMarketItems, customSourceNames, effectiveOriginFilter]);
+  const recommendedCounts = useMemo(() => {
+    const counts: Record<PluginPresentationOrigin, number> = {
+      public: 0,
+      organization: 0,
+      local: 0,
+      custom: 0,
+    };
+    for (const item of searchedAvailableMarketItems) {
+      counts[pluginPresentationOrigin(item)] += 1;
+    }
+    return counts;
+  }, [searchedAvailableMarketItems]);
+
+  // ── 已安装区排序:未读通知(新→旧) → 最近使用 → 基础序,实时计算 ──
+  // 反应式而非冻结快照:排序信号变化即重排。安全边界——`markUsed` 只在对话里
+  // 触发(ChatInput),插件页自身不打点,所以「最近使用」的变化只发生在离开本页
+  // 之后,回到页面即已重排,不会在用户眼皮下洗牌;后台到达的未读通知冒头则正是
+  // 目的所在。切账号/模式时 recentGhostIds 与未读表都会随 owner 快照整体作废。
+  // marketUpdate 刻意不作排序键——更新已有统一横幅兜底,可被折叠。
+  const unreadEntries = useGhostUnreadEntries();
+  const unreadAtById = useMemo(
+    () => new Map(unreadEntries.map((entry) => [entry.ghostId, entry.at])),
+    [unreadEntries],
+  );
+  // 切账号/模式收起折叠区:换 owner 的已装集合不同,上一个身份的展开态不带过去。
+  const collapseOwnerKeyRef = useRef(panelOwnerKey);
+  useEffect(() => {
+    if (collapseOwnerKeyRef.current === panelOwnerKey) return;
+    collapseOwnerKeyRef.current = panelOwnerKey;
+    setInstalledExpanded(false);
+  }, [panelOwnerKey]);
+  const displayInstalledItems = useMemo(
+    () =>
+      sortInstalledForDisplay(searchedInstalledItems, {
+        recentIds: recentGhostIds,
+        unreadAtById,
+      }),
+    [searchedInstalledItems, recentGhostIds, unreadAtById],
+  );
+  // 未读通知永不折叠:可见窗口至少 MAX_VISIBLE_INSTALLED_PLUGINS 个,并容纳全部
+  // 未读——未读已排在最前,按未读数量扩窗即可保证它们都落在可见区(更新可被折叠)。
+  const visibleInstalledCount = useMemo(
+    () => installedVisibleCount(displayInstalledItems, unreadAtById, MAX_VISIBLE_INSTALLED_PLUGINS),
+    [displayInstalledItems, unreadAtById],
+  );
+  const primaryInstalledItems = useMemo(
+    () => displayInstalledItems.slice(0, visibleInstalledCount),
+    [displayInstalledItems, visibleInstalledCount],
+  );
+  const additionalInstalledItems = useMemo(
+    () => displayInstalledItems.slice(visibleInstalledCount),
+    [displayInstalledItems, visibleInstalledCount],
+  );
+  const hiddenInstalledCount = Math.max(0, displayInstalledItems.length - visibleInstalledCount);
+
+  // ── 更新横幅与批量更新：作为自动更新失败／忙碌跳过后的手动重试入口 ──
+  const updatableInstalledItems = useMemo(
+    () => installedItems.filter((item) => item.marketUpdate !== null),
+    [installedItems],
+  );
+  const currentRoundKey = useMemo(() => updateRoundKey(marketItems), [marketItems]);
+  const handleIgnoreRound = useCallback(() => {
+    try {
+      window.localStorage.setItem(ignoredRoundKey, currentRoundKey);
+    } catch {
+      // localStorage 不可用时仅本次会话内生效。
+    }
+    setIgnoredRound(currentRoundKey);
+  }, [currentRoundKey, ignoredRoundKey]);
+
+  // 批次状态住在模块级控制器里(生命周期长于本页:关弹窗离开 /plugins
+  // 后批次继续跑),页面只订阅快照。真实包校验与落位由统一安装事务负责。
+  const updateBatch = useSyncExternalStore(subscribeUpdateAllBatch, getUpdateAllBatchState);
+  const updateRows = updateBatch.rows;
+  const batchRunning = updateBatch.running;
+  const [updateDialogOpen, setUpdateDialogOpen] = useState(false);
+  // 与外部事实对账:已装清单或市场快照变化(单项更新/文件更新/卸载)收束
+  // 对应批量行——完成判据取市场快照的 installState(目标 release 是否落账),
+  // 不用版本号;账号或模式切换作废整批,旧账号的批次绝不落到新账号数据上。
+  useEffect(() => {
+    reconcileUpdateAllBatch(marketItems);
+  }, [ghosts, marketItems, mode, dataOwnerId]);
+  // 有未完结批次时横幅必须在场:它是重开批量进度弹窗的唯一入口,
+  // 「忽略本轮」不得顺带藏掉正在执行的批次。
+  const hasUnfinishedBatch = updateRows !== null && !isBatchFinished(updateRows);
+  const bannerVisible =
+    hasUnfinishedBatch ||
+    (updatableInstalledItems.length > 0 &&
+      (currentRoundKey === '' || ignoredRound !== currentRoundKey));
+  const selectedGhost = selectedId
+    ? (findInstalledGhostByInstanceId(ghosts, selectedId) ?? null)
+    : null;
+  const selectedPresentation = selectedGhost
+    ? marketPresentationForInstalledGhost(
+        selectedGhost,
+        marketItemForInstalledGhost(marketItems, selectedGhost),
+      )
+    : null;
+  const selectedDetail = selectedGhost
+    ? toGhostPluginDetail(selectedGhost, selectedPresentation)
+    : null;
+  const selectedMarketInstall = selectedGhost
+    ? marketItemForInstalledGhost(marketItems, selectedGhost)
+    : null;
+  const selectedMarketUpdate = selectedDetail
+    ? pluginUpdateForInstalledVersion(selectedMarketInstall)
+    : null;
+  const selectedMainViewSidebarVisible = selectedDetail?.hasMainView
+    ? readMainViewSidebarVisible(dataOwnerId, selectedDetail.id)
+    : true;
+
+  // ── 面板收束:页面独占的插件面板宿主;停用/卸载/换形态自动失效 ──
+  const openPanelGhost = useMemo(() => {
+    if (!openPanelId) return null;
+    const ghost = findInstalledGhostByInstanceId(ghosts, openPanelId) ?? null;
+    if (!ghost) return null;
+    if (ghost.manifest.panel?.position !== 'tab') return null;
+    if (!effectiveEnabled(installedGhostStoragePart(ghost), ghost.enabled)) return null;
+    return ghost;
+  }, [effectiveEnabled, ghosts, openPanelId]);
+  useEffect(() => {
+    if (openPanelId && !openPanelGhost) setOpenPanelId(null);
+  }, [openPanelGhost, openPanelId]);
+  // 「打开面板 = 已读」不在这里清:三个 setOpenPanelId 调用点(卡片主动作 /
+  // 详情页「使用」/ ?panel= 深链)只是"想开",而面板还有停靠态与独立窗口两种
+  // 宿主。清零统一收在面板体 GhostChipPanelBody 挂载处——那才是"内容确实在
+  // 用户眼前"的唯一判据,三个宿主自然对称。
+  /**
+   * 账号 / 本地云模式切换必须关掉在开的面板。
+   *
+   * 光靠上面那条「解析不到就关」不够:两个账号装了**同 id、同版本、同入口**的
+   * 插件时,openPanelGhost 在新身份下照样解析得到,面板宿主不会重挂载,于是
+   * 账号 A 的 webview DOM、内存态与交互(表单、登录态、已加载数据)原样留在
+   * 账号 B 面前。这里按 owner 键显式清空;首帧不清,免得把 ?panel= 深链刚设上的
+   * 目标一并抹掉(那条 effect 排在本条之前)。
+   */
+  const panelOwnerKeyRef = useRef(panelOwnerKey);
+  useEffect(() => {
+    const previous = panelOwnerKeyRef.current;
+    if (previous === panelOwnerKey) return;
+    panelOwnerKeyRef.current = panelOwnerKey;
+    setOpenPanelId((current) => nextOpenPanelIdForOwner(previous, panelOwnerKey, current));
+  }, [panelOwnerKey]);
+
+  // 停靠形态的面板现在以右侧栏全局页签承载:状态只分「在右侧栏中」与「已从右侧栏关闭」。
+  const globalTabs = useGlobalTabs();
+  const panelStatus = useMemo(() => {
+    if (!selectedDetail || selectedDetail.panelMinWidth === null) return null;
+    // 页签形态(面板收束):由插件页承载,没有停靠状态可言。
+    if (selectedDetail.tabPanel) return t('settings.ghosts.detail.panelPageHosted');
+    const inSidebar = globalTabs.some(
+      (tab) => (tab.state as { instanceId?: string } | null)?.instanceId === selectedDetail.id,
+    );
+    return inSidebar
+      ? t('settings.ghosts.detail.panelInSidebar')
+      : t('settings.ghosts.detail.panelDismissed');
+  }, [globalTabs, selectedDetail, t]);
+
+  const handleToggle = useCallback(
+    async (id: string, enabled: boolean, displayName: string) => {
+      const pendingNonce = getPendingPluginSuggestion()?.nonce;
+      try {
+        const dir = scopeDirRef.current;
+        if (dir) {
+          const result = await window.electronAPI.ghosts.setWorkdirDisabled(dir, id, !enabled);
+          if (scopeDirRef.current === dir) setProjectDisabled(new Set(result.disabled));
+          toast.success(
+            t(
+              enabled
+                ? 'settings.ghosts.toast.projectEnabled'
+                : 'settings.ghosts.toast.projectDisabled',
+              { name: displayName },
+            ),
+          );
+        } else {
+          await window.electronAPI.ghosts.setEnabled(id, enabled);
+        }
+        if (enabled) continueRecommendation(pendingNonce, id);
+      } catch (error) {
+        toast.error(t(ghostInstallErrorKey(extractIpcError(error)?.code)));
+      }
+    },
+    [continueRecommendation, t],
+  );
+
+  /** Main 在同一次 install IPC 事务内校验真实包与市场声明的能力上限。 */
+  const installMarketPackage = useCallback(
+    async (input: {
+      pluginId: string;
+      options: PluginMarketInstallOptions;
+      isStillActive: () => boolean;
+    }): Promise<InstalledGhost | null> => {
+      const result = await window.electronAPI.pluginMarket.install(input.pluginId, input.options);
+      if (!input.isStillActive()) return null;
+      return result.ghost;
+    },
+    [],
+  );
+
+  // 目录详情用于发现与能力展示；点击更新后由 Main 下载并校验真实包后直接落位。
+  const handleMarketUpdate = useCallback(
+    async (instanceId: string) => {
+      const installedGhost = findInstalledGhostByInstanceId(ghosts, instanceId) ?? null;
+      const marketItem = installedGhost
+        ? marketItemForInstalledGhost(marketItems, installedGhost)
+        : null;
+      if (
+        !marketItem ||
+        !marketReviewTargetsInstalledGhost(marketItem, installedGhost?.approval.state)
+      ) {
+        return;
+      }
+      if (!installedGhost) {
+        toast.error(t('settings.ghosts.market.errors.stateChanged'));
+        await refreshMarket();
+        return;
+      }
+      // 列表每张卡都有直达入口,同步互斥防止并发更新互相覆盖忙碌状态。
+      const marketBusyLease = acquireMarketBusy(marketItem.pluginId);
+      if (!marketBusyLease) return;
+      try {
+        const next = await window.electronAPI.pluginMarket.detail(marketItem.pluginId);
+        if (!isMarketBusyLeaseActive(marketBusyLease)) return;
+        if (!marketReviewTargetsInstalledGhost(next, installedGhost.approval.state)) {
+          toast.error(t('settings.ghosts.market.errors.stateChanged'));
+          await refreshMarket();
+          return;
+        }
+        const options: PluginMarketInstallOptions = {
+          expectedReleaseId: next.releaseId,
+          expectedManifest: next.manifest,
+          expectedInstalledApproval: ghostInstallApprovalToken(installedGhost.approval),
+          allowSourceReplacement: false,
+        };
+        const ghost = await installMarketPackage({
+          pluginId: next.pluginId,
+          options,
+          isStillActive: () => isMarketBusyLeaseActive(marketBusyLease),
+        });
+        if (!ghost || !isMarketBusyLeaseActive(marketBusyLease)) return;
+        toast.success(
+          t('settings.ghosts.toast.updated', {
+            name: ghost.manifest.name,
+            version: ghost.manifest.version,
+          }),
+        );
+        // 列表/详情共用此路径:成功后不切页面,方便连续点其它插件的更新。
+        await refreshMarket();
+      } catch (error) {
+        if (isMarketBusyLeaseActive(marketBusyLease)) {
+          await showPluginMarketActionError(error);
+        }
+      } finally {
+        releaseMarketBusy(marketBusyLease);
+      }
+    },
+    [
+      acquireMarketBusy,
+      ghosts,
+      isMarketBusyLeaseActive,
+      installMarketPackage,
+      marketItems,
+      refreshMarket,
+      releaseMarketBusy,
+      showPluginMarketActionError,
+      t,
+    ],
+  );
+
+  const handleUpdate = useCallback(async () => {
+    if (!selectedDetail) return;
+    if (selectedMarketUpdate) {
+      await handleMarketUpdate(selectedDetail.id);
+      return;
+    }
+    await pickAndUpdateGhost(selectedDetail.id, { t });
+  }, [handleMarketUpdate, selectedDetail, selectedMarketUpdate, t]);
+
+  /**
+   * 安装验证记录缺失或损坏时，用户主动选择重新落位同一来源的真实包。
+   * 市场包重装当前 release；本地包重新选择 `.cindy`。两条路都只恢复
+   * 完整安装记录，不新增能力确认。
+   */
+  const handleRecoverInstall = useCallback(
+    async (instanceId: string) => {
+      const installedGhost = findInstalledGhostByInstanceId(ghosts, instanceId) ?? null;
+      if (installedGhost?.builtin) return;
+      if (
+        ghostReapprovalRoute(installedGhost ? marketItemForInstalledGhost(marketItems, installedGhost) : null) ===
+        'market'
+      ) {
+        await handleMarketUpdate(instanceId);
+        return;
+      }
+      await pickAndUpdateGhost(instanceId, { t });
+    },
+    [ghosts, handleMarketUpdate, marketItems, t],
+  );
+
+  const handleUpdateFromFile = useCallback(async () => {
+    if (!selectedDetail) return;
+    await pickAndUpdateGhost(selectedDetail.id, { t });
+  }, [selectedDetail, t]);
+
+  // 控制器在挂载期借用本页的市场刷新。
+  useEffect(
+    () =>
+      setUpdateAllBatchHooks({
+        refreshMarket: () => refreshMarket(),
+      }),
+    [refreshMarket],
+  );
+  const handleUpdateAll = useCallback(() => {
+    const current = getUpdateAllBatchState();
+    // 运行中或还有未完成项的批次:重开弹窗查看进度,不重建批次。
+    if (current.running || (current.rows !== null && !isBatchFinished(current.rows))) {
+      setUpdateDialogOpen(true);
+      return;
+    }
+    // 单项更新持有 market lease 期间不许开新批次:此刻的市场快照还把那个
+    // 插件标成 update-available,批次会把它一并收进去重复装一遍。
+    if (marketBusyLockRef.current !== null) return;
+    startUpdateAllBatch(
+      updatableInstalledItems.flatMap((item) => (item.marketUpdate ? [item.marketUpdate] : [])),
+    );
+    setUpdateDialogOpen(true);
+  }, [updatableInstalledItems]);
+
+  const handlePublish = useCallback(async () => {
+    const picked = await window.electronAPI.ghosts.pickFile().catch(() => null);
+    if (!picked || 'canceled' in picked) return;
+    try {
+      await window.electronAPI.pluginPublisher.start(picked.filePath);
+    } catch (error) {
+      const decoded = extractIpcError(error);
+      toast.error(
+        decoded?.code === 'PERMISSION_DENIED'
+          ? t('settings.ghosts.publish.disabled')
+          : t('settings.ghosts.publish.startFailed'),
+      );
+    }
+  }, [t]);
+
+  const handleInstall = useCallback(async () => {
+    const picked = await window.electronAPI.ghosts.pickFile().catch(() => null);
+    if (!picked || 'canceled' in picked) return;
+    await installGhostFromFile(picked.filePath, {
+      t,
+      // 已在插件页:tab 型插件安装后原地打开面板。
+      openPluginPanel: (instanceId) => {
+        setSelectedId(null);
+        setOpenPanelId(instanceId);
+      },
+    });
+  }, [t]);
+
+  const handleRetryLegacyRecovery = useCallback(async () => {
+    legacyRecoveryStatusRequestRef.current += 1;
+    const requestId = ++legacyRecoveryRetryRequestRef.current;
+    setLegacyRecoveryRetrying(true);
+    try {
+      const status = await window.electronAPI.ghosts.retryLegacyRecovery();
+      if (requestId === legacyRecoveryRetryRequestRef.current) {
+        setLegacyRecoveryStatus(status.state === 'none' ? null : status);
+      }
+    } catch {
+      const status = await window.electronAPI.ghosts.legacyRecoveryStatus().catch(() => null);
+      if (requestId === legacyRecoveryRetryRequestRef.current) {
+        setLegacyRecoveryStatus(status && status.state !== 'none' ? status : null);
+      }
+    } finally {
+      if (requestId === legacyRecoveryRetryRequestRef.current) {
+        await refreshMarket().catch(() => undefined);
+        if (requestId === legacyRecoveryRetryRequestRef.current) {
+          setLegacyRecoveryRetrying(false);
+        }
+      }
+    }
+  }, [refreshMarket]);
+
+  const handleCreateWithCindy = useCallback(async () => {
+    const agentKind = dbToMakerAgentKind(normalizeDbAgentKind(getWorkspaceDraft().vendor));
+    // Creation starts locally without a project. Use Main-attested identity: a
+    // same-named user Skill must never own this entry, including Claude aliases.
+    const commands = await loadAllCommands(agentKind, null);
+    const creator = commands.find((command) => (
+      command.kind === 'agent-skill'
+      && command.builtIn === true
+      && command.enabled !== false
+      && !isSlashCommandUnavailable(command)
+      && (command.name === CINDY_PLUGIN_CREATOR_NAME
+        || command.name === `cindy:${CINDY_PLUGIN_CREATOR_NAME}`)
+    ));
+    if (!creator) {
+      toast.error(t('settings.ghosts.page.creatorUnavailable'));
+      return;
+    }
+    saveComposerDraft(NEW_MAKER_DRAFT_KEY, {
+      text: plainTextToTiptapDoc(`/${creator.name} ${t('settings.ghosts.page.createPrompt')}`),
+      builtInSkillIntent: { name: CINDY_PLUGIN_CREATOR_NAME, commandName: creator.name },
+      attachments: [],
+      focusAtEnd: true,
+    });
+    resetDraftWorkspaceTargets();
+    navigate('/cc-agent/new');
+  }, [navigate, t]);
+
+  // 打开插件详情并滚到「配置」区(就绪弹窗的「去配置」动作)。详情视图
+  // 可能尚未挂载,滚动排到渲染之后的下一帧;减弱动效时改即时定位。
+  const openGhostConfiguration = useCallback((id: string) => {
+    setSelectedId(id);
+    const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        document
+          .getElementById('ghost-configuration-title')
+          ?.scrollIntoView({ behavior: reduceMotion ? 'auto' : 'smooth', block: 'start' });
+      });
+    });
+  }, []);
+
+  const handleUseGhost = useCallback(
+    async (id: string, displayName: string) => {
+      const ghost = findInstalledGhostByInstanceId(ghosts, id) ?? null;
+      if (!ghost) return;
+      if (!ghost.manifest.command || ghost.retirement) return;
+      // 使用前置门:点击时现查配置就绪度(main 侧确定性判定),未就绪先
+      // 弹窗引导去配置。查询失败不拦——运行期 networkSlot 仍会兜底报错,
+      // 这里拦不住只是少了一次前置提醒,不能因此把能用的插件挡在门外。
+      let setupStatus: GhostSetupStatus | null = null;
+      try {
+        setupStatus = await window.electronAPI.ghosts.setupStatus(id);
+      } catch {
+        setupStatus = null;
+      }
+      if (setupStatus && !setupStatus.ready) {
+        const goConfigure = await confirm({
+          title: t('settings.ghosts.setupGate.title', { name: displayName }),
+          description: formatSetupGateDescription(setupStatus, t),
+          confirmText: t('settings.ghosts.setupGate.configure'),
+          cancelText: t('settings.ghosts.setupGate.cancel'),
+          // 主操作「去配置」非破坏性,默认焦点落主按钮(弹窗契约的适用场景)。
+          autoFocusConfirm: true,
+        });
+        if (goConfigure) openGhostConfiguration(id);
+        return;
+      }
+      const existing = getComposerDraft(NEW_MAKER_DRAFT_KEY);
+      saveComposerDraft(NEW_MAKER_DRAFT_KEY, {
+        text: existing?.text ?? null,
+        attachments: existing?.attachments ?? [],
+        quotes: existing?.quotes ?? [],
+        browserComments: existing?.browserComments ?? [],
+        ...(ghost.manifest.command ? { pendingGhostId: installedGhostStoragePart(ghost) } : {}),
+        focusAtEnd: existing?.focusAtEnd === true,
+      });
+      resetDraftWorkspaceTargets();
+      navigate('/cc-agent/new');
+    },
+    [confirm, ghosts, navigate, openGhostConfiguration, t],
+  );
+
+  /** 卡片胶囊/详情主动作分发:面板型开页面内面板,指令/Host 能力起对话。 */
+  const handlePrimaryAction = useCallback(
+    (item: Pick<GhostPluginListItem, 'id' | 'name' | 'tabPanel' | 'canUse'>) => {
+      const action = ghostPrimaryAction(item);
+      if (action === 'panel') {
+        setOpenPanelId(item.id);
+        return;
+      }
+      if (action === 'command') {
+        void handleUseGhost(item.id, item.name);
+        return;
+      }
+      setSelectedId(item.id);
+    },
+    [handleUseGhost],
+  );
+
+  const handleMainViewSidebarVisibleChange = useCallback(
+    (visible: boolean) => {
+      const selected = selectedDetail;
+      if (!selected?.hasMainView) return;
+      const owner = currentMainViewVisibilityOwner();
+      void writeMainViewSidebarVisible(owner, selected.id, visible)
+        .then((persisted) => {
+          if (!persisted) toast.error(t('settings.ghosts.errors.generic'));
+        })
+        .catch(() => {
+          toast.error(t('settings.ghosts.errors.generic'));
+        });
+    },
+    [selectedDetail, t],
+  );
+
+  const handleUse = useCallback(() => {
+    if (selectedGhost && selectedDetail) {
+      handlePrimaryAction(selectedDetail);
+    }
+  }, [handlePrimaryAction, selectedDetail, selectedGhost]);
+
+  // 导出当前插件的 .cindy 包:main 侧打包安装目录 → 系统保存对话框落盘。
+  // 取消选择静默返回;成功/失败都如实 toast。
+  const handleExport = useCallback(async () => {
+    if (!selectedDetail) return;
+    try {
+      const result = await window.electronAPI.ghosts.export(selectedDetail.id);
+      if (result.status === 'canceled') return;
+      toast.success(t('settings.ghosts.toast.exported', { name: selectedDetail.name }));
+    } catch {
+      toast.error(t('settings.ghosts.toast.exportFailed', { name: selectedDetail.name }));
+    }
+  }, [selectedDetail, t]);
+
+  const handleUninstall = useCallback(async () => {
+    if (!selectedDetail) return;
+    const ok = await confirm({
+      title: t('settings.ghosts.uninstallConfirm.title', { name: selectedDetail.name }),
+      description: t('settings.ghosts.uninstallConfirm.description'),
+      confirmText: t('settings.ghosts.uninstall'),
+      cancelText: t('settings.ghosts.uninstallConfirm.cancel'),
+    });
+    if (!ok) return;
+    try {
+      if (selectedMarketInstall) {
+        await window.electronAPI.pluginMarket.uninstall(selectedMarketInstall.pluginId);
+        await refreshMarket();
+      } else {
+        await window.electronAPI.ghosts.uninstall(selectedDetail.id);
+      }
+      toast.success(t('settings.ghosts.toast.uninstalled', { name: selectedDetail.name }));
+    } catch (error) {
+      toast.error(
+        selectedMarketInstall
+          ? t(pluginMarketErrorKey(error))
+          : t(ghostInstallErrorKey(extractIpcError(error)?.code)),
+      );
+    }
+  }, [confirm, refreshMarket, selectedDetail, selectedMarketInstall, t]);
+
+  const handleSelectMarket = useCallback(
+    async (pluginId: string, preferInstalled = false) => {
+      // 与 handleMarketUpdate 共用同一互斥锁:更新进行中不叠加其它市场操作。
+      const marketBusyLease = acquireMarketBusy(pluginId);
+      if (!marketBusyLease) return;
+      capturePluginCatalogScroll();
+      const requestId = ++marketDetailRequestRef.current;
+      try {
+        const detail = await window.electronAPI.pluginMarket.detail(pluginId);
+        if (
+          requestId === marketDetailRequestRef.current &&
+          isMarketBusyLeaseActive(marketBusyLease)
+        ) {
+          const installed = preferInstalled && (detail.installState === 'installed' || detail.installState === 'update-available')
+            ? ghosts.find(ghost => marketItemMatchesInstalledGhost(detail, ghost)) : undefined;
+          if (installed) {
+            setMarketDetail(null);
+            setSelectedId(installedGhostStoragePart(installed));
+          } else {
+            setMarketDetail(detail);
+          }
+        }
+      } catch (error) {
+        if (
+          requestId === marketDetailRequestRef.current &&
+          isMarketBusyLeaseActive(marketBusyLease)
+        ) {
+          toast.error(t(pluginMarketErrorKey(error)));
+        }
+      } finally {
+        releaseMarketBusy(marketBusyLease);
+      }
+    },
+    [acquireMarketBusy, capturePluginCatalogScroll, ghosts, isMarketBusyLeaseActive, releaseMarketBusy, t],
+  );
+  const handleMarketBack = useCallback(() => {
+    cancelPendingPluginSuggestion(recommendationNonce ?? undefined);
+    requestPluginCatalogScrollRestore();
+    marketDetailRequestRef.current += 1;
+    setMarketDetail(null);
+  }, [recommendationNonce, requestPluginCatalogScrollRestore]);
+
+  const refreshVisibleMarketDetail = useCallback(async (pluginId: string) => {
+    // A background icon renewal may observe navigation, but must never invalidate a
+    // user-initiated detail request by advancing its request generation.
+    const requestId = marketDetailRequestRef.current;
+    try {
+      const detail = await window.electronAPI.pluginMarket.detail(pluginId);
+      if (requestId !== marketDetailRequestRef.current) return;
+      setMarketDetail((current) => (current?.pluginId === pluginId ? detail : current));
+    } catch (error) {
+      // A background URL renewal must not close an otherwise usable detail page.
+      if (requestId === marketDetailRequestRef.current) throw error;
+    }
+  }, []);
+  useEffect(() => {
+    const pluginId = searchParams.get('market');
+    if (!pluginId || marketBusyId !== null) return;
+    const next = new URLSearchParams(searchParams);
+    next.delete('market');
+    setSearchParams(next, { replace: true });
+    void handleSelectMarket(pluginId, true);
+  }, [handleSelectMarket, marketBusyId, searchParams, setSearchParams]);
+  usePluginMarketLocaleRefresh(
+    marketLocale,
+    async () => {
+      await window.electronAPI.setApplicationMenuLocale(marketLocale);
+    },
+    () => refreshMarket(true),
+    marketDetail?.pluginId ? () => refreshVisibleMarketDetail(marketDetail.pluginId) : undefined,
+  );
+  const visibleMarketIcons = useMemo(
+    () => [...marketItems.map((item) => item.icon), marketDetail?.icon],
+    [marketDetail?.icon, marketItems],
+  );
+  const refreshVisibleMarketIcons = useCallback(async () => {
+    const refreshes: Promise<void>[] = [refreshMarket(true)];
+    if (marketDetail?.pluginId) {
+      refreshes.push(refreshVisibleMarketDetail(marketDetail.pluginId));
+    }
+    await Promise.all(refreshes);
+  }, [marketDetail?.pluginId, refreshMarket, refreshVisibleMarketDetail]);
+  const handleMarketIconLoadError = usePluginIconRefresh(
+    visibleMarketIcons,
+    refreshVisibleMarketIcons,
+  );
+
+  const runMarketInstallFlow = useCallback(
+    async (marketDetailArg: PluginMarketDetail) => {
+      const pendingNonce = getPendingPluginSuggestion()?.nonce;
+      const marketDetail = marketDetailArg;
+      // 确认框等待期间也持有 lease。账号/模式切换会清除当前 lease,
+      // 旧确认回调恢复后必须先验权,不能在新会话里继续安装。
+      const marketBusyLease = acquireMarketBusy(marketDetail.pluginId);
+      if (!marketBusyLease) return;
+      // 市场更新与用户显式选择的同 id 替换都走原位更新，
+      // 保留生效状态和按 ghostId 存储的用户数据。
+      const isUpdate =
+        marketDetail.installState === 'update-available' ||
+        marketDetail.installState === 'conflict';
+      try {
+        let installedGhost =
+          ghosts.find((ghost) => marketItemMatchesInstalledGhost(marketDetail, ghost)) ?? null;
+        if (isUpdate && !installedGhost) {
+          try {
+            installedGhost =
+              window.electronAPI.ghosts
+                .listSync()
+                .ghosts.find((ghost) => marketItemMatchesInstalledGhost(marketDetail, ghost)) ?? null;
+          } catch {
+            // bridge 不可用或状态切换时保持 null；下面按状态变化安全终止。
+          }
+        }
+        if (isUpdate && !installedGhost) {
+          if (isMarketBusyLeaseActive(marketBusyLease)) {
+            toast.error(t('settings.ghosts.market.errors.stateChanged'));
+          }
+          releaseMarketBusy(marketBusyLease);
+          await refreshMarket();
+          return;
+        }
+        if (!isMarketBusyLeaseActive(marketBusyLease)) return;
+        const options: PluginMarketInstallOptions = {
+          expectedReleaseId: marketDetail.releaseId,
+          expectedManifest: marketDetail.manifest,
+          ...(isUpdate && installedGhost
+            ? { expectedInstalledApproval: ghostInstallApprovalToken(installedGhost.approval) }
+            : {}),
+          // 来源隔离(#2043):仅用户显式选择的冲突替换允许切换来源;更新与原位安装不切换。
+          allowSourceReplacement: marketDetail.installState === 'conflict',
+        };
+        const ghost = await installMarketPackage({
+          pluginId: marketDetail.pluginId,
+          options,
+          isStillActive: () => isMarketBusyLeaseActive(marketBusyLease),
+        });
+        if (!ghost || !isMarketBusyLeaseActive(marketBusyLease)) return;
+        if (continueRecommendation(pendingNonce, installedGhostStoragePart(ghost))) return;
+        // 市场首装装完即开(2026-07-26 定案),toast 用"已安装";更新路径如实
+        // 用"已更新"(生效状态未被改变),并留在当前页方便连续更新多个插件。
+        toast.success(
+          isUpdate
+            ? t('settings.ghosts.toast.updated', {
+                name: ghost.manifest.name,
+                version: ghost.manifest.version,
+              })
+            : t('settings.ghosts.toast.installed', {
+                name: ghost.manifest.name,
+              }),
+        );
+        if (shouldOpenInstalledDetailAfterMarketSuccess(isUpdate)) {
+          setMarketDetail((current) =>
+            current?.pluginId === marketDetail.pluginId ? null : current,
+          );
+          setSelectedId(installedGhostStoragePart(ghost));
+        } else {
+          await refreshVisibleMarketDetail(marketDetail.pluginId).catch(() => undefined);
+        }
+        await refreshMarket();
+      } catch (error) {
+        if (isMarketBusyLeaseActive(marketBusyLease)) {
+          await showPluginMarketActionError(error);
+        }
+      } finally {
+        releaseMarketBusy(marketBusyLease);
+      }
+    },
+    [
+      acquireMarketBusy,
+      ghosts,
+      isMarketBusyLeaseActive,
+      installMarketPackage,
+      continueRecommendation,
+      refreshMarket,
+      refreshVisibleMarketDetail,
+      releaseMarketBusy,
+      showPluginMarketActionError,
+      t,
+    ],
+  );
+  const handleInstallFromMarket = useCallback(async () => {
+    if (!marketDetail) return;
+    await runMarketInstallFlow(marketDetail);
+  }, [marketDetail, runMarketInstallFlow]);
+  /** 推荐卡片上的直接「安装」:先取详情,再走与详情页相同的确认+安装流。 */
+  const handleInstallMarketItem = useCallback(
+    async (pluginId: string) => {
+      const marketBusyLease = acquireMarketBusy(pluginId);
+      if (!marketBusyLease) return;
+      let detail: PluginMarketDetail;
+      try {
+        detail = await window.electronAPI.pluginMarket.detail(pluginId);
+      } catch (error) {
+        if (isMarketBusyLeaseActive(marketBusyLease)) {
+          toast.error(t(pluginMarketErrorKey(error)));
+        }
+        releaseMarketBusy(marketBusyLease);
+        return;
+      }
+      if (!isMarketBusyLeaseActive(marketBusyLease)) return;
+      releaseMarketBusy(marketBusyLease);
+      await runMarketInstallFlow(detail);
+    },
+    [acquireMarketBusy, isMarketBusyLeaseActive, releaseMarketBusy, runMarketInstallFlow, t],
+  );
+
+  useEffect(() => {
+    const id = searchParams.get('retired');
+    if (!id) return;
+    if (ghosts.some((ghost) => ghost.manifest.id === id && ghost.retirement)) {
+      // The detached sidebar can navigate here while market details are still open/loading.
+      marketDetailRequestRef.current += 1;
+      setMarketDetail(null);
+      setSelectedId(id);
+    }
+    const next = new URLSearchParams(searchParams);
+    next.delete('retired');
+    setSearchParams(next, { replace: true });
+  }, [ghosts, searchParams, setSearchParams]);
+
+  useEffect(() => {
+    // Market details render first; selecting a hidden notice does not make it read.
+    if (marketDetail || !selectedGhost?.retirement?.unread) return;
+    void window.electronAPI.ghosts
+      .acknowledgeRetirement(installedGhostStoragePart(selectedGhost))
+      .catch(() => toast.error(t('settings.ghosts.retirement.saveFailed')));
+  }, [marketDetail, selectedGhost?.manifest.id, selectedGhost?.retirement?.unread, t]);
+
+  const handleReplaceRetiredFeature = async () => {
+    const descriptor =
+      selectedGhost?.retirement && featureRetirementById(selectedGhost.retirement.id);
+    const target = descriptor?.replacement;
+    if (!target || !selectedGhost?.retirement?.eligible) return;
+    const replacement = findInstalledRetirementReplacement(
+      window.electronAPI.ghosts.listSync().ghosts,
+      marketItems,
+      target,
+    );
+    if (replacement) {
+      const replacementId = installedGhostStoragePart(replacement);
+      if (replacement.enabled) {
+        setSelectedId(replacementId);
+        handlePrimaryAction(toGhostPluginListItem(replacement));
+      } else {
+        const lease = acquireMarketBusy(target.marketId);
+        if (!lease) return;
+        try {
+          await window.electronAPI.ghosts.setEnabled(
+            replacementId, true, ghostInstallApprovalToken(replacement.approval),
+          );
+          if (isMarketBusyLeaseActive(lease)) setSelectedId(replacementId);
+        } catch (error) {
+          if (isMarketBusyLeaseActive(lease)) await showPluginMarketActionError(error);
+        } finally {
+          releaseMarketBusy(lease);
+        }
+      }
+      return;
+    }
+    await handleInstallMarketItem(target.marketId);
+  };
+
+  const showMyPlugins = searchParams.has('myPlugins');
+  useEffect(() => {
+    if (!searchParams.has('contributionChild') && !searchParams.has('contributionTransfer')) return;
+    const next = new URLSearchParams(searchParams); next.delete('contributionChild'); next.delete('contributionTransfer');
+    setSearchParams(next, { replace: true });
+  }, [searchParams, setSearchParams]);
+  const contributionUnavailableKey = localPublishingUnavailableKey(selectedGhost, selectedMarketInstall);
+  const showLocalPublishing = selectedGhost?.publishingSource?.kind === 'local' && !contributionUnavailableKey;
+  useEffect(() => {
+    if (showMyPlugins) { setSelectedId(null); setMarketDetail(null); }
+  }, [showMyPlugins]);
+  useEffect(() => { setPublicationDialog(null); }, [contributionOwner, selectedDetail?.id, showMyPlugins]);
+  useEffect(() => { contributing.current = null; setContributionBusy(false); }, [contributionOwner]);
+
+  const openMyPlugins = (pluginId?: string) => {
+    if (pluginCatalogVisible) capturePluginCatalogScroll();
+    setSelectedId(null); setMarketDetail(null);
+    const next = new URLSearchParams(searchParams);
+    next.set('myPlugins', '1'); next.delete('contributionChild'); next.delete('contributionTransfer');
+    if (pluginId) next.set('contribution', pluginId); else next.delete('contribution');
+    setSearchParams(next);
+  };
+  const preparePublication = (instanceId: string) => {
+    const ghost = findInstalledGhostByInstanceId(ghosts, instanceId);
+    if (!ghost || ghost.publishingSource?.kind !== 'local' ||
+      localPublishingUnavailableKey(ghost, marketItemForInstalledGhost(marketItems, ghost)))
+      throw new Error('Current local publishing source is unavailable');
+    return window.electronAPI.pluginContributions.prepare(instanceId, {
+      directory: ghost.dir, approvalToken: ghostInstallApprovalToken(ghost.approval),
+    });
+  };
+  const contribute = async (instanceId: string, options?: PluginSubmitOptions): Promise<boolean> => {
+    if (contributing.current) return false;
+    if (!contributor) {
+      const ghost = findInstalledGhostByInstanceId(ghosts, instanceId);
+      if (!ghost || localPublishingUnavailableKey(ghost) || ghost.publishingSource?.kind !== 'local') return false;
+      const nonce = rememberContributionIntent(ghost);
+      const next = new URLSearchParams(searchParams); next.set('myPlugins', '1'); next.set('contributionIntent', nonce);
+      setSearchParams(next);
+      if (mode !== 'cloud') {
+        await signInForContribution();
+        navigate('/login', { replace: true, state: { returnTo: `/plugins?${next}` } });
+      }
+      return false;
+    }
+    const owner = contributionOwner;
+    const submittedFrom = contributionView.current.token;
+    const stillHere = () => contributionMounted.current && contributionOwnerRef.current === owner &&
+      contributionView.current.token === submittedFrom && (options?.isCurrent?.() ?? true);
+    contributing.current = owner;
+    setContributionBusy(true);
+    let preparedId: string | undefined;
+    try {
+      const clicked = findInstalledGhostByInstanceId(ghosts, instanceId);
+      if (!clicked) throw new Error('Original installed plugin is unavailable');
+      if (clicked.publishingSource?.kind !== 'local' || localPublishingUnavailableKey(clicked, marketItemForInstalledGhost(marketItems, clicked)))
+        throw new Error('Current publishing source or permission is unavailable');
+      const prepared = options?.prepared ?? await preparePublication(instanceId);
+      if (prepared.instanceId !== instanceId) throw new Error('Original installed plugin changed');
+      preparedId = prepared.preparedId;
+      if (contributionOwnerRef.current !== owner) return false;
+      let result = await window.electronAPI.pluginContributions.submit(prepared.preparedId);
+      preparedId = undefined;
+      // Keep upload bookkeeping inside this submit action. Only a confirmed
+      // server submission belongs in My Plugins; HTTP 202 is still submitting.
+      while (result.stage !== 'complete') {
+        if (!contributionMounted.current || contributionOwnerRef.current !== owner) return false;
+        await new Promise(resolve => window.setTimeout(resolve, 1000));
+        if (!contributionMounted.current || contributionOwnerRef.current !== owner) return false;
+        result = await window.electronAPI.pluginContributions.status(result.localId);
+      }
+      if (!contributionMounted.current || contributionOwnerRef.current !== owner) return false;
+      if (result.operation?.status !== 'succeeded' || !result.operation.receipt) {
+        toast.error(t(`settings.ghosts.contribution.errors.${result.operation?.failure?.code ?? result.errorCode ?? 'INTERNAL'}`, {
+          defaultValue: t('settings.ghosts.contribution.submitFailed'),
+        }));
+        return false;
+      }
+      contributionCache.current.page = null; contributionCache.current.detail = null;
+      setSubmissionRevision(value => value + 1);
+      if (stillHere() && (!showMyPlugins || searchParams.get('contribution') !== result.operation.receipt.pluginId))
+        openMyPlugins(result.operation.receipt.pluginId);
+      return true;
+    } catch (error) {
+      if (contributionOwnerRef.current === owner) { toast.error(t(contributionErrorKey(error), { defaultValue: t('settings.ghosts.contribution.loadFailed') })); }
+      return false;
+    } finally {
+      if (preparedId && contributionOwnerRef.current === owner) void window.electronAPI.pluginContributions.discard(preparedId).catch(() => undefined);
+      if (contributionOwnerRef.current === owner && contributing.current === owner) { contributing.current = null; setContributionBusy(false); }
+    }
+  };
+
+  useEffect(() => {
+    const nonce = searchParams.get('contributionIntent');
+    if (!nonce || !contributor) return;
+    const target = consumeContributionIntent(nonce);
+    const next = new URLSearchParams(searchParams); next.delete('contributionIntent');
+    setSearchParams(next, { replace: true });
+    if (!target) return;
+    const matches = ghosts.filter((ghost) => matchesContributionIntent(target, ghost));
+    if (matches.length === 1) {
+      // Login returns to the exact local detail so the actual package summary is read first.
+      next.delete('myPlugins'); next.delete('contribution'); next.delete('contributionChild');
+      setSelectedId(installedGhostStoragePart(matches[0]));
+      setMarketDetail(null);
+      setSearchParams(next, { replace: true });
+    }
+    else toast.error(t('settings.ghosts.contribution.installForAccount'));
+  }, [searchParams, contributor, contributionOwner, ghosts]);
+
+  const publishingInstalledRevision = JSON.stringify([installedGhostMarketKey, installedGhostLocationsKey,
+    ghosts.map(ghost => [installedGhostStoragePart(ghost), ghostInstallApprovalToken(ghost.approval), ghost.publishingSource])]);
+  const publicationDialogView = publicationDialog && publicationDialog.owner === contributionOwner && publicationDialog.instanceId === selectedDetail?.id ? (
+    <PluginPublishDialog
+      key={publicationDialog.id}
+      open={publicationDialog.open}
+      ownerKey={contributionOwner}
+      initialInstanceId={publicationDialog.instanceId}
+      reader={window.electronAPI.pluginContributions}
+      localPlugins={publishableInstalledItems}
+      installedPluginCount={allInstalledItems.length}
+      onPrepare={preparePublication}
+      onSubmitUpdate={contribute}
+      submitBusy={contributionBusy}
+      installedRevision={publishingInstalledRevision}
+      submissionRevision={submissionRevision}
+      onOpenChange={open => setPublicationDialog(current => current?.id === publicationDialog.id ? { ...current, open } : current)}
+      onClosed={() => setPublicationDialog(current => current?.id === publicationDialog.id && !current.open ? null : current)}
+    />
+  ) : null;
+
+  // 面板收束:aside 只挂在插件页语境里(列表/详情/市场详情共用),
+  // 路由离开本页组件整体卸载 → webview 一并回收,绝不残留到别的界面。
+  const panelAside = openPanelGhost ? (
+    // key 纳入 owner 代际:双保险。即便将来某条路径漏了上面的清空,换身份也会
+    // 强制卸载重建宿主(webview 连同它的 DOM/内存态一起丢),不会跨账号复用。
+    <GhostPagePanelHost
+      key={`${panelOwnerKey}:${installedGhostStoragePart(openPanelGhost)}`}
+      ghost={openPanelGhost}
+      onClose={() => setOpenPanelId(null)}
+    />
+  ) : null;
+
+
+  const renderInstalledDetail = () => selectedDetail ? (
+      <div className="flex h-full min-h-0 w-full">
+        <div className="flex min-w-0 flex-1 flex-col">
+          {recommendationNotice}
+          <div className="min-h-0 flex-1">
+            <GhostPluginDetailView
+              usageOwnerKey={`${panelOwnerKey}:${dataOwnerGeneration}`}
+              confirmClearUsage={() => confirm({ title: t('settings.ghosts.usage.clearTitle'), description: t('settings.ghosts.usage.clearDescription'), confirmText: t('settings.ghosts.usage.clear'), confirmVariant: 'destructive' })}
+              ghost={selectedGhost}
+              sharePluginId={selectedMarketInstall?.sourceType === 'server' && selectedMarketInstall.scope === 'public' ? selectedMarketInstall.pluginId : undefined}
+              detail={selectedDetail}
+              marketItem={selectedMarketInstall}
+              panelStatus={panelStatus}
+              enabledOverride={
+                selectedGhost
+                  ? effectiveEnabled(installedGhostStoragePart(selectedGhost), selectedGhost.enabled)
+                  : undefined
+              }
+              onBack={() => {
+                cancelPendingPluginSuggestion(recommendationNonce ?? undefined);
+                setSelectedId(null);
+              }}
+              onToggle={(enabled) =>
+                void handleToggle(selectedDetail.id, enabled, selectedDetail.name)
+              }
+              onUse={handleUse}
+              mainViewSidebarVisible={selectedMainViewSidebarVisible}
+              onMainViewSidebarVisibleChange={handleMainViewSidebarVisibleChange}
+              onUpdate={() => void handleUpdate()}
+              onUpdateFromFile={() => void handleUpdateFromFile()}
+              onReapprove={() => void handleRecoverInstall(selectedDetail.id)}
+              updateVersion={selectedMarketUpdate?.version}
+              updateBusy={(selectedMarketUpdate !== null && marketBusyId !== null) || batchRunning}
+              onUninstall={() => void handleUninstall()}
+              onExport={
+                selectedGhost && !isUserInstallReservedGhostId(selectedDetail.ghostId)
+                  ? () => void handleExport()
+                  : undefined
+              }
+              onContribute={!showLocalPublishing ? undefined : () => {
+                if (!contributor) { void contribute(selectedDetail.id); return; }
+                setPublicationDialog({
+                  id: ++publicationDialogSequence.current, owner: contributionOwner, open: true, instanceId: selectedDetail.id,
+                });
+              }}
+              contributionUnavailableReason={contributionUnavailableKey === 'officialGithubRequired' || (contributionUnavailableKey === 'reservedId' && selectedGhost?.publishingSource?.kind === 'public-market')
+                ? t(`settings.ghosts.contribution.unavailable.${contributionUnavailableKey}`)
+                : selectedGhost?.publishingSource?.kind === 'local' && contributionUnavailableKey
+                  ? t(`settings.ghosts.contribution.unavailable.${contributionUnavailableKey}`) : undefined}
+              contributionBusy={contributionBusy}
+              toggleDisabled={scopeDir !== null && selectedGhost !== null && !selectedGhost.enabled}
+              onIconLoadError={handleMarketIconLoadError}
+            />
+          </div>
+        </div>
+        {panelAside}
+        {publicationDialogView}
+      </div>
+  ) : null;
+
+  if (showMyPlugins) return <MyPluginsPage
+    key={contributionOwner}
+    cache={contributionCache.current}
+    reader={window.electronAPI.pluginContributions}
+    localPlugins={publishableInstalledItems}
+    installedPluginCount={allInstalledItems.length}
+    onPrepare={preparePublication}
+    installedRevision={publishingInstalledRevision}
+    renderVersionFacts={(plugin) => <PluginVersionFacts plugin={plugin} />}
+    onReadPublished={window.electronAPI.pluginMarket.detail}
+    submitBusy={contributionBusy}
+    submissionRevision={submissionRevision}
+    onSubmitUpdate={contribute}
+    onInstallPublished={async (pluginId) => {
+      const owner = contributionOwner;
+      const detail = await window.electronAPI.pluginMarket.detail(pluginId);
+      if (contributionOwnerRef.current !== owner) return;
+      if (detail.scope !== 'public' || detail.sourceType !== 'server') return;
+      await runMarketInstallFlow(detail);
+    }}
+    onViewLocal={() => {
+      const next = new URLSearchParams(searchParams); next.delete('myPlugins'); next.delete('contribution'); next.delete('contributionChild'); next.delete('contributionTransfer');
+      requestPluginCatalogScrollRestore();
+      setSelectedId(null); setMarketDetail(null); setSearchParams(next, { replace: true });
+    }}
+  />;
+
+
+  if (marketDetail) {
+    return (
+      <div className="flex h-full min-h-0 w-full">
+        <div className="flex min-w-0 flex-1 flex-col">
+          {recommendationNotice}
+          <div className="min-h-0 flex-1">
+            <MarketPluginDetailView
+              detail={marketDetail}
+              busy={marketBusyId === marketDetail.pluginId}
+              onBack={handleMarketBack}
+              onInstall={
+                canOfferMarketInstall(mode, marketDetail.ghostId)
+                  ? () => void handleInstallFromMarket()
+                  : undefined
+              }
+              onIconLoadError={handleMarketIconLoadError}
+            />
+          </div>
+        </div>
+        {panelAside}
+      </div>
+    );
+  }
+
+  if (selectedGhost?.retirement) {
+    const target = featureRetirementById(selectedGhost.retirement.id)?.replacement;
+    return (
+      <RetiredFeatureDetail
+        ghost={selectedGhost}
+        replacement={findInstalledRetirementReplacement(ghosts, marketItems, target)}
+        busy={marketBusyId !== null}
+        onBack={() => setSelectedId(null)}
+        onReplace={() => void handleReplaceRetiredFeature()}
+        onDismiss={() => {
+          void window.electronAPI.ghosts
+            .acknowledgeRetirement(installedGhostStoragePart(selectedGhost))
+            .then(() => setSelectedId(null))
+            .catch(() => toast.error(t('settings.ghosts.retirement.saveFailed')));
+        }}
+        onUninstall={() => void handleUninstall()}
+      />
+    );
+  }
+
+  if (selectedDetail) return renderInstalledDetail();
+
+  return (
+    <PluginManagementLayout
+      activeTab="plugins"
+      query={query}
+      onQueryChange={setQuery}
+      searchPlaceholder={t('settings.ghosts.page.search')}
+      clearSearchLabel={t('settings.ghosts.page.clearSearch')}
+      embedded={embedded}
+      onSelectTab={onSelectCatalogTab}
+      headerActions={
+        <>
+          <Button variant="secondary" size="sm" onClick={() => openMyPlugins()}>
+            {t('settings.ghosts.contribution.myPlugins')}
+            {reviewUnread.length > 0 ? (
+              <span role="img" className="inline-flex" aria-label={t('settings.ghosts.contribution.unreadReview')}>
+                <AttentionDot tone={reviewUnread.some(item => item.status !== 'approved' && item.status !== 'enabled') ? 'error' : 'done'} />
+              </span>
+            ) : null}
+          </Button>
+          <GhostPluginActions
+            onInstall={() => void handleInstall()}
+            onCreateWithCindy={handleCreateWithCindy}
+            onAddMarketplace={() => setAddMarketplaceOpen(true)}
+          />
+        </>
+      }
+    >
+      <div className="flex min-h-0 flex-1">
+        <main
+          ref={pluginCatalogListRef}
+          className={cn(
+            'app-wallpaper-surface min-h-0 w-full min-w-0 flex-1 overflow-y-auto [scrollbar-gutter:stable_both-edges]',
+            embedded ? 'bg-transparent' : 'bg-[var(--surface)]',
+          )}
+          onScroll={onPluginCatalogScroll}
+        >
+          <PluginManagementPage>
+            {recommendationNotice}
+            <header className="plugin-motion-page-header pb-2" data-catalog-region="heading">
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <h1 className="text-28 font-medium leading-tight text-[var(--text-primary)]">
+                    {t('settings.ghosts.title')}
+                  </h1>
+                  <CatalogTargetControls
+                    computer={deviceControl}
+                    project={
+                      <PluginProjectMenu
+                        scopeDir={scopeDir}
+                        activeSessionWorkingDir={activeSessionWorkingDir ?? undefined}
+                        recentWorkdirs={recentWorkdirs}
+                        onPick={handlePickScope}
+                      />
+                    }
+                    projectLabel={scopeDir ? basename(scopeDir) : undefined}
+                  />
+                </div>
+                <p className="mt-2 max-w-2xl text-14 leading-6 text-[var(--text-secondary)]">
+                  {t('settings.ghosts.description')}
+                </p>
+              </div>
+            </header>
+
+            <MyPublishesSectionVisibilityGate
+              visible={SHOW_MY_PUBLISHES_SECTION && showEnterprise}
+              overviewLabel={t('settings.ghosts.page.overviewTab')}
+              publishesLabel={t('settings.ghosts.publish.section')}
+              tabsAriaLabel={t('settings.ghosts.page.secondaryTabsAria')}
+              publishes={
+                <MyPublishesSection
+                  enabled={showEnterprise}
+                  onPublish={() => void handlePublish()}
+                />
+              }
+            >
+            <section className="plugin-motion-page-section mt-6 min-w-0">
+              <InstalledCatalogHeader
+                title={t('settings.ghosts.page.installedSection')}
+                count={searchedInstalledItems.length}
+              />
+            {scopeDir ? (
+              <CatalogManagementNotice
+                title={t('settings.ghosts.projectBanner.title', { name: basename(scopeDir) })}
+                action={
+                  <Button
+                    variant="secondary"
+                    tone="quiet"
+                    size="sm"
+                    compact
+                    onClick={() => handlePickScope(null)}
+                  >
+                    {t('settings.ghosts.projectBanner.backToGlobal')}
+                  </Button>
+                }
+              >
+                {t('settings.ghosts.projectBanner.desc', {
+                  device: t('settings.ghosts.remote.thisComputer'),
+                })}
+              </CatalogManagementNotice>
+            ) : null}
+
+
+              {legacyRecoveryStatus ? (
+                <LegacyGhostRecoveryNotice
+                  status={legacyRecoveryStatus}
+                  retrying={legacyRecoveryRetrying}
+                  onRetry={() => void handleRetryLegacyRecovery()}
+                />
+              ) : null}
+
+              {bannerVisible ? (
+                <div className="mb-4 flex items-center gap-4 rounded-xl border-[0.5px] border-[var(--border-default)] bg-[var(--surface-elevated)] px-4 py-3.5">
+                  <span className="grid size-9 shrink-0 place-items-center rounded-full bg-[var(--surface-chip)] text-[var(--text-primary)]">
+                    <ArrowUp size={16} aria-hidden="true" />
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <p className="text-13 font-medium text-[var(--text-primary)]">
+                      {t('settings.ghosts.page.updatesAvailable', {
+                        count: updatableInstalledItems.length,
+                      })}
+                    </p>
+                    <p className="truncate text-12 text-[var(--text-secondary)]">
+                      {updatableInstalledItems
+                        .map((item) => `${item.name} v${item.marketUpdate?.version ?? ''}`)
+                        .join(' · ')}
+                    </p>
+                  </div>
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      tone="quiet"
+                      compact
+                    type="button"
+                    onClick={handleIgnoreRound}
+                      className="shrink-0"
+                  >
+                    {t('settings.ghosts.page.ignoreRound')}
+                    </Button>
+                    {/* 单项更新在飞时禁用:与 handleUpdateAll 的守卫同因,按钮如实变灰。 */}
+                    <Button
+                      variant="cta"
+                      size="lg"
+                      loading={marketBusyId !== null}
+                    type="button"
+                    onClick={handleUpdateAll}
+                    disabled={marketBusyId !== null}
+                      className="shrink-0"
+                  >
+                    {t('settings.ghosts.page.updateAll')}
+                    </Button>
+                </div>
+              ) : null}
+
+              {primaryInstalledItems.length > 0 ? (
+                <>
+                  <div className={cn('plugin-motion-stagger', PLUGIN_INSTALLED_CARD_GRID_CLASS)}>
+                    {primaryInstalledItems.map((item) => (
+                      <GhostPluginCard
+                        key={item.id}
+                        item={item}
+                        sourceLabel={t(`settings.ghosts.page.origin.${item.origin}`)}
+                        marketItem={item.marketItem}
+                        author={item.author}
+                        updateVersion={item.marketUpdate?.version}
+                        updateNeedsConsent={item.marketUpdate?.updateRequiresConsent === true}
+                        updateBusy={
+                          (item.marketUpdate !== null && marketBusyId !== null) || batchRunning
+                        }
+                        updatePending={item.marketUpdate?.pluginId === marketBusyId}
+                        onUpdate={
+                          item.marketUpdate ? () => void handleMarketUpdate(item.id) : undefined
+                        }
+                        effectiveEnabled={effectiveEnabled(item.id, item.enabled)}
+                        onPrimary={() => handlePrimaryAction(item)}
+                        onManage={() => setSelectedId(item.id)}
+                        onIconLoadError={handleMarketIconLoadError}
+                      />
+                    ))}
+                  </div>
+                  {additionalInstalledItems.length > 0 ? (
+                    <InstalledPluginOverflow id={installedOverflowId} expanded={installedExpanded}>
+                      <div
+                        className={cn(
+                          PLUGIN_INSTALLED_CARD_GRID_CLASS,
+                          'plugin-installed-overflow-grid',
+                          installedExpanded && 'plugin-motion-stagger',
+                        )}
+                      >
+                        {additionalInstalledItems.map((item) => (
+                          <GhostPluginCard
+                            key={item.id}
+                            item={item}
+                            sourceLabel={t(`settings.ghosts.page.origin.${item.origin}`)}
+                            marketItem={item.marketItem}
+                            author={item.author}
+                            updateVersion={item.marketUpdate?.version}
+                            updateNeedsConsent={item.marketUpdate?.updateRequiresConsent === true}
+                            updateBusy={
+                              (item.marketUpdate !== null && marketBusyId !== null) || batchRunning
+                            }
+                            updatePending={item.marketUpdate?.pluginId === marketBusyId}
+                            onUpdate={
+                              item.marketUpdate ? () => void handleMarketUpdate(item.id) : undefined
+                            }
+                            effectiveEnabled={effectiveEnabled(item.id, item.enabled)}
+                            onPrimary={() => handlePrimaryAction(item)}
+                            onManage={() => setSelectedId(item.id)}
+                            onIconLoadError={handleMarketIconLoadError}
+                          />
+                        ))}
+                      </div>
+                    </InstalledPluginOverflow>
+                  ) : null}
+                </>
+              ) : !legacyRecoveryStatus ? (
+                <div className="rounded-xl border-[0.5px] border-[var(--border-default)] px-5 py-10 text-center">
+                  <p className="text-13 text-[var(--text-secondary)]">
+                    {installedItems.length === 0
+                      ? t('settings.ghosts.empty')
+                      : t('settings.ghosts.page.emptyFiltered')}
+                  </p>
+                  {installedItems.length === 0 ? (
+                    <p className="mt-1.5 text-12 text-[var(--text-tertiary)]">
+                      {t('settings.ghosts.emptyHint')}
+                    </p>
+                  ) : null}
+                </div>
+              ) : null}
+              {hiddenInstalledCount > 0 ? (
+                <InstalledPluginDisclosure
+                  expanded={installedExpanded}
+                  controlsId={installedOverflowId}
+                  totalCount={displayInstalledItems.length}
+                  previewItems={additionalInstalledItems}
+                  onToggle={() => setInstalledExpanded((expanded) => !expanded)}
+                  onIconLoadError={handleMarketIconLoadError}
+                />
+              ) : null}
+            </section>
+
+            {availableMarketItems.length > 0 ||
+            searchedAvailableMarketItems.length > 0 ||
+            marketSnapshot?.unavailableReason ||
+            marketSnapshot?.organizationAccessError ||
+            marketSnapshot?.unavailableCustomSourceNames.length ? (
+              <section className="plugin-motion-page-section mt-10 min-w-0">
+                <div className={PLUGIN_CATALOG_TOOLBAR_CLASS}>
+                  {/* 推荐区标题不带数字(设计定稿):数量感由卡片自身传达。 */}
+                  <h2 className="shrink-0 whitespace-nowrap text-20 font-medium text-[var(--text-primary)]">
+                    {t('settings.ghosts.page.recommendedSection')}
+                  </h2>
+                  <SegmentedControl
+                    className="plugin-catalog-filters"
+                    role="radiogroup"
+                    aria-label={t('settings.ghosts.page.filtersAria')}
+                    style={WINDOW_NO_DRAG_STYLE}
+                    height={32}
+                    optionHeight={28}
+                    optionClassName="px-3.5 text-12"
+                    value={effectiveOriginFilter}
+                    onValueChange={setOriginFilter}
+                    options={recommendedFilters.map((filter) => {
+                      const count =
+                        filter === 'all'
+                          ? searchedAvailableMarketItems.length
+                          : recommendedCounts[filter];
+                      return {
+                        value: filter,
+                        label: (
+                          <>
+                            {filter === 'all'
+                              ? t('settings.ghosts.page.filterAll')
+                              : t(`settings.ghosts.page.origin.${filter}`)}
+                            <span className="ml-1.5 tabular-nums text-[var(--text-tertiary)]">
+                              {count}
+                            </span>
+                          </>
+                        ),
+                      };
+                    })}
+                  />
+                </div>
+
+                <p className="mb-3 text-12 leading-5 text-[var(--text-tertiary)]">
+                  {t('settings.ghosts.remote.installDestination', { device: t('settings.ghosts.remote.thisComputer') })}
+                </p>
+                {marketSnapshot?.unavailableReason ? (
+                  <p className="mb-4 rounded-xl border border-[var(--border-default)] bg-[var(--surface-chip)] px-4 py-3 text-12 text-[var(--text-secondary)]">
+                    {t(
+                      marketSnapshot.unavailableReason === 'authentication-required'
+                        ? 'settings.ghosts.market.authenticationRequired'
+                        : marketSnapshot.unavailableReason === 'not-configured'
+                          ? 'settings.ghosts.market.notConfigured'
+                          : 'settings.ghosts.market.unavailable',
+                    )}
+                  </p>
+                ) : null}
+
+                {marketSnapshot?.unavailableCustomSourceNames.length ? (
+                  <p className="mb-4 rounded-xl border border-[var(--border-default)] bg-[var(--surface-chip)] px-4 py-3 text-12 text-[var(--text-secondary)]">
+                    {t('settings.ghosts.market.customSourcesUnavailable', {
+                      names: marketSnapshot.unavailableCustomSourceNames.join(', '),
+                    })}
+                  </p>
+                ) : null}
+
+                {organizationAccessErrorKey ? (
+                  <p className="mb-4 rounded-xl border border-[var(--border-default)] bg-[var(--surface-chip)] px-4 py-3 text-12 text-[var(--text-secondary)]">
+                    {t(organizationAccessErrorKey)}
+                  </p>
+                ) : null}
+
+                {availableMarketItems.length > 0 ? (
+                  customGroups && customGroups.length > 1 ? (
+                    <div className="flex flex-col gap-6">
+                      {customGroups.map(([marketName, groupItems]) => (
+                        <section key={marketName || 'unknown-source'}>
+                          <header className="mb-3 flex items-baseline gap-2">
+                            <h3 className="text-14 font-medium text-[var(--text-primary)]">
+                              {marketName || t('settings.ghosts.page.origin.custom')}
+                            </h3>
+                            <span className="text-12 tabular-nums text-[var(--text-tertiary)]">
+                              {groupItems.length}
+                            </span>
+                          </header>
+                          <div
+                            className={cn(
+                              'plugin-motion-stagger',
+                              PLUGIN_MANAGEMENT_CARD_GRID_CLASS,
+                            )}
+                          >
+                            {groupItems.map((item) => (
+                              <MarketPluginCard
+                                key={item.pluginId}
+                                item={item}
+                                busy={marketBusyId !== null}
+                                pending={marketBusyId === item.pluginId}
+                                onSelect={() => void handleSelectMarket(item.pluginId)}
+                                onInstall={
+                                  canOfferMarketInstall(mode, item.ghostId)
+                                    ? () => void handleInstallMarketItem(item.pluginId)
+                                    : undefined
+                                }
+                                onIconLoadError={handleMarketIconLoadError}
+                              />
+                            ))}
+                          </div>
+                        </section>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className={cn('plugin-motion-stagger', PLUGIN_MANAGEMENT_CARD_GRID_CLASS)}>
+                      {availableMarketItems.map((item) => (
+                        <MarketPluginCard
+                          key={item.pluginId}
+                          item={item}
+                          busy={marketBusyId !== null}
+                          pending={marketBusyId === item.pluginId}
+                          onSelect={() => void handleSelectMarket(item.pluginId)}
+                          onInstall={
+                            canOfferMarketInstall(mode, item.ghostId)
+                              ? () => void handleInstallMarketItem(item.pluginId)
+                              : undefined
+                          }
+                          onIconLoadError={handleMarketIconLoadError}
+                        />
+                      ))}
+                    </div>
+                  )
+                ) : marketSnapshot?.unavailableReason ||
+                  marketSnapshot?.organizationAccessError ||
+                  marketSnapshot?.unavailableCustomSourceNames.length ? null : (
+                  <div className="rounded-xl border-[0.5px] border-[var(--border-default)] px-5 py-10 text-center">
+                    <p className="text-13 text-[var(--text-secondary)]">
+                      {t('settings.ghosts.page.emptyFiltered')}
+                    </p>
+                  </div>
+                )}
+              </section>
+            ) : null}
+            </MyPublishesSectionVisibilityGate>
+          </PluginManagementPage>
+        </main>
+        {panelAside}
+      </div>
+      <AddMarketplaceDialog
+        open={addMarketplaceOpen}
+        onOpenChange={setAddMarketplaceOpen}
+        onSourcesChanged={() => void refreshMarket()}
+      />
+      {updateRows ? (
+        <UpdateAllDialog
+          open={updateDialogOpen}
+          rows={updateRows}
+          iconByGhostId={new Map(ghosts.map((ghost) => [ghost.manifest.id, ghost.iconDataUrl]))}
+          onClose={() => setUpdateDialogOpen(false)}
+        />
+      ) : null}
+    </PluginManagementLayout>
+  );
+}
+
+export function LegacyGhostRecoveryNotice({
+  status,
+  retrying,
+  onRetry,
+}: {
+  status: LegacyGhostRecoveryStatus;
+  retrying: boolean;
+  onRetry: () => void;
+}) {
+  const { t } = useTranslation();
+  if (status.state === 'none') return null;
+  const messageKey =
+    status.state === 'claimed-by-other-owner'
+      ? 'settings.ghosts.legacyRecovery.claimedByOtherOwner'
+      : status.state === 'partial' || status.canRetry
+        ? status.canRetry
+          ? 'settings.ghosts.legacyRecovery.partial'
+          : 'settings.ghosts.legacyRecovery.partialBlocked'
+        : 'settings.ghosts.legacyRecovery.deferred';
+  return (
+    <div className="rounded-xl border-[0.5px] border-[var(--border-default)] bg-[var(--surface-elevated)] px-5 py-6 text-left">
+      <p className="text-14 font-medium text-[var(--text-primary)]">
+        {t('settings.ghosts.legacyRecovery.title')}
+      </p>
+      <p className="mt-2 text-13 leading-5 text-[var(--text-secondary)]">
+        {t(messageKey, { count: status.legacyPluginCount })}
+      </p>
+      {status.canRetry ? (
+        <Button
+          variant="secondary"
+          size="lg"
+          loading={retrying}
+          type="button"
+          onClick={onRetry}
+          disabled={retrying}
+          className="mt-4"
+        >
+          {t('settings.ghosts.legacyRecovery.retry')}
+        </Button>
+      ) : null}
+    </div>
+  );
+}
+
+export function MarketPluginCard({
+  item,
+  busy,
+  pending = false,
+  onSelect,
+  onInstall,
+  onIconLoadError,
+}: {
+  item: PluginMarketItem;
+  busy: boolean;
+  /** 本卡正在安装:主按钮换成 Spinner。 */
+  pending?: boolean;
+  onSelect: () => void;
+  /** 卡片直接安装；卡片正文、右侧空白与右上角箭头都进入详情。 */
+  onInstall?: () => void;
+  onIconLoadError: () => void;
+}) {
+  const { t } = useTranslation();
+  const metadataId = useId();
+  const marketIcon = usePluginMarketIcon(item, { deferUntilVisible: true });
+  const unavailable = busy;
+  const replacementDescriptionId = useId();
+  const replacementDescription =
+    item.installState === 'conflict' ? t('settings.ghosts.market.replaceDescription') : undefined;
+  return (
+    <article
+      className={cn(
+        'group flex min-h-[108px] w-full select-none items-start gap-4 rounded-xl border-[0.5px] border-[var(--border-default)] bg-[var(--surface-elevated)] p-4 text-left',
+        'transition-[background-color,border-color,transform] duration-150 ease-out',
+        'hover:-translate-y-px hover:border-[var(--text-tertiary)] hover:bg-[var(--surface-hover-soft)]',
+        'active:translate-y-0 active:scale-[0.992] motion-reduce:transform-none motion-reduce:transition-none',
+      )}
+    >
+      <button
+        type="button"
+        onClick={onSelect}
+        disabled={unavailable}
+        aria-label={item.name}
+        aria-describedby={replacementDescription ? `${metadataId} ${replacementDescriptionId}` : metadataId}
+        className={cn(
+          'flex min-w-0 flex-1 items-start gap-4 self-stretch text-left',
+          'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)]',
+          unavailable ? 'cursor-wait' : 'cursor-pointer',
+        )}
+      >
+        <GhostPluginIcon
+          iconContainerRef={marketIcon.containerRef}
+          iconDataUrl={marketIcon.iconDataUrl}
+          iconId={item.ghostId}
+          iconName={item.name}
+          onIconLoad={marketIcon.onIconLoad}
+          onIconLoadError={() => marketIcon.onIconLoadError(onIconLoadError)}
+        />
+        <span className="flex min-w-0 flex-1 flex-col self-stretch pt-0.5">
+          <span className="truncate text-15 font-medium text-[var(--text-primary)]">
+            {item.name}
+          </span>
+          <span id={metadataId} className="mt-1 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 text-11 text-[var(--text-tertiary)]">
+            <span className="shrink-0">
+              {t(`settings.ghosts.page.origin.${pluginPresentationOrigin(item)}`)}
+            </span>
+            {item.author ? (
+              <>
+                <span aria-hidden="true">·</span>
+                <span className="min-w-0 max-w-[120px] truncate">{item.author}</span>
+              </>
+            ) : null}
+            <PluginSharedUsage detail={item} variant="list" />
+          </span>
+          <span
+            id={replacementDescription ? replacementDescriptionId : undefined}
+            className="mt-1.5 line-clamp-2 text-13 leading-5 text-[var(--text-secondary)]"
+          >
+            {replacementDescription ?? (item.description || item.ghostId)}
+          </span>
+        </span>
+      </button>
+      <div className="relative flex min-h-[76px] min-w-8 shrink-0 flex-col items-end justify-end self-stretch">
+        <button
+          type="button"
+          onClick={onSelect}
+          disabled={unavailable}
+          aria-label={t('settings.ghosts.market.detailsAria', { name: item.name })}
+          aria-describedby={replacementDescription ? replacementDescriptionId : undefined}
+          className={cn(
+            'group/market-details absolute inset-0 flex items-start justify-end rounded-xl text-[var(--text-tertiary)]',
+            'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)] disabled:cursor-not-allowed disabled:opacity-40',
+          )}
+        >
+          <span
+            className={cn(
+              'grid size-8 shrink-0 place-items-center rounded-full',
+              'transition-[background-color,color,transform] duration-150 group-hover/market-details:bg-[var(--surface-hover-soft)] group-hover/market-details:text-[var(--text-primary)] group-active/market-details:scale-[0.96]',
+            )}
+          >
+            <ChevronRight size={16} aria-hidden="true" />
+          </span>
+        </button>
+        {onInstall ? (
+          <Button
+            variant="secondary"
+            size="md"
+            compact
+            loading={pending}
+            type="button"
+            onClick={(event) => {
+              event.stopPropagation();
+              onInstall();
+            }}
+            disabled={unavailable}
+            aria-busy={pending || undefined}
+            aria-label={
+              item.installState === 'conflict'
+                ? t('settings.ghosts.market.replaceAria', { name: item.name })
+                : t('settings.ghosts.page.installAria', { name: item.name })
+            }
+            aria-describedby={replacementDescription ? replacementDescriptionId : undefined}
+            className="relative z-[1] min-w-[72px] shrink-0"
+          >
+            {t(
+              item.installState === 'conflict'
+                ? 'settings.ghosts.market.replace'
+                : 'settings.ghosts.market.install',
+            )}
+          </Button>
+        ) : null}
+      </div>
+    </article>
+  );
+}
+
+/**
+ * 已安装插件卡片(设计定稿):
+ * - 整卡可点 = 进详情(与滑杆管理入口同目标);
+ * - 主动作留在右下角胶囊(面板「使用」/ 指令或能力「对话」/ 工具型无按钮);
+ * - 无启用开关(收进详情页);滑杆图标 = 管理入口;
+ * - 更新 = 文字胶囊「更新到 vX」,无任何小圆点(绿点专职未读语义,PR-B 接入)。
+ */
+export function GhostPluginCard({
+  item,
+  readOnly = false,
+  sourceLabel,
+  showLocalUnread = true,
+  marketItem,
+  author,
+  updateVersion,
+  updateNeedsConsent = false,
+  updateBusy = false,
+  updatePending = false,
+  onUpdate,
+  effectiveEnabled,
+  onPrimary,
+  onManage,
+  onIconLoadError,
+}: {
+  item: Pick<GhostPluginListItem, 'id' | 'name' | 'description'> & Partial<GhostPluginListItem>;
+  readOnly?: boolean;
+  sourceLabel?: string;
+  showLocalUnread?: boolean;
+  marketItem?: PluginMarketItem | null;
+  author?: string | null;
+  /** 市场存在新版本时的目标版本;与 onUpdate 同时提供。 */
+  updateVersion?: string;
+  /** 新版本权限变多、后台更新已暂停等用户确认(Main 按真实包判定)。 */
+  updateNeedsConsent?: boolean;
+  updateBusy?: boolean;
+  updatePending?: boolean;
+  onUpdate?: () => void;
+  effectiveEnabled?: boolean;
+  onPrimary: () => void;
+  onManage: () => void;
+  onIconLoadError?: () => void;
+}) {
+  const { t } = useTranslation();
+  const metadataId = useId();
+  const enabled = effectiveEnabled ?? item.enabled;
+  // 远程列表不投影本机同名插件的未读状态。
+  const localUnread = useGhostUnread(item.id);
+  const localUnreadSummary = useGhostUnreadSummary(item.id);
+  const unread = showLocalUnread && localUnread;
+  const unreadSummary = showLocalUnread ? localUnreadSummary : undefined;
+  const primary = ghostPrimaryAction({
+    canUse: item.canUse ?? false,
+    tabPanel: item.tabPanel ?? false,
+  });
+  const handleCardKeyDown = (event: KeyboardEvent<HTMLElement>) => {
+    if (event.target !== event.currentTarget) return;
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    event.preventDefault();
+    onManage();
+  };
+  let primaryControl: ReactNode;
+  if (readOnly) {
+    primaryControl = (
+      <CardPillButton onClick={onManage} label={t('settings.ghosts.market.details')} />
+    );
+  } else if (item.retirement) {
+    primaryControl = (
+      <CardPillButton onClick={onManage} label={t('settings.ghosts.retirement.view')} />
+    );
+  } else if (!enabled) {
+    primaryControl = (
+      <CardPillButton onClick={onManage} label={t('settings.ghosts.page.manageAction')} />
+    );
+  } else if (primary === 'panel') {
+    primaryControl = (
+      <CardPillButton
+        onClick={onPrimary}
+        label={t('settings.ghosts.page.usePanelAction')}
+        ariaLabel={t('settings.ghosts.page.useAria', { name: item.name })}
+      />
+    );
+  } else if (primary === 'command') {
+    primaryControl = (
+      <CardPillButton
+        onClick={onPrimary}
+        icon={<MessageCircle size={13} aria-hidden="true" />}
+        label={t('settings.ghosts.page.chatAction')}
+        ariaLabel={t('settings.ghosts.page.chatAria', { name: item.name })}
+      />
+    );
+  } else {
+    primaryControl = (
+      <span className="flex items-center gap-1.5 whitespace-nowrap text-11 text-[var(--text-tertiary)]">
+        <Bot size={13} aria-hidden="true" />
+        {t('settings.ghosts.page.agentInvoked')}
+      </span>
+    );
+  }
+  return (
+    <article
+      role="button"
+      tabIndex={0}
+      onClick={onManage}
+      onKeyDown={handleCardKeyDown}
+      aria-label={item.name}
+      aria-describedby={metadataId}
+      className={cn(
+        'group flex min-h-[108px] w-full cursor-pointer select-none items-start gap-4 rounded-xl border-[0.5px] border-[var(--border-default)] bg-[var(--surface-elevated)] p-4 text-left',
+        'transition-[background-color,border-color,transform] duration-150 ease-out',
+        'hover:-translate-y-px hover:border-[var(--text-tertiary)] hover:bg-[var(--surface-hover-soft)]',
+        'active:translate-y-0 active:scale-[0.992]',
+        'motion-reduce:transform-none motion-reduce:transition-none',
+        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)]',
+        enabled === false && !item.retirement && 'opacity-60',
+      )}
+    >
+      <GhostPluginIcon
+        iconDataUrl={item.iconDataUrl}
+        iconId={item.id}
+        iconName={item.name}
+        onIconLoadError={onIconLoadError}
+      />
+      <span className="flex min-w-0 flex-1 flex-col self-stretch pt-0.5">
+        <span className="flex min-w-0 items-center gap-1.5">
+          <span className="truncate text-15 font-medium text-[var(--text-primary)]">
+            {item.name}
+          </span>
+          {item.retirement?.unread ? (
+            <AttentionDot tone="awaiting" size={6} className="mt-px" />
+          ) : unread ? (
+            <AttentionDot breathing size={6} className="mt-px" />
+          ) : null}
+        </span>
+        <span
+          id={metadataId}
+          className="mt-1 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 text-11 text-[var(--text-tertiary)]"
+        >
+          {sourceLabel ? <span className="shrink-0">{sourceLabel}</span> : null}
+          {author ? (
+            <>
+              {sourceLabel ? <span aria-hidden="true">·</span> : null}
+              <span className="min-w-0 max-w-[120px] truncate">{author}</span>
+            </>
+          ) : null}
+          {marketItem ? <PluginSharedUsage detail={marketItem} variant="list" /> : null}
+          {readOnly && item.version ? <span>v{item.version}</span> : null}
+          {readOnly && enabled !== undefined ? (
+            <span>
+              {t(
+                enabled
+                  ? 'settings.ghosts.detail.enabledLabel'
+                  : 'settings.ghosts.detail.disabledLabel',
+              )}
+            </span>
+          ) : null}
+          {item.retirement ? (
+            <span> · {t('settings.ghosts.retirement.status')}</span>
+          ) : item.oauthAuthorizationExpired ? (
+            <span className="inline-flex items-center gap-1 text-[var(--warning-fg)]">
+              {' · '}
+              <AlertTriangle size={11} className="inline" aria-hidden="true" />
+              <span>{t('settings.ghosts.page.oauthAuthorizationExpired')}</span>
+            </span>
+          ) : updateNeedsConsent ? (
+            <span className="inline-flex items-center gap-1 text-[var(--text-secondary)]">
+              {' · '}
+              <ShieldAlert size={11} className="inline" aria-hidden="true" />
+              {t('settings.ghosts.installConsent.updateNeedsConsent')}
+            </span>
+          ) : null}
+          {!readOnly && enabled === false && !item.retirement
+            ? ` · ${t('settings.ghosts.disabledTag')}`
+            : ''}
+        </span>
+        <span
+          className={cn(
+            'mt-1.5 line-clamp-2 text-13 leading-5',
+            unreadSummary ? 'text-[var(--text-primary)]' : 'text-[var(--text-secondary)]',
+          )}
+        >
+          {item.retirement
+            ? t('settings.ghosts.retirement.cardNotice')
+            : unreadSummary || item.description || item.id}
+        </span>
+      </span>
+      {/* 仅真实控件拦截冒泡，右列空白仍可进入详情。 */}
+      <span className="flex shrink-0 flex-col items-end justify-between gap-2 self-stretch">
+        <span className="flex items-center gap-1.5">
+          {updateVersion && onUpdate ? (
+            <Button
+              variant="secondary"
+              size="sm"
+              compact
+              loading={updatePending}
+              type="button"
+              onClick={stopAnd(onUpdate)}
+              disabled={updateBusy}
+              aria-busy={updatePending || undefined}
+              aria-label={t('settings.ghosts.page.updateAria', {
+                name: item.name,
+                version: updateVersion,
+              })}
+              className="min-w-[72px]"
+            >
+              <ArrowUp size={11} className="text-[var(--text-secondary)]" aria-hidden="true" />
+              {t('settings.ghosts.page.updateTo', { version: updateVersion })}
+            </Button>
+          ) : null}
+          {!readOnly ? (
+            <button
+              type="button"
+              onClick={stopAnd(onManage)}
+              aria-label={t('settings.ghosts.page.manageAria', { name: item.name })}
+              title={t('settings.ghosts.page.manageAction')}
+              className="grid size-7 place-items-center rounded-full text-[var(--text-tertiary)] transition-colors duration-150 hover:bg-[var(--surface-hover-soft)] hover:text-[var(--text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)]"
+            >
+              <SlidersHorizontal size={14} aria-hidden="true" />
+            </button>
+          ) : null}
+        </span>
+        {primaryControl}
+      </span>
+    </article>
+  );
+}
+
+function stopAnd(handler: () => void) {
+  return (event: { stopPropagation: () => void }) => {
+    event.stopPropagation();
+    handler();
+  };
+}
+
+function CardPillButton({
+  onClick,
+  label,
+  icon,
+  ariaLabel,
+}: {
+  onClick: () => void;
+  label: string;
+  icon?: ReactNode;
+  ariaLabel?: string;
+}) {
+  return (
+    <Button
+      variant="primary"
+      size="md"
+      compact
+      type="button"
+      onClick={stopAnd(onClick)}
+      aria-label={ariaLabel ?? label}
+    >
+      {icon}
+      {label}
+    </Button>
+  );
+}

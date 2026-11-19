@@ -1,0 +1,35 @@
+{
+  "id": "zhihu-search",
+  "match": [
+    "zhihu.com"
+  ],
+  "description": "知乎搜索",
+  "access": "read",
+  "adapter": "zhihu/search",
+  "inputs": {
+    "query": {
+      "required": true,
+      "type": "str",
+      "description": "Search query"
+    },
+    "limit": {
+      "required": false,
+      "type": "int",
+      "default": 10,
+      "description": "Number of results (max 1000; use normal-sized requests)"
+    },
+    "type": {
+      "required": false,
+      "type": "str",
+      "default": "all",
+      "description": "Result type: all, answer, article, or question",
+      "choices": [
+        "all",
+        "answer",
+        "article",
+        "question"
+      ]
+    }
+  },
+  "steps": []
+}
