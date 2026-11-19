@@ -31,18 +31,9 @@
       "sharp"
     ],
     "supportedArchitectures": {
-      "os": [
-        "win32",
-        "darwin",
-        "linux"
-      ],
-      "cpu": [
-        "x64",
-        "arm64"
-      ],
-      "libc": [
-        "glibc"
-      ]
+      "os": ["current"],
+      "cpu": ["current"],
+      "libc": ["current"]
     },
     "overrides": {
       "@electron/rebuild": "^4.0.3",

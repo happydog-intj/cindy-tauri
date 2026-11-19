@@ -15,5 +15,11 @@ LIST="$(mktemp)"
   {print}' > "$LIST"
 rsync -a --files-from="$LIST" "$SRC/" "$DST/"
 rm -f "$LIST"
+# 本地改动：只装当前平台的可选依赖。上游 package.json 的 pnpm.supportedArchitectures 列了全部 os/cpu，
+# 会把 claude-agent-sdk 等的 8 个平台二进制（含 claude.exe，每个约 230 MB）全装下来。
+node -e '
+const fs=require("fs"),p=process.argv[1],j=JSON.parse(fs.readFileSync(p,"utf8"));
+j.pnpm=j.pnpm||{};j.pnpm.supportedArchitectures={os:["current"],cpu:["current"],libc:["current"]};
+fs.writeFileSync(p,JSON.stringify(j,null,2)+"\n");' "$DST/package.json"
 ( cd "$SRC" && git rev-parse HEAD ) > "$DST/.upstream-commit"
 echo "vendored $(find "$DST" -type f | wc -l) files -> $DST"
