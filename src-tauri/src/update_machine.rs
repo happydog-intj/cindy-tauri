@@ -815,7 +815,12 @@ mod tests {
         backend.state.lock().unwrap().check_delay_ms = 100;
         let m2 = m.clone();
         let t = std::thread::spawn(move || m2.check_for_update());
-        std::thread::sleep(Duration::from_millis(20));
+        // 等到第一线程真的进入 backend.check（而不是睡固定时间：CI 机器忙时 20ms 内线程可能还没起来）。
+        let started = std::time::Instant::now();
+        while backend.checks.load(Ordering::Relaxed) == 0 {
+            assert!(started.elapsed() < Duration::from_secs(5), "第一线程没有进入 backend.check");
+            std::thread::sleep(Duration::from_millis(1));
+        }
         let r = m.check_for_update(); // 在途：应等到第一线程的结果
         assert_eq!(r, "manifest_failed");
         assert_eq!(t.join().unwrap(), "manifest_failed");
