@@ -810,9 +810,11 @@ mod tests {
         let backend = MockBackend::new();
         backend.state.lock().unwrap().latest = Some("0.0.2".into());
         let (m, _) = machine("0.0.1", "manual", backend.clone(), Arc::new(MockProbe(Mutex::new(false))));
-        // check 挂起 100ms，模拟慢网络（否则在途窗口太窄，去重不触发）。
+        // check 挂起 1s，模拟慢网络。窗口要远大于 CI 机器忙时线程的调度延迟：100ms 时主线程偶尔 100ms 内
+        // 没被调度，第一个检查先结束，第二次调用就成了新一轮检查（checks=2）。1s 只拖慢这一个用例，
+        // 主线程一进入等待就会被 notify，不会真等满。
         backend.state.lock().unwrap().check_error = Some("slow".into());
-        backend.state.lock().unwrap().check_delay_ms = 100;
+        backend.state.lock().unwrap().check_delay_ms = 1000;
         let m2 = m.clone();
         let t = std::thread::spawn(move || m2.check_for_update());
         // 等到第一线程真的进入 backend.check（而不是睡固定时间：CI 机器忙时 20ms 内线程可能还没起来）。
