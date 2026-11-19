@@ -132,3 +132,24 @@ fn replays_js_golden() {
     let _ = std::fs::remove_dir_all(&dir);
     assert!(failures.is_empty(), "与 JS 实现不一致:\n{}", failures.join("\n"));
 }
+
+/// 回归：renderer 把值为 undefined 的键编码成 {"__cindy_t":"u"}，建本地任务时不能因此被当成远程 / 协同会话拒绝。
+#[test]
+fn create_ignores_undefined_remote_fields_but_rejects_real_ones() {
+    let dir = std::env::temp_dir().join(format!("local-db-undef-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let env = Arc::new(TestEnv { now: AtomicI64::new(1_700_000_000_000), uuids: AtomicUsize::new(0), bytes: AtomicUsize::new(0) });
+    let db = LocalDb::open(&dir, "local-v1", env, Arc::new(Sink::default())).unwrap();
+    let undef = json!({ "__cindy_t": "u" });
+    let ok = db.invoke(
+        "local-db:sessions:create",
+        &[json!({ "id": "u1", "agentKind": "pi", "model": "m", "workspaceKind": "dialogue", "remoteHostId": undef, "agentDeviceId": undef, "orcaRole": undef })],
+    );
+    assert!(ok.is_ok(), "undefined 标记被当成了远程字段: {ok:?}");
+    for k in ["remoteHostId", "agentDeviceId", "orcaRole"] {
+        let err = db.invoke("local-db:sessions:create", &[json!({ "id": format!("r-{k}"), "agentKind": "pi", "model": "m", k: "x" })]).unwrap_err();
+        assert!(err.starts_with("[NOT_IMPLEMENTED]"), "{k}: {err}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

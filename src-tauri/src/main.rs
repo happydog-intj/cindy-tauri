@@ -287,7 +287,15 @@ fn runtime_info(app: AppHandle) -> Value {
 async fn ipc_invoke(webview: Webview, channel: String, payload: String) -> Result<Value, String> {
     browser::require_main(&webview)?;
     let app = webview.app_handle().clone();
-    ipc_invoke_core(&app, Some(&webview), channel, payload).await
+    let name = channel.clone();
+    let r = ipc_invoke_core(&app, Some(&webview), channel, payload).await;
+    // 兜底通道（fallback.rs）已经自己记过；这里补上 local-db:/maker: 等原生通道，建任务失败时日志里才有错误码。
+    if let Err(e) = &r {
+        if !e.starts_with("[NOT_IMPLEMENTED]") && (name.starts_with("local-db:") || name.starts_with("maker:")) {
+            eprintln!("[ipc] invoke {name} failed: {}", e.lines().next().unwrap_or("").chars().take(300).collect::<String>());
+        }
+    }
+    r
 }
 
 /// invoke 路由内核。`webview` 为 None = 设备互联的远程调用（没有窗口，fullscreen 之类按未全屏处理）。

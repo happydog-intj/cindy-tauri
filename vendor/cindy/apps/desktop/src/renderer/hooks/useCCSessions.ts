@@ -193,6 +193,9 @@ export function useCCSessions(options?: UseCCSessionsOptions): UseCCSessionsRetu
         sessionsStore.prependCreated(newSession);
         return newSession;
       } catch (err) {
+        // 本地改动(cindy-tauri)：建任务失败的真实原因原先只存 state，界面只弹通用提示，日志里什么都没有。
+        console.error('[createSession failed]', err);
+        void window.electronAPI?.logToMain?.('error', 'useCCSessions', `createSession failed: ${err instanceof Error ? err.message : String(err)} | opts: ${JSON.stringify({ ...opts, extraDirs: undefined, writableDirs: undefined })}`);
         setError(err instanceof Error ? err : new Error(String(err)));
         // The caller needs this invocation's error before React commits setError.
         onCreateError?.(err);

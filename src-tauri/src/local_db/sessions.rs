@@ -131,7 +131,8 @@ pub fn create(db: &LocalDb, conn: &Connection, body: &Value) -> Result<Value, St
         }
     }
     for k in ["remoteHostId", "agentDeviceId", "orcaRole"] {
-        if body.get(k).map(super::mapper::truthy).unwrap_or(false) {
+        // IPC 里值为 undefined 的键会编码成 {"__cindy_t":"u"} 对象，不能当成有值（否则普通本地任务也被拒）。
+        if body.get(k).filter(|v| !crate::voice_settings::is_undef(v)).map(super::mapper::truthy).unwrap_or(false) {
             return fail("NOT_IMPLEMENTED", "remote / orca sessions are not available in the Tauri build yet");
         }
     }
