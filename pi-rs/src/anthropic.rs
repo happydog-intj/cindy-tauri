@@ -145,7 +145,10 @@ pub async fn stream(
     let mut req = client.post(&url).json(&body)
         .header("anthropic-version", "2023-06-01").header("anthropic-dangerous-direct-browser-access", "true")
         .header("user-agent", concat!("pi-rs/", env!("CARGO_PKG_VERSION")));
-    if let Some(k) = model.api_key() { req = req.header("x-api-key", k); }
+    match model.auth_headers() {
+        Some(hs) => { for (k, v) in hs { req = req.header(k, v); } }
+        None => { if let Some(k) = model.api_key() { req = req.header("x-api-key", k); } }
+    }
     if !betas.is_empty() { req = req.header("anthropic-beta", betas.join(",")); }
     for (k, v) in model.headers() { req = req.header(k, v); }
     let idle = crate::retry::idle_timeout();

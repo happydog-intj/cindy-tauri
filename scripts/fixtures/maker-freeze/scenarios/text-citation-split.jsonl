@@ -1,0 +1,12 @@
+{"type": "agent_start"}
+{"type": "turn_start"}
+{"type": "message_start", "message": {"role": "user", "content": [{"type": "text", "text": "hi"}], "timestamp": 1794971128520}}
+{"type": "message_end", "message": {"role": "user", "content": [{"type": "text", "text": "hi"}], "timestamp": 1794971128520}}
+{"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "contentIndex": 0, "delta": "see\ue200ci"}, "message": {"role": "assistant", "content": []}}
+{"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "contentIndex": 0, "delta": "te\ue202turn0"}, "message": {"role": "assistant", "content": []}}
+{"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "contentIndex": 0, "delta": "search1\ue201 done"}, "message": {"role": "assistant", "content": []}}
+{"type": "message_start", "message": {"role": "assistant", "content": [], "api": "openai-completions", "provider": "smoke", "model": "mock-model", "usage": {"input": 10, "output": 4, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 14, "reasoning": 0, "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}}, "stopReason": "stop", "timestamp": 1794971128900}}
+{"type": "message_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "see\ue200cite\ue202turn0search1\ue201 done"}], "api": "openai-completions", "provider": "smoke", "model": "mock-model", "usage": {"input": 10, "output": 4, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 14, "reasoning": 0, "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}}, "stopReason": "stop", "timestamp": 1794971128900}}
+{"type": "turn_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "see\ue200cite\ue202turn0search1\ue201 done"}], "api": "openai-completions", "provider": "smoke", "model": "mock-model", "usage": {"input": 10, "output": 4, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 14, "reasoning": 0, "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}}, "stopReason": "stop", "timestamp": 1794971128900}, "toolResults": []}
+{"type": "agent_end", "messages": []}
+{"type": "agent_settled", "aborted": false}

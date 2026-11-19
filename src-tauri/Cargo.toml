@@ -10,7 +10,23 @@ tauri-build = { version = "2", features = [] }
 # unstable：Window::add_child（浏览器面板的子 webview）需要。
 tauri = { version = "2", features = ["tray-icon", "image-png", "unstable"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
+regex = "1"
+serde_yaml = "0.9"
+percent-encoding = "2"
+url = "2"
+sys-locale = "0.3"
+# 桌面版导入：解 Electron safeStorage（Chromium os_crypt v10）的 .enc。
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+aes-gcm = "0.10"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+sha1 = "0.10"
+sha2 = "0.10"
+base64 = "0.22"
+# 用量历史的 todayKey 要本地日期。
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+uuid = { version = "1", features = ["v4"] }
 # 主密钥存系统钥匙串：macOS Keychain / Windows 凭据管理器。
 keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native"] }
 getrandom = "0.3"
@@ -18,17 +34,33 @@ tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-updater = "2.14.1"
+# 账号登录的 HTTP 客户端与异步运行时（二者本就经 tauri / updater 在依赖树里）。
+tokio = { version = "1", features = ["time", "sync", "rt", "macros"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+indexmap = "2.14.2"
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 
 # 浏览器面板的前进 / 后退 / 停止：Tauri 没有封装，直接调原生 webview。版本跟 wry 用的一致。
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "objc2-app-kit", "WKWebView", "WKNavigation"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSURL"] }
 
+# 右侧栏终端的 PTY：替代 node-pty（macOS fork/exec，Windows ConPTY）。
+portable-pty = "0.9"
+
+# 本地库引擎：Rust 持有 SQLite（差距清单 #3），经 127.0.0.1 行协议暴露给 sidecar。
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-core = "0.62"
 # 从桌面版导入时用 DPAPI 解开 Electron safeStorage 的 AES key。
 # 自动更新的「空闲时重启」用 GetLastInputInfo 取系统无操作时长。
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_SystemInformation", "Win32_UI_Input_KeyboardAndMouse"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util", "net", "io-util"] }
 
 [profile.release]
 codegen-units = 1

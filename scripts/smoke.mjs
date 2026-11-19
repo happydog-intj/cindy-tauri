@@ -1,4 +1,4 @@
-// 冒烟测试：启动已打包的应用（CINDY_TAURI_SMOKE=1），等待其写出结果文件，判断 sidecar 通信是否成功。
+// 冒烟测试：启动已打包的应用（CINDY_TAURI_SMOKE=1），等待其写出结果文件，判断宿主自检与 pi-rs 是否就绪。
 // 用法：node scripts/smoke.mjs <可执行文件路径> [--session]
 // --session：先启动 scripts/mock-openai.mjs，用同一个临时数据目录连续启动应用两次
 //   （CINDY_TAURI_SESSION_SMOKE=run 再 =verify），两次都 ok 才算通过。

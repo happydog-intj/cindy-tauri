@@ -1,0 +1,9 @@
+{"type": "agent_start"}
+{"type": "turn_start"}
+{"type": "message_start", "message": {"role": "user", "content": [{"type": "text", "text": "hi"}], "timestamp": 1794971128520}}
+{"type": "message_end", "message": {"role": "user", "content": [{"type": "text", "text": "hi"}], "timestamp": 1794971128520}}
+{"type": "message_start", "message": {"role": "assistant", "content": [], "api": "openai-completions", "provider": "smoke", "model": "mock-model", "usage": {"input": 10, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 10, "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}}, "stopReason": "pending", "timestamp": 1794971128520, "responseId": "mock-1"}}
+{"type": "message_end", "message": {"role": "assistant", "content": [], "api": "openai-completions", "provider": "smoke", "model": "mock-model", "usage": {"input": 10, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 10, "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}}, "stopReason": "error", "timestamp": 1794971128520, "responseId": "mock-1", "errorMessage": "401 invalid api key"}}
+{"type": "turn_end", "message": {"role": "assistant", "content": [], "api": "openai-completions", "provider": "smoke", "model": "mock-model", "usage": {"input": 10, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 10, "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}}, "stopReason": "error", "timestamp": 1794971128520, "responseId": "mock-1", "errorMessage": "401 invalid api key"}}
+{"type": "agent_end", "messages": []}
+{"type": "agent_settled", "aborted": false}

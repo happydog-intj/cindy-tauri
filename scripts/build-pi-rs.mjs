@@ -1,4 +1,4 @@
-// 编译 pi-rs（Rust 版 Pi）并放到 sidecar/dist/pi-rs/，供 Tauri 作为资源随包。
+// 编译 pi-rs（Rust 版 Pi）并放到 resources/pi-rs/，供 Tauri 作为资源随包。
 // 用法：node scripts/build-pi-rs.mjs [目标三元组]，默认按当前机器。需要 Rust 工具链。
 import { execFileSync } from 'node:child_process';
 import { chmodSync, copyFileSync, mkdirSync, rmSync, statSync } from 'node:fs';
@@ -14,7 +14,7 @@ if (triple) args.push('--target', triple);
 execFileSync('cargo', args, { stdio: 'inherit' });
 
 const built = path.join(root, 'pi-rs', 'target', ...(triple ? [triple] : []), 'release', win ? 'pi.exe' : 'pi');
-const outDir = path.join(root, 'sidecar', 'dist', 'pi-rs');
+const outDir = path.join(root, 'resources', 'pi-rs');
 rmSync(outDir, { recursive: true, force: true });
 mkdirSync(outDir, { recursive: true });
 const dest = path.join(outDir, win ? 'pi.exe' : 'pi');

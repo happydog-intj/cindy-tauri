@@ -23,7 +23,7 @@ export function installRendererSmoke() {
   const finish = async (rendered, renderer) => {
     let stats = null;
     try {
-      stats = await invoke('sidecar_call', { method: 'ipc.stats', params: {} });
+      stats = await invoke('ipc_stats', {});
     } catch (err) {
       stats = { error: String(err) };
     }
@@ -122,7 +122,7 @@ async function waitStable(ms = 1500, max = 8000) {
 async function runSettingsTour(invoke, errors) {
   const tabs = [];
   let ok = true;
-  const stats = async () => invoke('sidecar_call', { method: 'ipc.stats', params: {} }).catch(() => null);
+  const stats = async () => invoke('ipc_stats', {}).catch(() => null);
   let before = await stats();
   for (const tab of SETTINGS_TABS) {
     const errCount = errors.length;
@@ -211,7 +211,7 @@ async function runBrowserSmoke(base) {
       const probe = `(() => { window.__smokeIpc = {}; const i = window.__TAURI_INTERNALS__;
         if (!i) { window.__smokeIpc = { done: true, internals: false }; return 0; }
         const one = (cmd, args) => i.invoke(cmd, args).then(() => 'allowed', (e) => 'denied: ' + String(e).slice(0, 120));
-        Promise.all([one('ipc_invoke', { channel: 'app:get-version', payload: '[]' }), one('sidecar_call', { method: 'ping', params: {} }),
+        Promise.all([one('ipc_invoke', { channel: 'app:get-version', payload: '[]' }), one('ipc_stats', {}),
           one('browser_op', { id: 1, op: 'state', arg: null })])
           .then((r) => { window.__smokeIpc = { done: true, internals: true, r }; });
         return 0; })()`;

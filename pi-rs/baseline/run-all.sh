@@ -67,6 +67,7 @@ if skip_orig_step "scenarios vs original"; then :; else
 step "scenarios vs original"; (cd $B && ./compare.sh "$ORIG" "$PI") >$T/cmp.log 2>&1; res $? $T/cmp.log
 fi
 step "bridge behaviour"; (cd $B && PI_BIN="$PI" run 60 node bridge-test.mjs) >$T/bridge.log 2>&1; res $? $T/bridge.log
+step "permission wire (24)"; run 240 node $B/permission-test.mjs >$T/perm.log 2>&1; res $? $T/perm.log
 step "stress (3x150 rounds)"; for sd in 1 2 3; do (cd $B && PI_BIN="$PI" SEED=$sd ROUNDS=150 run 250 node stress-test.mjs) >>$T/stress.log 2>&1 || { false; break; }; done; res $? $T/stress.log
 step "per-session fallback"; PI_BIN="$PI" run 60 node $B/fallback-test.mjs >$T/fb.log 2>&1; res $? $T/fb.log
 

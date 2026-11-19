@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
 
 env:
-  # 与本地验证用的 cindy 版本一致；cindy-headless 0.4.3。
+  # 与本地验证用的 cindy 版本一致。
   CINDY_REF: 628f32170e046cdb5869ac58ccac7b201c748495
 
 jobs:
@@ -38,7 +38,7 @@ jobs:
       - name: Install JS dependencies
         run: npm ci
 
-      # cindy-headless：按固定 commit 检出，只装它自己的依赖，跳过 postinstall（会拉 Electron 和 agent 二进制）。
+      # cindy：按固定 commit 检出，只装 desktop 的依赖，跳过 postinstall（会拉 Electron 和 agent 二进制）。
       - uses: actions/checkout@v4
         with:
           repository: makecindy/cindy
@@ -49,11 +49,9 @@ jobs:
         with:
           package_json_file: .cache/cindy/package.json
 
-      - name: Build cindy-headless
+      - name: Install cindy desktop dependencies
         working-directory: .cache/cindy
-        run: |
-          pnpm install --filter cindy-headless... --filter "desktop..." --ignore-scripts
-          pnpm --filter cindy-headless build
+        run: pnpm install --filter "desktop..." --ignore-scripts
 
       # 真实 renderer：只跑 vite renderer 构建，不碰 Electron 主进程。
       - name: Build cindy renderer
@@ -64,73 +62,53 @@ jobs:
           VITE_CINDY_AUTH_REGION: global
         run: npx vite build --config vite.renderer.config.ts
 
-      # sidecar 复用 cindy desktop shared/ 下的纯函数模块。
-      - name: Build sidecar bundle
-        env:
-          CINDY_DIR: .cache/cindy
-        run: npm run sidecar:build
-
       - name: Build frontend (renderer + preload shim)
         run: node scripts/build-frontend.mjs .cache/cindy
 
-      - name: Bundle cindy-headless into sidecar
-        run: npm run headless:fetch -- .cache/cindy
-
-      # 原生模块（node-pty）：只带目标平台的预编译文件，Windows 只带 ConPTY。
-      - name: Bundle native modules into sidecar
-        run: npm run native:fetch -- ${{ matrix.triple }}
-
-      # Pi 是随包的 Rust 实现（pi-rs，源码在 pi-rs/）：编译后放到 sidecar/dist/pi-rs/，随 Tauri 资源打进安装包。
+      # Pi 是随包的 Rust 实现（pi-rs，源码在 pi-rs/）：编译后放到 resources/pi-rs/，随 Tauri 资源打进安装包。
       # 之后所有会话类 e2e 和冒烟都用它，不再下载原版 Pi。
-      - name: Build pi-rs (Rust Pi)
+      - name: Bundle pi-rs (Rust Pi)
         run: npm run pirs:build -- ${{ matrix.triple }}
 
       - name: pi-rs unit tests
         run: cargo test --release --locked --manifest-path pi-rs/Cargo.toml
 
-      - name: pi-rs resolution unit test
-        run: node scripts/pi-rs-unit.mjs
-
-      # 桌面外壳 IPC（通知 / 角标 / 对话框 / 打开链接 / 关闭行为 / 托盘文案），脚本扮演 Rust 回反向调用。
-      # sidecar 启动需要 headless/ 已打包，放在 headless:fetch 之后。
-      - name: Desktop shell e2e
-        run: node scripts/desktop-shell-e2e.mjs
-
-      - name: Settings e2e
-        run: node scripts/settings-e2e.mjs
-
-      - name: Browser panel e2e
-        run: node scripts/browser-e2e.mjs
-
-      - name: Desktop import e2e
-        run: node scripts/desktop-import-e2e.mjs
-
-      # 真实 PTY：macOS 用默认 shell，Windows 11 用 PowerShell + ConPTY。
-      - name: Terminal e2e
-        run: node scripts/terminal-e2e.mjs
+      # 真实 PTY：terminal 已迁到 Rust（src-tauri/src/terminal.rs），测试随 cargo test 跑。
+      - name: Terminal tests (Rust)
+        run: 'cargo test --release --manifest-path src-tauri/Cargo.toml terminal::'
 
       # 自动更新状态机：脚本扮演 Rust 回 update.*，覆盖检查 / 下载进度 / 失败回退 / superseding / 空闲自动重启。
-      - name: Update e2e
-        run: node scripts/update-e2e.mjs
+      # maker 事件层双产出比对：同一帧流 TS translator 与 pi-rs --replay-maker 逐字段全等。
+      - name: Maker event translation freeze
+        run: node scripts/maker-freeze.mjs
 
-      # 运行中切换模型：同来源 / 跨来源热切、回合中延期、落库、重启后按新模型重建（mock 模型，会下载 Pi）。
-      - name: Model switch e2e
-        run: node scripts/model-switch-e2e.mjs
+      # 权限门线协议：ask/allow、deny、cancelled、bypass、控制面、fail-closed（24 断言）。
+      - name: Permission wire contract
+        run: node pi-rs/baseline/permission-test.mjs
 
-      # Cindy 账号登录与云端模型：mock auth / model-access / 网关，邮箱验证码 + 浏览器登录、续期、
-      # 退出、本地网关转发（上游只见真实 key、没有内部头）、余额。
-      - name: Auth e2e
-        run: node scripts/auth-e2e.mjs
-
-      # 设备互联（被控端）：mock 中继 + 上游 DeviceLinkClient 扮演手机，列任务 / 发消息 / 远程审批 / 撤销 / 退出下线。
-      - name: Device link e2e
+      # Rust 会话宿主：本地库引擎、待处理交互表、帧分流核心、pi-rs 子进程包装。
+      # 带 PI_RS_BIN / MOCK_OPENAI 时 pi_proc 会对真实 pi-rs 跑事件流与权限门允许/拒绝两个端到端。
+      - name: Session host tests (Rust)
         env:
-          CINDY_DIR: .cache/cindy
-        run: node scripts/device-link-e2e.mjs
+          PI_RS_BIN: ${{ github.workspace }}/pi-rs/target/release/pi
+          MOCK_OPENAI: ${{ github.workspace }}/scripts/mock-openai.mjs
+          # rust_session_e2e：Rust 会话宿主 + pi-rs。覆盖会话回合 / 审批 / 带 key 的鉴权 / 重启续接、
+          # 换模型（跨来源、回合中延期并迁移队列）、goal 全部终态与 /goal 命令、网关直连、手机端 invoke 与推送、导入任务续接。
+          # device_link::e2e：mock 中继 + 上游 DeviceLinkClient 扮演手机。
+          NODE_BIN: node
+          CINDY_DIR: ${{ github.workspace }}/.cache/cindy
+        run: cargo test --release --manifest-path src-tauri/Cargo.toml
 
-      # Goal（/goal 自主续跑）：mock 模型按 [Goal] 指令回裁决块，多轮自动跑到 complete / blocked / 上限，暂停恢复，重启接着跑。
-      - name: Goal e2e
-        run: node scripts/goal-e2e.mjs
+      # 网关直连（取代本地转发器）：apiKeyFile + apiKeyHeaders 双头、轮换、空 key 不发空凭据、key 不外泄。
+      - name: Gateway key (direct)
+        run: PI_BIN=${{ github.workspace }}/pi-rs/target/release/pi node pi-rs/baseline/gateway-key-test.mjs
+
+      # 自动更新状态机已迁到 Rust（update_machine.rs），34 步行为规格随 cargo test 跑。
+      - name: Update machine tests (Rust)
+        run: 'cargo test --release --manifest-path src-tauri/Cargo.toml update_machine::'
+
+      # Cindy 账号登录与云端模型（mock auth / model-access / 网关）：auth_e2e 随上面的 cargo test 运行。
+      # 设备互联（被控端）已在 Rust：device_link::e2e（mock 中继 + 上游 DeviceLinkClient）随 cargo test 运行，见上面的 Rust 测试步骤。
 
       # 更新签名密钥：v* 标签用仓库 secret 里的正式密钥（和 tauri.conf.json 的 pubkey 配对）；
       # 其余构建用一次性密钥并覆盖 pubkey，正式私钥不进普通 CI。
@@ -151,9 +129,6 @@ jobs:
           # 更新冒烟用的「新版本」= 当前版本 patch + 1
           node -e "const c=require('./src-tauri/tauri.conf.json');const [a,b,p]=c.version.split('-')[0].split('.').map(Number);console.log('APP_VERSION='+c.version);console.log('NEXT_VERSION='+a+'.'+b+'.'+(p+1))" >> "$GITHUB_ENV"
 
-      - name: Fetch Node runtime for sidecar
-        run: npm run node:fetch -- ${{ matrix.triple }}
-
       - name: Build app
         shell: bash
         run: npx tauri build --bundles ${{ matrix.bundles }} -c "$RUNNER_TEMP/updater-ci.json"
@@ -167,7 +142,6 @@ jobs:
           APP="src-tauri/target/release/bundle/macos/Cindy Tauri.app"
           codesign --verify --deep --strict -v "$APP"
           codesign -dv "$APP" 2>&1 | grep -E '^(Identifier|Sealed Resources)='
-          "$APP/Contents/MacOS/cindy-node" -p process.version
       - name: Stage release artifacts
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash

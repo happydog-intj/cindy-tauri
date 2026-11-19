@@ -1,0 +1,2 @@
+{"type": "compaction_start", "reason": "manual"}
+{"type": "compaction_end", "reason": "manual", "result": null, "aborted": true, "willRetry": false, "errorMessage": "cancelled"}

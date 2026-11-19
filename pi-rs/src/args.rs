@@ -19,6 +19,8 @@ pub struct Args {
     pub no_context_files: bool,
     pub no_prompt_templates: bool,
     pub no_approve: bool,
+    /// maker 事件重放（scripts/maker-freeze.mjs）：读 RPC 帧 JSONL，输出 AgentEvent JSONL。
+    pub replay_maker: Option<String>,
 }
 
 pub fn parse(argv: Vec<String>) -> Result<Args, String> {
@@ -46,6 +48,7 @@ pub fn parse(argv: Vec<String>) -> Result<Args, String> {
             "--no-context-files" => a.no_context_files = true,
             "--no-prompt-templates" => a.no_prompt_templates = true,
             "--no-approve" => a.no_approve = true,
+            "--replay-maker" => a.replay_maker = Some(value("--replay-maker")?),
             other => return Err(format!("Unknown option: {other}")),
         }
     }

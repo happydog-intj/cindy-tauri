@@ -1,9 +1,8 @@
 node_modules/
 .cache/
 src-tauri/target/
-src-tauri/binaries/
 src-tauri/gen/
-sidecar/dist/
+resources/pi-rs/
 .DS_Store
 dist/
 src-tauri/preload/

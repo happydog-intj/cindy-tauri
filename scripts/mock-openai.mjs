@@ -13,6 +13,7 @@
 //   MOCK_GOAL_COMPLETE_AFTER=N  第 N 个 Goal 轮回复 complete，之前回复 continue；
 //   MOCK_GOAL_BLOCKED           直接回复 blocked；
 //   没有标记                    一直回复 continue（测轮数上限用）。
+// 慢回复：最近一条用户消息含 MOCK_SLOW 时，回复约 4 秒才结束（每段间隔 200ms），给「回合进行中」的用例留出窗口。
 // MOCK_LOG_HEADER_NAMES=1 时聊天请求日志多一个 headers 字段：只有 header 名，没有值（测转发有没有漏内部头）。
 import { createServer } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
@@ -94,6 +95,7 @@ function decide(body) {
     if (tool) return { kind: 'tool', ...tool, reason: 'trigger' };
     return { kind: 'text', text: 'no write tool available', reason: 'trigger-no-tool' };
   }
+  if (userText.includes('MOCK_SLOW')) return { kind: 'text', text: 'slow reply. '.repeat(14), reason: 'slow', slow: true };
   return { kind: 'text', text: 'Hello from mock.', reason: 'default' };
 }
 
@@ -115,7 +117,7 @@ async function streamReply(res, id, created, model, reply, includeUsageChunk) {
   const send = (choices, extra = {}) => {
     res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices, ...extra })}\n\n`);
   };
-  const tick = () => new Promise((r) => setTimeout(r, 20));
+  const tick = () => new Promise((r) => setTimeout(r, reply.slow ? 200 : 20));
   send([{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }]);
   let finish;
   if (reply.kind === 'tool') {

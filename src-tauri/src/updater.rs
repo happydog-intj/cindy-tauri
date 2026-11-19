@@ -1,9 +1,9 @@
-// P4 自动更新的原生部分（sidecar update.mjs 经反向调用 update.* 驱动）：
-// - update.check：按 tauri.conf.json 的 endpoints 读 latest.json，只认比当前版本高的发布；
-// - update.download：下载并用内置公钥校验签名（含签名里绑定的版本号），落到 <dataDir>/updates/；
-// - update.install：再次校验后安装。Windows 交给 NSIS（passive，装完由安装程序拉起新版本），
+// P4 自动更新的原生机制（update_machine.rs 的 UpdateBackend 后端）：
+// - check：按 tauri.conf.json 的 endpoints 读 latest.json，只认比当前版本高的发布；
+// - download：下载并用内置公钥校验签名（含签名里绑定的版本号），落到 <dataDir>/updates/，进度回调给状态机；
+// - install：再次校验后安装。Windows 交给 NSIS（passive，装完由安装程序拉起新版本），
 //   macOS 原地替换 .app 后重启；两边都先让 sidecar 收尾退出（关库、杀终端）；
-// - update.idleSeconds：系统级无操作时长，给「空闲时自动重启」用。
+// - idle_seconds：系统级无操作时长，给「空闲时自动重启」用。
 // 冒烟（CINDY_TAURI_SMOKE=1）可用 CINDY_TAURI_SMOKE_UPDATE_URL 指向本机 http 的 latest.json，签名校验不变。
 use crate::native;
 use serde_json::{json, Value};
@@ -20,13 +20,15 @@ static PENDING: Mutex<Option<Update>> = Mutex::new(None);
 // 但下载失败时，sidecar 回到旧的 ready，安装仍要用旧版本的这一份。
 static STAGED: Mutex<Option<(Update, PathBuf)>> = Mutex::new(None);
 static UPDATES_DIR: OnceLock<PathBuf> = OnceLock::new();
-// Windows：安装前已经让 sidecar 退出（之后安装失败只能重启回旧版本）。
-static SIDECAR_STOPPED: AtomicBool = AtomicBool::new(false);
-const SIDECAR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
 
 fn is_smoke() -> bool {
     std::env::var("CINDY_TAURI_SMOKE").as_deref() == Ok("1") && std::env::var_os("CINDY_TAURI_SMOKE_OUT").is_some()
+}
+
+// 传给 update_machine 的冒烟开关（计时覆盖 / manual 模式也评估自动重启）。
+pub fn smoke() -> bool {
+    is_smoke()
 }
 
 // 冒烟用的更新地址：只接受本机 http。
@@ -70,24 +72,14 @@ fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
-fn version_param(params: &Value) -> Result<String, String> {
-    params.get("version").and_then(Value::as_str).map(str::to_owned).ok_or_else(|| "version required".to_string())
-}
-
+// 机器侧直接传版本号；保留 version_param 给内部校验复用。
 fn check<R: Runtime>(app: &AppHandle<R>) -> Result<Value, String> {
     let handle = app.clone();
     let updater = app
         .updater_builder()
         // 不设整体 timeout（会限制下载总时长），只限制连接和读取停顿。
         .configure_client(|c| c.connect_timeout(Duration::from_secs(15)).read_timeout(Duration::from_secs(60)))
-        // Windows：启动安装程序前让 sidecar 退出，否则 cindy-node.exe 被占用无法覆盖。
-        .on_before_exit(move || {
-            if let Some(sc) = native::sidecar_handle() {
-                sc.shutdown(SIDECAR_SHUTDOWN_TIMEOUT);
-            }
-            SIDECAR_STOPPED.store(true, Ordering::SeqCst);
-            handle.cleanup_before_exit();
-        })
+        .on_before_exit(move || handle.cleanup_before_exit())
         // 冒烟：Windows 安装程序以管理员身份拉起新版本时会丢掉冒烟环境变量，改由脚本等安装完成后自己启动。
         .restart_after_install(!is_smoke())
         .build()
@@ -121,32 +113,27 @@ fn pending_for(version: &str) -> Result<Update, String> {
     }
 }
 
-fn download(params: &Value) -> Result<Value, String> {
-    let version = version_param(params)?;
-    let update = pending_for(&version)?;
+fn download(version: &str, progress: &dyn Fn(u64, u64)) -> Result<Value, String> {
+    let update = pending_for(version)?;
     let dir = UPDATES_DIR.get().ok_or("updates dir not set")?.clone();
     std::fs::create_dir_all(&dir).map_err(err)?;
-    let sc = native::sidecar_handle();
     let mut received: u64 = 0;
     let mut last = Instant::now() - PROGRESS_INTERVAL;
     // download 内部已按公钥和签名里的版本号校验，校验失败直接报错。
+    // 进度直接回调状态机（原经 sc.notify("native.updateProgress") 绕行 sidecar，状态机入主后不再绕）。
     let bytes = tauri::async_runtime::block_on(update.download(
         |chunk, total| {
             received += chunk as u64;
             if last.elapsed() >= PROGRESS_INTERVAL {
                 last = Instant::now();
-                if let Some(sc) = &sc {
-                    sc.notify("native.updateProgress", json!({ "received": received, "total": total }));
-                }
+                progress(received, total.unwrap_or(0));
             }
         },
         || {},
     ))
     .map_err(err)?;
-    if let Some(sc) = &sc {
-        let n = bytes.len() as u64;
-        sc.notify("native.updateProgress", json!({ "received": n, "total": n }));
-    }
+    let n = bytes.len() as u64;
+    progress(n, n);
     let file = dir.join(format!("update-{version}.pkg"));
     let tmp = dir.join(format!("update-{version}.pkg.part"));
     std::fs::write(&tmp, &bytes).map_err(err)?;
@@ -160,8 +147,7 @@ fn download(params: &Value) -> Result<Value, String> {
     Ok(json!({ "version": version, "size": bytes.len() }))
 }
 
-fn install<R: Runtime>(app: &AppHandle<R>, params: &Value) -> Result<Value, String> {
-    let version = version_param(params)?;
+fn install<R: Runtime>(app: &AppHandle<R>, version: &str) -> Result<Value, String> {
     let (update, file) = match STAGED.lock().map_err(err)?.as_ref() {
         Some((u, f)) if u.version == version => (u.clone(), f.clone()),
         _ => return Err(format!("[PRECONDITION_FAILED] update {version} is not downloaded")),
@@ -170,16 +156,9 @@ fn install<R: Runtime>(app: &AppHandle<R>, params: &Value) -> Result<Value, Stri
     // install 会重新校验签名；Windows 成功时在里面启动安装程序并退出进程，不会返回。
     if let Err(e) = update.install(&bytes) {
         eprintln!("[updater] install {version} failed: {e}");
-        if SIDECAR_STOPPED.load(Ordering::SeqCst) {
-            // sidecar 已退出，界面无法继续用，重启回当前版本。
-            app.restart();
-        }
         return Err(err(e));
     }
-    // macOS：新 .app 已就位。先让 sidecar 关库退出，再重启进新版本。
-    if let Some(sc) = native::sidecar_handle() {
-        sc.shutdown(SIDECAR_SHUTDOWN_TIMEOUT);
-    }
+    // macOS：新 .app 已就位，重启进新版本。
     relaunch(app)
 }
 
@@ -233,15 +212,25 @@ fn idle_seconds() -> Result<Value, String> {
     Err("[UNSUPPORTED_CAPABILITY] idle time".into())
 }
 
-pub fn run<R: Runtime>(app: &AppHandle<R>, method: &str, params: &Value) -> Result<Value, String> {
-    if mode() == "off" {
-        return Err("[UNSUPPORTED_CAPABILITY] updates are disabled in this build".into());
+// idle_seconds 的数值形式（状态机用）。
+pub fn idle_seconds_value() -> Result<f64, String> {
+    idle_seconds()?.as_f64().ok_or_else(|| "idle time parse failed".into())
+}
+
+// ── UpdateBackend 适配（update_machine.rs 用）────────────────────────
+pub struct NativeUpdateBackend<R: Runtime>(pub AppHandle<R>);
+
+impl<R: Runtime> crate::update_machine::UpdateBackend for NativeUpdateBackend<R> {
+    fn check(&self) -> Result<Value, String> {
+        check(&self.0)
     }
-    match method {
-        "update.check" => check(app),
-        "update.download" => download(params),
-        "update.install" => install(app, params),
-        "update.idleSeconds" => idle_seconds(),
-        other => Err(format!("[NOT_IMPLEMENTED] native method {other}")),
+    fn download(&self, version: &str, progress: &dyn Fn(u64, u64)) -> Result<Value, String> {
+        download(version, progress)
+    }
+    fn install(&self, version: &str) -> Result<Value, String> {
+        install(&self.0, version)
+    }
+    fn idle_seconds(&self) -> Result<f64, String> {
+        idle_seconds_value()
     }
 }

@@ -1,0 +1,53 @@
+{
+ "zh-CN": {
+  "title": "从 Cindy 桌面版导入",
+  "message": "在这台电脑上找到 Cindy 桌面版的数据：{sessions} 个任务、{providers} 个自定义模型服务。要导入到这里吗？",
+  "detail": "只读取桌面版数据，不会修改或删除它。导入 API key 时，macOS 可能会请求访问钥匙串项目“Cindy Safe Storage”，请点“允许”。",
+  "later": "以后再说",
+  "import": "导入",
+  "never": "不再提醒",
+  "doneTitle": "导入完成",
+  "done": "已导入 {sessions} 个任务、{messages} 条消息、{providers} 个模型服务。",
+  "notes": "需要留意：",
+  "keyMissing": "{n} 个模型服务的 API key 没有导入，请在 设置 → 模型服务 里重新填写。",
+  "workdirs": "{n} 个任务的工作文件超过 1 GB，没有复制，这些任务继续使用桌面版目录里的原文件。",
+  "providerSkipped": "{n} 个模型服务暂不支持（OAuth、自定义请求头或非 Pi 运行时）。",
+  "failedTitle": "导入失败",
+  "failed": "没有完成导入：{error}。桌面版数据没有改动，下次启动时会再询问。",
+  "ok": "好"
+ },
+ "zh-TW": {
+  "title": "從 Cindy 桌面版匯入",
+  "message": "在這台電腦上找到 Cindy 桌面版的資料：{sessions} 個任務、{providers} 個自訂模型服務。要匯入到這裡嗎？",
+  "detail": "只讀取桌面版資料，不會修改或刪除它。匯入 API key 時，macOS 可能會要求存取鑰匙圈項目「Cindy Safe Storage」，請按「允許」。",
+  "later": "以後再說",
+  "import": "匯入",
+  "never": "不再提醒",
+  "doneTitle": "匯入完成",
+  "done": "已匯入 {sessions} 個任務、{messages} 則訊息、{providers} 個模型服務。",
+  "notes": "需要留意：",
+  "keyMissing": "{n} 個模型服務的 API key 沒有匯入，請在 設定 → 模型服務 重新填寫。",
+  "workdirs": "{n} 個任務的工作檔案超過 1 GB，沒有複製，這些任務繼續使用桌面版目錄裡的原檔案。",
+  "providerSkipped": "{n} 個模型服務暫不支援（OAuth、自訂請求標頭或非 Pi 執行環境）。",
+  "failedTitle": "匯入失敗",
+  "failed": "沒有完成匯入：{error}。桌面版資料沒有改動，下次啟動時會再詢問。",
+  "ok": "好"
+ },
+ "en": {
+  "title": "Import from Cindy desktop",
+  "message": "Found Cindy desktop data on this computer: {sessions} tasks and {providers} custom model providers. Import them here?",
+  "detail": "The desktop data is only read, never changed or deleted. When importing API keys, macOS may ask for access to the keychain item \"Cindy Safe Storage\"; choose Allow.",
+  "later": "Not now",
+  "import": "Import",
+  "never": "Don't ask again",
+  "doneTitle": "Import complete",
+  "done": "Imported {sessions} tasks, {messages} messages and {providers} model providers.",
+  "notes": "Please note:",
+  "keyMissing": "API keys for {n} providers were not imported; enter them again in Settings → Model Providers.",
+  "workdirs": "Working files for {n} tasks are larger than 1 GB and were not copied; those tasks keep using the originals in the desktop folder.",
+  "providerSkipped": "{n} providers are not supported yet (OAuth, custom headers or a non-Pi runtime).",
+  "failedTitle": "Import failed",
+  "failed": "The import did not finish: {error}. Desktop data was not changed; you will be asked again next launch.",
+  "ok": "OK"
+ }
+}

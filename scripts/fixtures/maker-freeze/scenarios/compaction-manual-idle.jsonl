@@ -1,0 +1,2 @@
+{"type": "compaction_start", "reason": "manual"}
+{"type": "compaction_end", "reason": "manual", "result": {"summary": "s", "tokensBefore": 50000, "estimatedTokensAfter": 8000}, "aborted": false, "willRetry": false}

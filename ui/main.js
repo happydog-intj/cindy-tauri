@@ -5,50 +5,17 @@ function show(value) {
   out.textContent = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
 }
 
-const call = (method, params = {}) => invoke('sidecar_call', { method, params });
-
-// 基础检查：sidecar 通信 + cindy-headless 可用。
+// 基础检查：Rust 宿主可达 + 随包 pi-rs 就绪。
 async function basicChecks() {
-  const result = {};
-  result.ping = await call('ping');
-  result.info = await call('info');
-  result.echo = await call('echo', { hello: 'cindy' });
-  result.headless = await call('headless.version');
-  const caps = await call('headless.capabilities', { profile: 'cindy-production-pi/profile.example.json' });
-  result.headlessCapabilities = { agentBackend: caps.agentBackend, profileId: caps.profileId };
-  return result;
+  return invoke('runtime_info');
 }
 
-// 冒烟任务：让 agent 在临时工作目录里写一个文件，并回复固定文本。
-const SMOKE_TASK = 'Create a file named hello.txt containing exactly the text: hello from cindy-tauri. Then reply with the single word: done';
-
-async function smoke(info) {
+// 冒烟阶段 1：agent 的完整往返（发消息、审批、重启续跑）由 smoke.mjs 的会话冒烟与 cargo e2e 覆盖，这里只确认宿主与二进制就绪。
+async function smoke() {
   const result = await basicChecks();
   show(result);
-  const parts = [
-    `sidecar ok: ${JSON.stringify(result.info)}`,
-    `headless ${result.headless.version} (${result.headlessCapabilities.agentBackend})`,
-  ];
-
-  const install = await call('agent.install', { kind: 'pi' });
-  result.agent = install;
-  show(result);
-  parts.push(`pi ${install.version} ${install.downloaded ? 'downloaded' : 'cached'}`);
-
-  if (info.modelBaseUrl && info.modelId) {
-    const run = await call('headless.run', {
-      task: SMOKE_TASK,
-      model: { baseUrl: info.modelBaseUrl, id: info.modelId },
-      timeoutMs: 240000,
-    });
-    result.run = run;
-    show(result);
-    if (run.status !== 'valid-completed') throw new Error(`run ${run.status}: ${run.error}`);
-    parts.push(`run ${run.status} in ${run.durationMs}ms, reply=${JSON.stringify(run.finalText)}`);
-  } else {
-    parts.push('run skipped (no model configured)');
-  }
-  return parts.join('; ');
+  if (!result.agent.installed) throw new Error(`bundled pi-rs missing: ${result.agent.binary}`);
+  return `host ok: ${JSON.stringify(result.info)}; pi-rs ${result.agent.version} ready`;
 }
 
 async function main() {
@@ -62,7 +29,7 @@ async function main() {
     return;
   }
   try {
-    const detail = await smoke(info);
+    const detail = await smoke();
     // 第一阶段通过后加载真实 renderer，由 preload 里的冒烟钩子写最终结果。
     sessionStorage.setItem('cindySmokePhase1', detail);
     location.replace('/index.html');

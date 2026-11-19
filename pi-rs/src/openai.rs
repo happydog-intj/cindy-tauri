@@ -169,8 +169,17 @@ pub async fn stream(
     }
     let url = format!("{}/chat/completions", model.base_url.trim_end_matches('/'));
     let mut req = client.post(&url).json(&body);
-    if let Some(k) = model.api_key() {
-        req = req.bearer_auth(k);
+    match model.auth_headers() {
+        Some(hs) => {
+            for (k, v) in hs {
+                req = req.header(k, v);
+            }
+        }
+        None => {
+            if let Some(k) = model.api_key() {
+                req = req.bearer_auth(k);
+            }
+        }
     }
     for (k, v) in model.headers() {
         req = req.header(k, v);

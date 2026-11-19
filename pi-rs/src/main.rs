@@ -6,6 +6,9 @@ mod args;
 mod compact;
 mod cred;
 mod export;
+mod maker;
+mod maker_errors;
+mod maker_text;
 mod models;
 mod perm;
 mod openai;
@@ -44,6 +47,15 @@ async fn main() -> ExitCode {
                 return run_original(&orig);
             }
         }
+    }
+    if let Some(frames) = &args.replay_maker {
+        return match maker::replay(frames) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                ExitCode::from(1)
+            }
+        };
     }
     if args.version {
         println!("pi-rs {}", env!("CARGO_PKG_VERSION"));

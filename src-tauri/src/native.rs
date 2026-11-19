@@ -1,7 +1,6 @@
 // sidecar → Rust 的反向调用（sidecar/src/native.mjs）和桌面外壳的原生部分：
 // 系统通知、Dock 角标、原生对话框、打开链接 / 文件、Windows 托盘、主窗口关闭行为。
-// IPC 校验和文案都在 sidecar（desktop-shell.mjs），这里只执行原生动作。
-use crate::sidecar::Sidecar;
+// 通道校验和文案在 desktop_shell.rs，这里只执行原生动作。
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,7 +12,6 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind, Me
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
 
-pub static SIDECAR: OnceLock<Arc<Sidecar>> = OnceLock::new();
 // 真正退出时置位，主窗口 CloseRequested 不再拦截。
 static QUITTING: AtomicBool = AtomicBool::new(false);
 
@@ -26,28 +24,126 @@ struct TrayLabels {
 }
 
 static TRAY_LABELS: Mutex<Option<TrayLabels>> = Mutex::new(None);
-const TRAY_ID: &str = "main";
+/// 桌面外壳（通知 / 角标 / 关闭行为），setup 时建好。
+pub static AUTH: OnceLock<Arc<crate::auth::manager::Manager>> = OnceLock::new();
+pub static DEVICE_LINK: OnceLock<Arc<crate::device_link::host::DeviceLink>> = OnceLock::new();
 
-fn sidecar() -> Option<Arc<Sidecar>> {
-    // 反向调用可能早于 SIDECAR 设置（sidecar 启动即发），稍等一下。
-    for _ in 0..50 {
-        if let Some(sc) = SIDECAR.get() {
-            return Some(sc.clone());
-        }
-        thread::sleep(Duration::from_millis(20));
+/// renderer 推送的设备互联旁路：转发给 Rust 设备互联宿主。
+pub fn push_tap(channel: &str, payload: &Value) {
+    if let Some(d) = DEVICE_LINK.get() {
+        d.on_push(channel, payload.clone());
     }
-    None
+}
+pub static MODEL_ACCESS: OnceLock<Arc<crate::model_access::manager::Manager>> = OnceLock::new();
+pub static MODELS: OnceLock<Arc<crate::model_config::manager::Manager>> = OnceLock::new();
+
+/// renderer 推送 + 设备互联旁路（手机端也要这份推送）。
+pub fn emit_all(app: &AppHandle, channel: &str, arg: Value) {
+    use tauri::Emitter;
+    let payload = serde_json::to_string(&json!({ "v": [arg.clone()] })).unwrap_or_default();
+    let _ = app.emit_to(tauri::EventTarget::webview("main"), "cindy:ipc", json!({ "channel": channel, "payload": payload }));
+    push_tap(channel, &arg);
 }
 
-// 自动更新安装前要让 sidecar 退出。
-pub fn sidecar_handle() -> Option<Arc<Sidecar>> {
-    SIDECAR.get().cloned()
+pub static MODEL_HOST: OnceLock<Arc<crate::model_config::host::ModelHost>> = OnceLock::new();
+
+/// 原 sidecar 的 `host.*` 模型相关回调，现在由 Rust 直接回答。None = 不是这几个方法。
+pub fn model_host_call(method: &str, p: &Value) -> Option<Result<Value, String>> {
+    match MODEL_HOST.get() {
+        Some(h) => h.call(method, p),
+        None if method.starts_with("host.") && ["resolve-launch", "pi-models", "gateway-rejected", "secrets-ready", "has-provider", "import-provider"].contains(&&method[5..]) => {
+            Some(Err("[PRECONDITION_FAILED] models are not ready".into()))
+        }
+        None => None,
+    }
+}
+pub static LOCAL_DB: OnceLock<Arc<crate::local_db::LocalDb>> = OnceLock::new();
+pub static SHELL: OnceLock<Arc<crate::desktop_shell::DesktopShell>> = OnceLock::new();
+
+/// 桌面版导入（原 sidecar desktop-import.mjs）。
+pub static IMPORT: OnceLock<Arc<crate::import_run::DesktopImport>> = OnceLock::new();
+
+pub fn desktop_import() -> Option<Arc<crate::import_run::DesktopImport>> {
+    IMPORT.get().cloned()
 }
 
-// 调用 sidecar 里只给 Rust 用的 native.* 方法（index.mjs rustOnly）。
-fn call_sidecar(method: &str, params: Value) -> Result<Value, String> {
-    sidecar().ok_or_else(|| "sidecar unavailable".to_string())?.call(method, params)
+/// 导入的生产端口：模型服务 / secret store / 本地库文件名向 sidecar 要，其余走本模块。
+pub struct ImportAppPorts(pub AppHandle);
+
+impl crate::import_run::ImportPorts for ImportAppPorts {
+    fn sidecar(&self, method: &str, params: Value) -> Result<Value, String> {
+        if let Some(r) = model_host_call(method, &params) {
+            return r;
+        }
+        if method == "host.local-db-file" {
+            return LOCAL_DB.get().map(|d| json!(d.file.to_string_lossy())).ok_or_else(|| "[PRECONDITION_FAILED] local database is not ready".to_string());
+        }
+        Err(format!("[NOT_IMPLEMENTED] {method}"))
+    }
+    fn safe_storage_key(&self, request: &Value) -> Result<Value, String> {
+        crate::desktop_import::safe_storage_key(request)
+    }
+    fn dialog(&self, params: Value) -> Result<i64, String> {
+        run(&self.0, "dialog.message", &params).map(|v| v.as_i64().unwrap_or(0))
+    }
+    fn emit(&self, channel: &str, arg: Value) {
+        crate::desktop_shell::Ports::emit(&AppPorts(self.0.clone()), channel, arg);
+    }
+    fn locale(&self) -> String {
+        shell().map(|s| s.current_locale()).unwrap_or_else(|| "en".into())
+    }
 }
+
+pub fn shell() -> Option<Arc<crate::desktop_shell::DesktopShell>> {
+    SHELL.get().cloned()
+}
+
+/// 外壳的生产端口：原生动作直接调本模块，owner / 静音标记向 sidecar 查询（auth 与落库迁移后改本地读）。
+pub struct AppPorts(pub AppHandle);
+
+impl crate::desktop_shell::Ports for AppPorts {
+    fn notify(&self, method: &str, params: Value) {
+        let app = self.0.clone();
+        let method = method.to_string();
+        thread::spawn(move || {
+            if method == "sidecar.locale" {
+                if let Some(i) = desktop_import() {
+                    i.locale_changed();
+                }
+                return;
+            }
+            if let Err(e) = run(&app, &method, &params) {
+                eprintln!("[native] {method} failed: {e}");
+            }
+        });
+    }
+    fn call(&self, method: &str, params: Value, _wait_user: bool) -> Result<Value, String> {
+        run(&self.0, method, &params)
+    }
+    fn emit(&self, channel: &str, arg: Value) {
+        use tauri::Emitter;
+        let payload = serde_json::to_string(&json!({ "v": [arg] })).unwrap_or_default();
+        let _ = self.0.emit_to(tauri::EventTarget::webview("main"), "cindy:ipc", json!({ "channel": channel, "payload": payload }));
+        // 手机端（设备互联）也要这份推送。
+        push_tap(channel, &arg);
+    }
+    fn is_muted(&self, session_id: &str) -> bool {
+        LOCAL_DB.get().map(|d| d.session_muted(session_id)).unwrap_or(false)
+    }
+    fn any_session_in_turn(&self) -> bool {
+        // 探测失败不能变成无确认退出。
+        match self.0.try_state::<crate::MakerState>() {
+            Some(m) => m.0.as_ref().map(|r| r.any_in_turn()).unwrap_or(false),
+            None => true,
+        }
+    }
+    fn owner(&self) -> (Option<String>, i64) {
+        // 应用会话在 Rust（owner.rs），不再绕 sidecar。
+        let v = self.0.try_state::<Arc<crate::owner::Owner>>().map(|o| o.stamp()).unwrap_or(Value::Null);
+        (v.get("dataOwnerId").and_then(Value::as_str).map(str::to_owned), v.get("ownerGeneration").and_then(Value::as_i64).unwrap_or(0))
+    }
+}
+const TRAY_ID: &str = "main";
 
 // 主窗口里还有浏览器子 webview，所以按 Window 取（get_webview_window 在多 webview 时返回 None）。
 pub fn main_window<R: Runtime>(app: &AppHandle<R>) -> Option<Window<R>> {
@@ -115,11 +211,8 @@ pub fn on_main_close_requested<R: Runtime>(window: &Window<R>, api: &tauri::Clos
         api.prevent_close();
         let app = window.app_handle().clone();
         thread::spawn(move || {
-            let action = call_sidecar("native.mainWindowCloseRequested", json!({}))
-                .ok()
-                .and_then(|v| v.get("action").and_then(Value::as_str).map(str::to_owned))
-                .unwrap_or_else(|| "quit".to_string());
-            apply_close_action(&app, &action);
+            let action = shell().map(|s| s.main_window_close_requested()).unwrap_or("quit");
+            apply_close_action(&app, action);
         });
     }
     // Linux：先保持默认关闭（desktop 的 Linux 托盘未移植）。
@@ -135,7 +228,9 @@ fn apply_close_action<R: Runtime>(app: &AppHandle<R>, action: &str) {
                     hide_main_window(&w);
                 }
             } else {
-                let _ = call_sidecar("native.trayUnavailable", json!({}));
+                if let Some(s) = shell() {
+                    s.tray_unavailable();
+                }
             }
         }
         _ => {}
@@ -200,17 +295,16 @@ fn on_tray_menu<R: Runtime>(app: &AppHandle<R>, id: &str) {
         "tray-show" => focus_main_window(app),
         "tray-open-logs" => {
             thread::spawn(|| {
-                let _ = call_sidecar("native.trayOpenLogs", json!({}));
+                if let Some(s) = shell() {
+                    s.tray_open_logs();
+                }
             });
         }
         "tray-quit" => {
             let app = app.clone();
             thread::spawn(move || {
-                // 有任务在跑时 sidecar 会先弹确认框；sidecar 不可用时直接退出。
-                let ok = match call_sidecar("native.trayQuit", json!({})) {
-                    Ok(v) => v.get("quit").and_then(Value::as_bool).unwrap_or(false),
-                    Err(_) => true,
-                };
+                // 有任务在跑时先弹确认框。
+                let ok = shell().map(|s| s.confirm_quit_if_busy()).unwrap_or(true);
                 if ok {
                     quit(&app);
                 }
@@ -255,7 +349,9 @@ pub fn register_notification_click<R: Runtime>(app: &AppHandle<R>) {
         };
         focus_main_window(&handle);
         thread::spawn(move || {
-            let _ = call_sidecar("native.notificationClicked", json!({ "sessionId": session_id }));
+            if let Some(s) = shell() {
+                s.notification_clicked(&session_id);
+            }
         });
     });
 }
@@ -411,34 +507,103 @@ fn run<R: Runtime>(app: &AppHandle<R>, method: &str, params: &Value) -> Result<V
         "dialog.pickFolder" => pick_folder(app, params),
         "dialog.pickFile" => pick_file(app, params),
         "open.url" => open_url(app, params),
+        // sidecar 里的 model-access / device-link 经这两个回调使用 Rust 的账号会话。
+        "auth.refresh" | "auth.expire" => AUTH
+            .get()
+            .cloned()
+            .ok_or_else(|| "[PRECONDITION_FAILED] auth is not ready".to_string())?
+            .handle_native(method, params)
+            .unwrap_or(Ok(Value::Null)),
         "open.path" => open_path(app, params),
         "reveal" => reveal(app, params),
         // 从桌面版导入：取 Electron safeStorage 密钥材料（macOS 可能弹钥匙串授权框）。
         "desktopImport.safeStorageKey" => crate::desktop_import::safe_storage_key(params),
-        // 自动更新：检查 / 下载 / 安装 / 系统空闲时长（updater.rs）。
-        m if m.starts_with("update.") => crate::updater::run(app, m, params),
+        // goal 控制器经 sidecar 回调 Rust 会话宿主（会话在 Rust 时，goal 的发送 / 中止走这里）。
+        "maker.enqueue" => crate::maker_wiring::native_enqueue(app, params),
+        "maker.abort" => crate::maker_wiring::native_abort(app, params),
+        "maker.invoke" => crate::maker_wiring::native_invoke(app, params),
+        "maker.gateway-key" => crate::maker_wiring::native_gateway_key(app, params),
+        // messages:view：分页在 Rust，sidecar 只做 projectHistoryView 投影。
+        "local-db.view-page" => LOCAL_DB.get().ok_or("[PRECONDITION_FAILED] local database is not ready")?.view_page(&params["sid"], &params["opts"]),
+        // update.* 原生路由已移除：更新状态机在 Rust（update_machine.rs），直接调 updater.rs。
         other => Err(format!("[NOT_IMPLEMENTED] native method {other}")),
     }
 }
 
-// sidecar 读线程调用：每个请求放独立线程，阻塞式对话框不卡读线程和主线程。
-pub fn dispatch<R: Runtime>(app: &AppHandle<R>, msg: Value) {
-    let app = app.clone();
-    thread::spawn(move || {
-        let method = msg.get("method").and_then(Value::as_str).unwrap_or("").to_string();
-        let params = msg.get("params").cloned().unwrap_or(Value::Null);
-        let result = run(&app, &method, &params);
-        match msg.get("id").and_then(Value::as_u64) {
-            Some(id) => {
-                if let Some(sc) = sidecar() {
-                    sc.reply_native(id, result);
-                }
+/// 账号登录的生产端口。
+pub struct AuthPorts(pub AppHandle);
+
+impl crate::auth::env::Ports for AuthPorts {
+    fn emit(&self, channel: &str, arg: Value) {
+        crate::desktop_shell::Ports::emit(&AppPorts(self.0.clone()), channel, arg);
+    }
+    fn open_url(&self, url: &str) -> Result<(), String> {
+        open_url(&self.0, &json!({ "url": url })).map(|_| ())
+    }
+    fn locale(&self) -> String {
+        shell().map(|s| s.current_locale()).unwrap_or_else(|| "en".into())
+    }
+}
+
+/// 设备互联宿主的外部依赖（账号令牌、renderer 推送、本机 invoke 路由）。
+pub struct DeviceLinkPorts {
+    pub app: AppHandle,
+    pub name: String,
+}
+
+impl crate::device_link::host::Ports for DeviceLinkPorts {
+    fn token(&self) -> crate::device_link::runtime::BoxFut<Option<String>> {
+        Box::pin(async move {
+            let auth = AUTH.get().cloned()?;
+            if !auth.info().authenticated {
+                return None;
             }
-            None => {
-                if let Err(e) = result {
-                    eprintln!("[native] {method} failed: {e}");
-                }
+            if let Some(t) = auth.access_token() {
+                return Some(t);
             }
-        }
-    });
+            auth.refresh().await;
+            auth.access_token()
+        })
+    }
+    fn authenticated(&self) -> (bool, Option<String>) {
+        AUTH.get().map(|a| a.info()).map(|i| (i.authenticated, i.user_id)).unwrap_or((false, None))
+    }
+    fn ws_url(&self) -> String {
+        let base = crate::auth::env::device_link_base_url();
+        let base = if let Some(r) = base.strip_prefix("https") { format!("wss{r}") } else if let Some(r) = base.strip_prefix("http") { format!("ws{r}") } else { base };
+        format!("{base}/api/device-link/ws")
+    }
+    fn http_base(&self) -> String {
+        crate::auth::env::device_link_base_url()
+    }
+    fn emit(&self, channel: &str, arg: Value) {
+        // 只推 renderer：设备互联自己的状态通知不需要再转给手机
+        use tauri::Emitter;
+        let payload = serde_json::to_string(&json!({ "v": [arg] })).unwrap_or_default();
+        let _ = self.app.emit_to(tauri::EventTarget::webview("main"), "cindy:ipc", json!({ "channel": channel, "payload": payload }));
+    }
+    fn owner_stamp(&self) -> Value {
+        use tauri::Manager;
+        self.app.state::<std::sync::Arc<crate::owner::Owner>>().stamp()
+    }
+    fn invoke(&self, channel: String, args: Vec<Value>) -> crate::device_link::runtime::BoxFut<Result<Value, String>> {
+        let app = self.app.clone();
+        Box::pin(async move {
+            let payload = serde_json::to_string(&json!({ "v": args })).unwrap_or_default();
+            // 远程调用走与 renderer 同一套路由，返回值是 `{"v": <value>}` 编码串
+            let r = crate::ipc_invoke_core(&app, None, channel, payload).await?;
+            let s = r.as_str().ok_or_else(|| "[INTERNAL] unexpected invoke result".to_string())?;
+            let decoded: Value = serde_json::from_str(s).map_err(|e| format!("[INTERNAL] {e}"))?;
+            Ok(decoded.get("v").cloned().unwrap_or(Value::Null))
+        })
+    }
+    fn log(&self, level: &str, msg: &str) {
+        eprintln!("[device-link] {level} {msg}");
+    }
+    fn device_name(&self) -> String {
+        self.name.clone()
+    }
+    fn app_version(&self) -> String {
+        std::env::var("CINDY_TAURI_APP_VERSION").unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_owned())
+    }
 }
