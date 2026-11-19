@@ -18,9 +18,11 @@ jobs:
           - os: macos-15
             triple: aarch64-apple-darwin
             bundles: app,dmg
-          - os: windows-latest
-            triple: x86_64-pc-windows-msvc
-            bundles: nsis
+          # Windows 暂时停用：Rust 侧还有 Unix 专有代码没适配（见 git log）。适配好后把下面三行加回来，
+          # 并恢复 publish 里的 WIN= 与 latest.json 的 windows-* 键。
+          # - os: windows-latest
+          #   triple: x86_64-pc-windows-msvc
+          #   bundles: nsis
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -243,7 +245,7 @@ jobs:
           cp "$N"/*"_${NEXT_VERSION}_x64-setup.exe" "$N"/*"_${NEXT_VERSION}_x64-setup.exe.sig" "$RUNNER_TEMP/upd-new/"
           node scripts/update-smoke.mjs --old "$(ls "$RUNNER_TEMP"/upd-old/*-setup.exe)" --new "$(ls "$RUNNER_TEMP"/upd-new/*-setup.exe)" --version "$NEXT_VERSION"
 
-  # v* 标签：两个平台的构建和冒烟都通过后才发布。latest.json 同时给带安装类型和不带的键。
+  # v* 标签：构建和冒烟都通过后才发布（目前只有 macOS）。latest.json 同时给带安装类型和不带的键。
   publish:
     needs: smoke
     if: startsWith(github.ref, 'refs/tags/v')
@@ -271,10 +273,9 @@ jobs:
           V=$(node -p "require('./src-tauri/tauri.conf.json').version")
           if [ "v$V" != "$TAG" ]; then echo "tag $TAG does not match tauri.conf.json version $V"; exit 1; fi
           MAC="release/Cindy-Tauri_${V}_aarch64.app.tar.gz"
-          WIN="release/Cindy-Tauri_${V}_x64-setup.exe"
           node scripts/latest-json.mjs --version "$V" --notes "Cindy Tauri $V" \
             --base-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/" --out release/latest.json \
-            darwin-aarch64-app="$MAC" darwin-aarch64="$MAC" windows-x86_64-nsis="$WIN" windows-x86_64="$WIN"
+            darwin-aarch64-app="$MAC" darwin-aarch64="$MAC"
           ls -l release
-          gh release create "$TAG" --title "Cindy Tauri $V" --notes "Cindy Tauri $V（未签名构建：macOS 首次打开被拦截后，到「系统设置 → 隐私与安全性」点「仍要打开」；Windows 在 SmartScreen 点「更多信息 → 仍要运行」）" \
+          gh release create "$TAG" --title "Cindy Tauri $V" --notes "Cindy Tauri $V（未签名构建：macOS 首次打开被拦截后，到「系统设置 → 隐私与安全性」点「仍要打开」）" \
             release/Cindy-Tauri_* release/latest.json
