@@ -2,9 +2,11 @@
 // （暴露 window.electronAPI），最后挂冒烟检查。
 import { installWebviewShim } from './webview.mjs';
 import { installDragRegionShim } from './drag-region.mjs';
+import { installImeGuard } from './ime-guard.mjs';
 import '__CINDY_PRELOAD__';
 import { installRendererSmoke } from './smoke.mjs';
 
 installWebviewShim();
 installDragRegionShim();
+installImeGuard();
 installRendererSmoke();
