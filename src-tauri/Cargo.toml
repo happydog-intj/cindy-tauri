@@ -42,16 +42,17 @@ tokio-tungstenite = { version = "0.26", default-features = false, features = ["c
 indexmap = "2.14.2"
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 
-# 浏览器面板的前进 / 后退 / 停止：Tauri 没有封装，直接调原生 webview。版本跟 wry 用的一致。
-[target.'cfg(target_os = "macos")'.dependencies]
-objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "objc2-app-kit", "WKWebView", "WKNavigation"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSURL"] }
 
 # 右侧栏终端的 PTY：替代 node-pty（macOS fork/exec，Windows ConPTY）。
 portable-pty = "0.9"
 
-# 本地库引擎：Rust 持有 SQLite（差距清单 #3），经 127.0.0.1 行协议暴露给 sidecar。
+# 本地库引擎：Rust 持有 SQLite（local-v1 库、goal、桌面版导入都用它）。
 rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+
+# 浏览器面板的前进 / 后退 / 停止：Tauri 没有封装，直接调原生 webview。版本跟 wry 用的一致。
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "objc2-app-kit", "WKWebView", "WKNavigation"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSURL"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-core = "0.62"
