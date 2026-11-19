@@ -80,7 +80,7 @@ jobs:
       # 带 PI_RS_BIN / MOCK_OPENAI 时 pi_proc 会对真实 pi-rs 跑事件流与权限门允许/拒绝两个端到端。
       - name: Session host tests (Rust)
         env:
-          PI_RS_BIN: ${{ github.workspace }}/pi-rs/target/release/pi
+          PI_RS_BIN: ${{ github.workspace }}/resources/pi-rs/pi${{ runner.os == 'Windows' && '.exe' || '' }}
           MOCK_OPENAI: ${{ github.workspace }}/scripts/mock-openai.mjs
           # rust_session_e2e：Rust 会话宿主 + pi-rs。覆盖会话回合 / 审批 / 带 key 的鉴权 / 重启续接、
           # 换模型（跨来源、回合中延期并迁移队列）、goal 全部终态与 /goal 命令、网关直连、手机端 invoke 与推送、导入任务续接。
@@ -91,7 +91,9 @@ jobs:
 
       # 网关直连（取代本地转发器）：apiKeyFile + apiKeyHeaders 双头、轮换、空 key 不发空凭据、key 不外泄。
       - name: Gateway key (direct)
-        run: PI_BIN=${{ github.workspace }}/pi-rs/target/release/pi node pi-rs/baseline/gateway-key-test.mjs
+        run: node pi-rs/baseline/gateway-key-test.mjs
+        env:
+          PI_BIN: ${{ github.workspace }}/resources/pi-rs/pi${{ runner.os == 'Windows' && '.exe' || '' }}
 
       # 自动更新状态机已迁到 Rust（update_machine.rs），34 步行为规格随 cargo test 跑。
       - name: Update machine tests (Rust)

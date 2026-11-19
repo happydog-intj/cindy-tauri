@@ -11,7 +11,7 @@ import path from 'node:path';
 import readline from 'node:readline';
 
 const root = path.resolve(import.meta.dirname, '../..');
-const PI = process.env.PI_BIN ?? path.join(root, 'pi-rs', 'target', 'release', 'pi');
+const PI = process.env.PI_BIN ?? path.join(root, 'resources', 'pi-rs', process.platform === 'win32' ? 'pi.exe' : 'pi');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const steps = [];

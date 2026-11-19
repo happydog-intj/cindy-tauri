@@ -241,7 +241,7 @@ mod tests {
             &dir,
             &format!(
                 r#"{{"providers":{{"cindy":{{"baseUrl":"http://127.0.0.1:1","apiKey":"$CINDY_TEST_KEY_X","apiKeyFile":"{}","api":"openai-completions","models":[{{"id":"m1"}},{{"id":"m2","apiKeyFile":null}}]}}}}}}"#,
-                kf.display()
+                kf.display().to_string().replace('\\', "\\\\")
             ),
         );
         let reg = Registry::load(&dir).unwrap();

@@ -17,7 +17,8 @@ import { fileURLToPath } from 'node:url';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 // translator 对齐上游较新版本，用 vendor/cindy-maker-main 里的依赖闭包（见其 README.md）。
 const cindyDir = path.resolve(process.env.CINDY_DIR ?? path.join(root, 'vendor', 'cindy-maker-main'));
-const piRs = path.join(root, 'pi-rs', 'target', 'release', 'pi');
+// 默认用随包的 resources/pi-rs/pi（npm run pirs:build 产出；CI 带 --target 时 target/release 下没有二进制）。
+const piRs = process.env.PI_RS_BIN ?? path.join(root, 'resources', 'pi-rs', process.platform === 'win32' ? 'pi.exe' : 'pi');
 const UPDATE = process.argv.includes('--update');
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
