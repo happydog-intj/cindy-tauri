@@ -35,19 +35,20 @@ console.log('bash env:', JSON.stringify(e0));
 assert.ok(!e0.includes('sekret'), 'secret leaked into bash env');
 assert.ok(!e0.includes('CINDY_PI_API_KEY') && !e0.includes('CINDY_PI_KEY_FOO') && !e0.includes('CINDY_PI_PERMISSION_FILE') && !e0.includes('CINDY_PI_TURN_TOOL_POLICY'));
 assert.ok(e0.trim().endsWith(tmp + '/pkg'), 'PI_CODING_AGENT_DIR should point at the isolated package home');
-// 3) ask_user_question：select + input
+// 3) ask_user_question：所有问题合成一条 cindy:ask-user-question 请求，答案以 {问题: 答案} 的 JSON 回传
 k = out.length; send({ id: 'p1', type: 'prompt', message: 'MOCK_TOOLS_NEXT 1' });
-const q1 = await until(r => r.type === 'extension_ui_request' && r.method === 'select' && out.indexOf(r) > k);
-assert.deepEqual(q1.options, ['A', 'B']); assert.equal(q1.title, 'Pick one');
-send({ type: 'extension_ui_response', id: q1.id, value: 'B' });
-const q2 = await until(r => r.type === 'extension_ui_request' && r.method === 'input' && r.title === 'Name?');
-send({ type: 'extension_ui_response', id: q2.id, value: 'Ann' });
+const q1 = await until(r => r.type === 'extension_ui_request' && r.title === 'cindy:ask-user-question' && out.indexOf(r) > k);
+assert.deepEqual(JSON.parse(q1.placeholder).questions, [
+  { question: 'Pick one', options: [{ label: 'A' }, { label: 'B' }] },
+  { question: 'Name?' },
+]);
+send({ type: 'extension_ui_response', id: q1.id, value: JSON.stringify({ 'Pick one': 'B', 'Name?': 'Ann' }) });
 const e1 = text(await toolEnd(1)); await until(r => r.type === 'agent_settled' && out.indexOf(r) > k);
 console.log('ask answers:', e1);
 assert.deepEqual(JSON.parse(e1), { answers: { 'Pick one': 'B', 'Name?': 'Ann' }, cancelled: false });
 // 4) 取消
 k = out.length; send({ id: 'p2', type: 'prompt', message: 'MOCK_TOOLS_NEXT 2' });
-const q3 = await until(r => r.type === 'extension_ui_request' && r.title === 'Cancel me' && out.indexOf(r) > k);
+const q3 = await until(r => r.type === 'extension_ui_request' && r.title === 'cindy:ask-user-question' && out.indexOf(r) > k);
 send({ type: 'extension_ui_response', id: q3.id, cancelled: true });
 const e2 = text(await toolEnd(2)); await until(r => r.type === 'agent_settled' && out.indexOf(r) > k);
 assert.deepEqual(JSON.parse(e2), { answers: {}, cancelled: true });

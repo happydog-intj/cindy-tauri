@@ -54,6 +54,11 @@ pub fn decision_to_response(request_id: &str, decision: &Value) -> Value {
     if dismissed {
         return json!({ "type": "extension_ui_response", "id": request_id, "cancelled": true });
     }
+    // 提问：答案以 {问题: 答案} 的 JSON 文本回给 pi-rs（宿主发来的 dismissed 已在上面转成 cancelled）。
+    if decision["kind"] == "ask_user_question" {
+        let answers = if decision["answers"].is_object() { decision["answers"].clone() } else { json!({}) };
+        return json!({ "type": "extension_ui_response", "id": request_id, "value": answers.to_string() });
+    }
     if decision["behavior"] == "deny" {
         let reason = decision["reason"].as_str().unwrap_or("denied");
         return json!({ "type": "extension_ui_response", "id": request_id, "value": format!("user-deny:{reason}") });
@@ -275,6 +280,20 @@ impl SessionCore {
                 }
                 vec![Action::InteractionRequest(json!({ "sessionId": self.session_id, "request": request }))]
             }
+            Some("cindy:ask-user-question") => {
+                let questions = frame["placeholder"].as_str()
+                    .and_then(|p| serde_json::from_str::<Value>(p).ok())
+                    .and_then(|v| v["questions"].as_array().cloned())
+                    .filter(|q| !q.is_empty());
+                let Some(questions) = questions else {
+                    return vec![Action::SendToPi(json!({ "type": "extension_ui_response", "id": id, "cancelled": true }))];
+                };
+                let request = json!({ "requestId": id, "kind": "ask_user_question", "questions": questions });
+                if self.table.register(&self.session_id, request.clone(), None, now).is_err() {
+                    return vec![Action::SendToPi(json!({ "type": "extension_ui_response", "id": id, "cancelled": true }))];
+                }
+                vec![Action::InteractionRequest(json!({ "sessionId": self.session_id, "request": request }))]
+            }
             // 其它 UI 请求（通知 / 状态栏等）本阶段没有 renderer 对应物：不应答、不翻译。
             _ => Vec::new(),
         }
@@ -483,6 +502,33 @@ mod tests {
             "placeholder": json!({ "toolName": "bash", "toolInput": {}, "toolUseId": "t2", "requestId": "r1", "kind": "permission" }).to_string() });
         c.on_frame(&req, t0 + Duration::from_secs(910));
         assert!(c.check_stall(t0 + Duration::from_secs(5000), Duration::from_secs(60)).is_empty(), "等待审批");
+    }
+
+    #[test]
+    fn ask_user_question_registers_a_question_card_and_answers_pi_with_json() {
+        let mut c = core();
+        let frame = json!({ "type": "extension_ui_request", "id": "q1", "method": "input", "title": "cindy:ask-user-question",
+            "placeholder": json!({ "questions": [{ "question": "删哪一个?", "options": [{ "label": "A" }, { "label": "B" }] }] }).to_string() });
+        let acts = c.on_frame(&frame, Instant::now());
+        let Action::InteractionRequest(v) = &acts[0] else { panic!("expected request") };
+        assert_eq!(v["request"]["kind"], "ask_user_question");
+        assert_eq!(v["request"]["requestId"], "q1");
+        assert_eq!(v["request"]["questions"][0]["question"], "删哪一个?");
+        assert_eq!(c.pending("s1").len(), 1);
+
+        let out = c.resolve("q1", json!({ "kind": "ask_user_question", "answers": { "删哪一个?": "A" } })).unwrap();
+        let Action::SendToPi(resp) = &out[0] else { panic!("expected response") };
+        assert_eq!(resp["id"], "q1");
+        let got: Value = serde_json::from_str(resp["value"].as_str().unwrap()).unwrap();
+        assert_eq!(got, json!({ "删哪一个?": "A" }));
+    }
+
+    #[test]
+    fn ask_user_question_with_no_questions_is_cancelled_instead_of_hanging() {
+        let mut c = core();
+        let frame = json!({ "type": "extension_ui_request", "id": "q2", "method": "input", "title": "cindy:ask-user-question", "placeholder": "{}" });
+        assert_eq!(c.on_frame(&frame, Instant::now()), vec![Action::SendToPi(json!({ "type": "extension_ui_response", "id": "q2", "cancelled": true }))]);
+        assert!(c.pending("s1").is_empty());
     }
 
     #[test]

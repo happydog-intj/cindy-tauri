@@ -135,13 +135,25 @@ pub async fn ask_user_question(sh: &Shared, args: &Value) -> (String, bool) {
             for v in o { match v.as_str().filter(|v| !v.trim().is_empty() && v.chars().count() <= 256) { Some(v) if u.insert(v.to_string()) => {}, _ => return bad() } }
         }
     }
-    let (mut answers, mut cancelled) = (serde_json::Map::new(), false);
+    // 所有问题打成一条请求交给宿主的提问向导：value 是 {问题: 答案} 的 JSON 文本，取消 / 跳过则为 cancelled。
+    let questions: Vec<Value> = qs.iter().map(|q| {
+        let mut o = json!({"question": q["question"]});
+        if let Some(h) = q["header"].as_str().filter(|h| !h.trim().is_empty()) { o["header"] = h.into(); }
+        if let Some(opts) = q["options"].as_array() { o["options"] = opts.iter().map(|v| json!({"label": v})).collect::<Vec<_>>().into(); }
+        o
+    }).collect();
+    let r = ask(sh, json!({"method":"input","title":"cindy:ask-user-question","placeholder":json!({"questions":questions}).to_string()})).await;
+    let given: serde_json::Map<String, Value> = r.as_ref()
+        .filter(|r| r["cancelled"] != true)
+        .and_then(|r| r["value"].as_str())
+        .and_then(|v| serde_json::from_str::<Value>(v).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    let mut answers = serde_json::Map::new();
     for q in qs {
-        let title = q["question"].as_str().unwrap_or("");
-        let req = if q["options"].is_array() { json!({"method":"select","title":title,"options":q["options"]}) } else { json!({"method":"input","title":title}) };
-        let r = ask(sh, req).await;
-        let a = r.as_ref().and_then(|r| (r["cancelled"] != true).then(|| r["value"].as_str().map(String::from)).flatten()).filter(|a| !a.trim().is_empty());
-        match a { Some(a) => { answers.insert(title.to_string(), a.into()); } None => { cancelled = true; break; } }
+        let t = q["question"].as_str().unwrap_or("");
+        if let Some(a) = given.get(t).and_then(Value::as_str).filter(|a| !a.trim().is_empty()) { answers.insert(t.to_string(), a.into()); }
     }
+    let cancelled = answers.len() < qs.len();
     (json!({"answers": answers, "cancelled": cancelled}).to_string(), false)
 }
