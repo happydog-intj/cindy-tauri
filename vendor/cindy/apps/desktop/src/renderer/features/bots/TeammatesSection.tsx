@@ -47,7 +47,6 @@ import { BotConnectionStatus } from './BotConnectionStatus';
 import { CindyDeviceRow } from './CindyDeviceRow';
 import { cindyDeviceKey, cindyDeviceOptions, isCindyDeviceBot } from './cindyDeviceRoster';
 import { BotAvatar } from './BotAvatar';
-import { BotCreateMenu } from './BotCreateMenu';
 import { BotDeleteDialog } from './BotDeleteDialog';
 import { BotGroupSidebarRow } from './BotGroupSidebarRow';
 import { BotGroupSidebarAvatar } from './BotGroupAvatars';
@@ -523,7 +522,6 @@ export function TeammatesSection() {
               </button>
             </span>
           ) : null}
-          <BotCreateMenu variant="header" />
         </div>
       </div>
 
@@ -620,11 +618,6 @@ export function TeammatesSection() {
       {archiveError && <p role="alert" className="mb-2 px-2.5 text-12 text-[var(--error-fg)]">{archiveError}</p>}
 
       <div>
-        {roster.visible.length === 0 && roster.hidden.length === 0 && archivedBots.length === 0 && remoteBots.length === 0 && visibleGroups.length === 0 ? (
-          <div className="px-3 py-3">
-            <BotCreateMenu label={t('bots.add')} />
-          </div>
-        ) : (
           <div className="flex flex-col gap-1">
             {displayedChats.map(entry => {
               if (entry.kind === 'group') return renderGroupRow(entry.group);
@@ -909,7 +902,6 @@ export function TeammatesSection() {
               </div>
             ) : null}
           </div>
-        )}
 
       </div>
       </div>
