@@ -6,6 +6,6 @@ resources/pi-rs/
 .DS_Store
 dist/
 src-tauri/preload/
-vendor/cindy/node_modules/
-vendor/cindy/**/node_modules/
-vendor/cindy/apps/desktop/.vite/
+frontend/node_modules/
+frontend/**/node_modules/
+frontend/apps/desktop/.vite/

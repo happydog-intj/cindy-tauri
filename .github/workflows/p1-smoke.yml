@@ -36,18 +36,18 @@ jobs:
       - name: Install JS dependencies
         run: npm ci
 
-      # cindy 源码已复制在 vendor/cindy（见其中 .upstream-commit），CI 不再检出上游仓库。
+      # cindy 源码已复制在 frontend（见其中 .upstream-commit），CI 不再检出上游仓库。
       - uses: pnpm/action-setup@v4
         with:
-          package_json_file: vendor/cindy/package.json
+          package_json_file: frontend/package.json
 
       - name: Install cindy desktop dependencies
-        working-directory: vendor/cindy
+        working-directory: frontend
         run: pnpm install --filter "desktop..." --ignore-scripts
 
       # 真实 renderer：只跑 vite renderer 构建，不碰 Electron 主进程。
       - name: Build cindy renderer
-        working-directory: vendor/cindy/apps/desktop
+        working-directory: frontend/apps/desktop
         # 与 cindy 自己的 CI 一致，renderer 打包需要较大的堆。登录页按区域烘焙：Tauri 只做 global 区。
         env:
           NODE_OPTIONS: --max-old-space-size=6144
@@ -55,7 +55,7 @@ jobs:
         run: npx vite build --config vite.renderer.config.ts
 
       - name: Build frontend (renderer + preload shim)
-        run: node scripts/build-frontend.mjs vendor/cindy
+        run: node scripts/build-frontend.mjs frontend
 
       # Pi 是随包的 Rust 实现（pi-rs，源码在 pi-rs/）：编译后放到 resources/pi-rs/，随 Tauri 资源打进安装包。
       # 之后所有会话类 e2e 和冒烟都用它，不再下载原版 Pi。
@@ -88,7 +88,7 @@ jobs:
           # 换模型（跨来源、回合中延期并迁移队列）、goal 全部终态与 /goal 命令、网关直连、手机端 invoke 与推送、导入任务续接。
           # device_link::e2e：mock 中继 + 上游 DeviceLinkClient 扮演手机。
           NODE_BIN: node
-          CINDY_DIR: ${{ github.workspace }}/vendor/cindy
+          CINDY_DIR: ${{ github.workspace }}/frontend
         run: cargo test --release --manifest-path src-tauri/Cargo.toml
 
       # 网关直连（取代本地转发器）：apiKeyFile + apiKeyHeaders 双头、轮换、空 key 不发空凭据、key 不外泄。

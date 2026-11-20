@@ -2,7 +2,7 @@
 // data：Rust 编译期嵌入的紧凑静态表（注册表里 xd 相关的条目、路由 API 声明、Pi 目录行）；
 // golden：对一批网关模型运行 sidecar 里真实的 projectPiModels / resolvePiGatewayModelSpec 得到的输出。
 import { BUNDLED_CATALOG, providerCatalogForPi } from '@cindy/model-providers';
-import { registryEntryDefaults, findBaseModel } from '../../vendor/cindy/packages/model-providers/src/modelMetadataLayers.ts';
+import { registryEntryDefaults, findBaseModel } from '../../frontend/packages/model-providers/src/modelMetadataLayers.ts';
 import { projectPiModels, resolvePiGatewayModelSpec, setGatewayModels } from './xd-reference.ts';
 import { effectiveGatewayModelCost as cost } from '@cindy-desktop-shared/modelPriceQuote';
 import {

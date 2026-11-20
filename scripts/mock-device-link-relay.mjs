@@ -8,9 +8,9 @@ import { createServer } from 'node:http';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-// 本仓库不直接依赖 ws：从 vendor/cindy（可用 CINDY_DIR 覆盖）的 node_modules 加载。
+// 本仓库不直接依赖 ws：从 frontend（可用 CINDY_DIR 覆盖）的 node_modules 加载。
 const here = path.dirname(fileURLToPath(import.meta.url));
-const cindyDir = path.resolve(here, '..', process.env.CINDY_DIR ?? 'vendor/cindy');
+const cindyDir = path.resolve(here, '..', process.env.CINDY_DIR ?? 'frontend');
 const { WebSocketServer } = await import(pathToFileURL(path.join(cindyDir, 'node_modules', 'ws', 'wrapper.mjs')).href);
 
 const PROTOCOL_VERSION = 1;

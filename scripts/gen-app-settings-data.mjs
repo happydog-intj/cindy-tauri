@@ -1,6 +1,6 @@
 // 生成 src-tauri/src/app_settings_data.json（静态表）、app_settings_golden.json 与 voice_input_golden.json（黄金样例）。
 // 全部由上游 cindy 的 shared TS 实际执行得到；上游改动后重跑并提交。
-// 用法：node scripts/gen-app-settings-data.mjs   （CINDY_DIR 指向 cindy 仓库，默认 vendor/cindy）
+// 用法：node scripts/gen-app-settings-data.mjs   （CINDY_DIR 指向 cindy 仓库，默认 frontend）
 import { build } from 'esbuild';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
@@ -9,7 +9,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const cindyDir = path.resolve(process.env.CINDY_DIR ?? path.join(root, 'vendor', 'cindy'));
+const cindyDir = path.resolve(process.env.CINDY_DIR ?? path.join(root, 'frontend'));
 const tmp = mkdtempSync(path.join(os.tmpdir(), 'app-settings-gen-'));
 const outfile = path.join(tmp, 'gen.cjs');
 await build({

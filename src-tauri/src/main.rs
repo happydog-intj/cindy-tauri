@@ -281,7 +281,7 @@ fn runtime_info(app: AppHandle) -> Value {
     })
 }
 
-// payload 是 shared/ipc-codec.mjs 编码后的参数数组；返回同样编码的结果。
+// payload 是 src/shared/ipc-codec.mjs 编码后的参数数组；返回同样编码的结果。
 // 主窗口有浏览器子 webview 后就不再是 WebviewWindow，命令参数用 Webview，并且只接受主 webview。
 #[tauri::command]
 async fn ipc_invoke(webview: Webview, channel: String, payload: String) -> Result<Value, String> {
@@ -355,7 +355,7 @@ pub(crate) async fn ipc_invoke_core(app: &tauri::AppHandle, webview: Option<&Web
     }
     if channel == "get-fullscreen-state" {
         let full = webview.map(|w| w.window().is_fullscreen().unwrap_or(false)).unwrap_or(false);
-        // 与 shared/ipc-codec.mjs 的编码一致：普通 JSON 值原样序列化。
+        // 与 src/shared/ipc-codec.mjs 的编码一致：普通 JSON 值原样序列化。
         return Ok(Value::String(serde_json::to_string(&full).unwrap()));
     }
     // 桌面版导入（import_run.rs）：扫描 / 导入涉及磁盘和钥匙串授权框，放进 blocking 线程。

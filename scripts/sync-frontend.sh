@@ -1,9 +1,9 @@
 #!/bin/sh
-# 把上游 cindy 构建渲染层所需的源码同步到 vendor/cindy（用法：scripts/vendor-cindy.sh <上游目录>）。
+# 把上游 cindy 构建渲染层所需的源码同步到 frontend（用法：scripts/sync-frontend.sh <上游目录>）。
 # 只带 git 跟踪的文件；排除测试、移动端、大部分 docs。其余 workspace 只留 package.json 以保持锁文件一致。
 set -e
-SRC="${1:?用法: vendor-cindy.sh <cindy 仓库目录>}"
-DST="$(cd "$(dirname "$0")/.." && pwd)/vendor/cindy"
+SRC="${1:?用法: sync-frontend.sh <cindy 仓库目录>}"
+DST="$(cd "$(dirname "$0")/.." && pwd)/frontend"
 mkdir -p "$DST"
 LIST="$(mktemp)"
 ( cd "$SRC" && git ls-files ) | awk '
@@ -22,4 +22,4 @@ const fs=require("fs"),p=process.argv[1],j=JSON.parse(fs.readFileSync(p,"utf8"))
 j.pnpm=j.pnpm||{};j.pnpm.supportedArchitectures={os:["current"],cpu:["current"],libc:["current"]};
 fs.writeFileSync(p,JSON.stringify(j,null,2)+"\n");' "$DST/package.json"
 ( cd "$SRC" && git rev-parse HEAD ) > "$DST/.upstream-commit"
-echo "vendored $(find "$DST" -type f | wc -l) files -> $DST"
+echo "synced $(find "$DST" -type f | wc -l) files -> $DST"

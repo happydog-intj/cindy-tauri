@@ -1,6 +1,6 @@
 //! 没有专属实现者的 renderer 通道：首屏默认值、降级通道、未实现的错误形状。
 //! 原先由 Node sidecar 的 ipc.mjs / capture-degraded.mjs / maker-ipc.mjs 应答，现在在 Rust 里。
-//! 返回值是未编码的 JSON 值；`UNDEFINED` 标记对应 JS 的 undefined（shared/ipc-codec.mjs 的 `u` 标签）。
+//! 返回值是未编码的 JSON 值；`UNDEFINED` 标记对应 JS 的 undefined（src/shared/ipc-codec.mjs 的 `u` 标签）。
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};

@@ -1,5 +1,5 @@
 //! 浏览器面板的通道（原 sidecar browser-panel.mjs）：rsb-browser-bridge:*、browser-backend:*、rsb-native-popup:*，
-//! 加上 shim/webview.mjs 专用的 tauri-browser:popup。
+//! 加上 src/shim/webview.mjs 专用的 tauri-browser:popup。
 //!
 //! desktop 的 TabRegistry 记 tabId → webContentsId，供 Agent 浏览器自动化后端和弹窗归属使用。Tauri 版没有
 //! Agent 自动化后端（browser-backend 报不可用），registry 只用来给弹窗补 openerTabId / openerSessionId。
@@ -253,7 +253,7 @@ impl BrowserPanel {
         Ok(json!({ "ok": true, "dropped": dropped, "kept": g.records.len(), "pinnedTabIds": g.pinned }))
     }
 
-    /// shim/webview.mjs：子 webview 里 window.open / target=_blank 被原生拒绝后转到这里，补归属后推给 renderer 开新标签页。
+    /// src/shim/webview.mjs：子 webview 里 window.open / target=_blank 被原生拒绝后转到这里，补归属后推给 renderer 开新标签页。
     fn popup(&self, payload: Option<&Value>) -> Result<Value, String> {
         let o = require_object(payload, "popup payload")?;
         let wc = require_id(o.get("webContentsId"), "webContentsId")?;

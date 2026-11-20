@@ -1,8 +1,8 @@
 // projectHistoryView 的黄金样例：运行上游 maker-shared 的 projectHistoryView / historySubagentScopes。
 // 输入是一批「会话脚本」（行序列 × streaming × lazyDetails），输出是投影结果。
-import { projectHistoryView, hasVisibleHistoryResult, completesHistoryTurn, isHistoryDetailTool } from '../../vendor/cindy/packages/maker-shared/src/historyViewProjection.ts';
-import { isDeliveryProseText } from '../../vendor/cindy/packages/maker-shared/src/messageRender.ts';
-import { isContinuationMessage } from '../../vendor/cindy/packages/maker-shared/src/syntheticTrigger.ts';
+import { projectHistoryView, hasVisibleHistoryResult, completesHistoryTurn, isHistoryDetailTool } from '../../frontend/packages/maker-shared/src/historyViewProjection.ts';
+import { isDeliveryProseText } from '../../frontend/packages/maker-shared/src/messageRender.ts';
+import { isContinuationMessage } from '../../frontend/packages/maker-shared/src/syntheticTrigger.ts';
 
 const norm = (v: any) => JSON.parse(JSON.stringify(v === undefined ? null : v));
 const T0 = Date.parse('2026-05-01T10:00:00.000Z');

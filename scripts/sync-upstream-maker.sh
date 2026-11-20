@@ -1,9 +1,9 @@
 #!/bin/sh
-# 同步 maker-freeze 用的 translator 依赖闭包到 vendor/cindy-maker-main（用法：scripts/vendor-maker-main.sh <上游目录>）。
+# 同步 maker-freeze 用的 translator 依赖闭包到 scripts/freeze/upstream-maker（用法：scripts/sync-upstream-maker.sh <上游目录>）。
 set -e
-SRC="${1:?用法: vendor-maker-main.sh <cindy 仓库目录>}"
+SRC="${1:?用法: sync-upstream-maker.sh <cindy 仓库目录>}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-DST="$ROOT/vendor/cindy-maker-main"
+DST="$ROOT/scripts/freeze/upstream-maker"
 LIST="$(mktemp)"
 CLOSURE_SRC="$ROOT/scripts/.closure.tmp.mjs"
 cat > "$CLOSURE_SRC" <<'JS'
@@ -26,4 +26,4 @@ mkdir -p "$DST"
 rsync -a --files-from="$LIST" "$SRC/" "$DST/"
 ( cd "$SRC" && git rev-parse HEAD ) > "$DST/.upstream-commit"
 rm -f "$LIST"
-echo "vendored $(find "$DST/packages" -type f | wc -l) files -> $DST"
+echo "synced $(find "$DST/packages" -type f | wc -l) files -> $DST"

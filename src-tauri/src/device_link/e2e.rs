@@ -131,7 +131,7 @@ fn wait<F: FnMut() -> bool>(what: &str, secs: u64, mut f: F) {
 fn cindy_dir() -> PathBuf {
     match std::env::var("CINDY_DIR") {
         Ok(d) => PathBuf::from(d),
-        Err(_) => Path::new(env!("CARGO_MANIFEST_DIR")).join("../vendor/cindy"),
+        Err(_) => Path::new(env!("CARGO_MANIFEST_DIR")).join("../frontend"),
     }
 }
 

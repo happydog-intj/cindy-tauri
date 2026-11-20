@@ -1,4 +1,4 @@
-// 浏览器面板（P3）：renderer 里的 <webview> 由 shim/webview.mjs 模拟，真正的网页跑在主窗口的
+// 浏览器面板（P3）：renderer 里的 <webview> 由 src/shim/webview.mjs 模拟，真正的网页跑在主窗口的
 // Tauri 子 webview 里（label = "wv-<id>"，id 由 shim 分配）。这里只做原生动作：
 //   browser_create / browser_op / browser_reset 三个命令，只接受主 webview（label "main"）调用；
 //   子 webview 的页面事件（开始 / 完成加载、标题、弹窗）以 Tauri 事件 "cindy:webview" 发给主 webview。

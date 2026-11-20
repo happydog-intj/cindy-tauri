@@ -15,8 +15,8 @@ import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-// translator 对齐上游较新版本，用 vendor/cindy-maker-main 里的依赖闭包（见其 README.md）。
-const cindyDir = path.resolve(process.env.CINDY_DIR ?? path.join(root, 'vendor', 'cindy-maker-main'));
+// translator 对齐上游较新版本，用 scripts/freeze/upstream-maker 里的依赖闭包（见其 README.md）。
+const cindyDir = path.resolve(process.env.CINDY_DIR ?? path.join(root, 'scripts', 'freeze', 'upstream-maker'));
 // 默认用随包的 resources/pi-rs/pi（npm run pirs:build 产出；CI 带 --target 时 target/release 下没有二进制）。
 const piRs = process.env.PI_RS_BIN ?? path.join(root, 'resources', 'pi-rs', process.platform === 'win32' ? 'pi.exe' : 'pi');
 const UPDATE = process.argv.includes('--update');
@@ -75,7 +75,7 @@ writeFileSync(framesFileFiltered, frames.join('\n') + '\n');
 
 // ── 2. TS 侧：打包 translator 重放器并执行 ──
 const bundle = path.join(tmp, 'translator-replay.cjs');
-// vendor 里没有 pnpm workspace 的 node_modules：按各包 package.json 的 exports 手动解析 @cindy/<pkg>[/sub]。
+// upstream-maker 里没有 pnpm workspace 的 node_modules：按各包 package.json 的 exports 手动解析 @cindy/<pkg>[/sub]。
 function workspaceExportsPlugin(dir) {
   return {
     name: 'cindy-workspace-exports',
