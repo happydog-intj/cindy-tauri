@@ -2,6 +2,8 @@
 // 规则与 mock-openai 对齐：最近一条 user 消息含 MOCK_WRITE_FILE 且其后没有 tool_result → 调 write；否则文本。
 import { createServer } from 'node:http';
 import { writeFileSync, appendFileSync } from 'node:fs';
+import { exitWithParent } from '../../scripts/exit-with-parent.mjs';
+exitWithParent();
 const LOG = process.env.MOCK_LOG;
 let n = 0;
 createServer((req, res) => {

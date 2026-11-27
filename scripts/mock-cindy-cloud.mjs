@@ -11,6 +11,8 @@
 // - GET  /__mock/state：返回计数（refresh 次数、有效 refresh token 数、logout 次数、captcha 是否带上等）。
 import { createServer } from 'node:http';
 import { createHash, randomBytes } from 'node:crypto';
+import { exitWithParent } from './exit-with-parent.mjs';
+exitWithParent();
 
 const GATEWAY_ENDPOINT = process.env.MOCK_GATEWAY_ENDPOINT || 'http://127.0.0.1:9/keyed';
 let gatewayKey = process.env.MOCK_GATEWAY_KEY || 'mock-gateway-key';

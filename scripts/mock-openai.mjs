@@ -20,6 +20,8 @@ import { timingSafeEqual } from 'node:crypto';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { exitWithParent } from './exit-with-parent.mjs';
+exitWithParent();
 
 const TRIGGER = 'MOCK_WRITE_FILE';
 const FILE_NAME = 'mock-ok.txt';
