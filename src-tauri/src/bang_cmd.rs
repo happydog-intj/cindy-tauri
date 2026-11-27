@@ -134,14 +134,23 @@ pub fn run(cmd: &str, cwd: &Path, timeout: Duration) -> Outcome {
     Outcome { output, code, timed_out, truncated }
 }
 
-/// 渲染层事件：一次工具调用 + 它的结果。形状与 pi-rs 翻译 `tool_execution_*` 得到的一致，
-/// 所以工具卡片、历史回放和落库都沿用现有路径。`tool_use_id` 要在会话内唯一。
-pub fn events(tool_use_id: &str, cmd: &str, out: &Outcome) -> Vec<Value> {
-    vec![
-        json!({ "type": "tool_use", "data": { "toolUseId": tool_use_id, "toolName": "bash", "input": { "command": cmd } }, "source": "pi" }),
-        json!({ "type": "tool_result_full", "data": { "toolUseId": tool_use_id, "fullText": out.display_text(), "isError": out.is_error() }, "source": "pi" }),
-        json!({ "type": "tool_result", "data": { "summary": if out.is_error() { "failed" } else { "done" }, "toolUseIds": [tool_use_id] }, "source": "pi" }),
-    ]
+/// 渲染层事件：一条独立的助手文本（`standaloneText`，不经模型、不进回合状态），直接作为聊天消息展示，
+/// 内容是代码块里的 `$ 命令` 加输出。围栏比输出里出现的反引号串更长，输出含 ``` 时不会被截断。
+pub fn events(cmd: &str, out: &Outcome) -> Vec<Value> {
+    let body = format!("$ {cmd}\n{}", out.display_text());
+    let mut longest = 0;
+    let mut run = 0;
+    for c in body.chars() {
+        if c == '`' {
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    let fence = "`".repeat((longest + 1).max(3));
+    let text = format!("{fence}\n{}\n{fence}", body.trim_end());
+    vec![json!({ "type": "text", "data": { "text": text, "isFinal": true }, "source": "pi", "standaloneText": true })]
 }
 
 /// 附在下一条发给模型的消息前面的上下文。多条命令按顺序排列。
@@ -218,13 +227,18 @@ mod tests {
     #[test]
     fn events_have_the_shape_the_renderer_expects() {
         let out = Outcome { output: "a\n".into(), code: Some(0), timed_out: false, truncated: false };
-        let ev = events("bang-1", "ls", &out);
-        assert_eq!(ev.len(), 3);
-        assert_eq!(ev[0]["type"], "tool_use");
-        assert_eq!(ev[0]["data"]["input"]["command"], "ls");
-        assert_eq!(ev[1]["type"], "tool_result_full");
-        assert_eq!(ev[1]["data"]["isError"], false);
-        assert_eq!(ev[2]["data"]["toolUseIds"][0], "bang-1");
+        let ev = events("ls", &out);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0]["type"], "text");
+        assert_eq!(ev[0]["standaloneText"], true);
+        assert_eq!(ev[0]["data"]["text"], "```\n$ ls\na\n```");
+    }
+
+    #[test]
+    fn fence_is_longer_than_any_backtick_run_in_the_output() {
+        let out = Outcome { output: "x ```` y\n".into(), code: Some(0), timed_out: false, truncated: false };
+        let t = events("echo", &out)[0]["data"]["text"].as_str().unwrap().to_string();
+        assert!(t.starts_with("`````\n") && t.ends_with("\n`````"), "{t}");
     }
 
     #[test]

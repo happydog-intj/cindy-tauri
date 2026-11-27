@@ -221,10 +221,8 @@ impl PiSession {
         self.sink.user_message(&self.session_id, item["clientId"].as_str().unwrap_or(""), &content);
         let me = self.clone();
         let spawned = std::thread::Builder::new().name(format!("bang-{}", self.session_id)).spawn(move || {
-            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let id = format!("bang-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed));
             let out = crate::bang_cmd::run(&cmd, &me.cwd, crate::bang_cmd::TIMEOUT);
-            for ev in crate::bang_cmd::events(&id, &cmd, &out) {
+            for ev in crate::bang_cmd::events(&cmd, &out) {
                 me.sink.maker_event(&me.session_id, ev);
             }
             me.bang_pending.lock().unwrap().push((cmd, out));
@@ -662,11 +660,12 @@ printf '%s\n' "{\"type\":\"echo\",\"ack\":$ack,\"answer\":$answer}"
 
         let proj = s.run_bang(&json!({ "clientId": "b1", "text": "!echo BANG_OUT_42" }), "echo BANG_OUT_42".to_string()).unwrap();
         assert_eq!(proj["turnInProgress"], false, "不开模型回合");
-        assert!(wait_until(&rx, || has_event(&sink, "tool_result_full")), "命令结果应以工具卡片事件推出");
+        assert!(wait_until(&rx, || has_event(&sink, "text")), "命令结果应以独立文本消息推出");
         let evs = sink.events.lock().unwrap().clone();
-        let full = evs.iter().find(|e| e["type"] == "tool_result_full").unwrap();
-        assert!(full["data"]["fullText"].as_str().unwrap().contains("BANG_OUT_42"));
-        assert_eq!(full["data"]["isError"], false);
+        let msg = evs.iter().find(|e| e["type"] == "text").unwrap();
+        assert_eq!(msg["standaloneText"], true);
+        assert!(msg["data"]["text"].as_str().unwrap().contains("BANG_OUT_42"));
+        assert!(!has_event(&sink, "tool_use"), "不再用工具卡片（默认折叠）");
         assert!(!has_event(&sink, "done"), "没有模型回合就不会有 done");
         assert!(std::fs::read_dir(&dump).map(|d| d.count()).unwrap_or(0) == 0, "没有请求到过模型");
 
@@ -693,13 +692,13 @@ printf '%s\n' "{\"type\":\"echo\",\"ack\":$ack,\"answer\":$answer}"
         s.enqueue(json!({ "clientId": "c1", "text": "MOCK_SLOW please" })).unwrap();
         let err = s.run_bang(&json!({ "clientId": "b1", "text": "!echo x" }), "echo x".into()).unwrap_err();
         assert!(err.contains("模型正在回答"), "{err}");
-        assert!(!has_event(&sink, "tool_result_full"));
+        assert!(!has_event(&sink, "text"));
         assert!(wait_until(&rx, || has_event(&sink, "done")));
         // 回合结束后可以跑，且 running 标记已复位（可以连着跑第二条）。
         for i in 0..2 {
-            let before = sink.events.lock().unwrap().iter().filter(|e| e["type"] == "tool_result_full").count();
+            let before = sink.events.lock().unwrap().iter().filter(|e| e["type"] == "text").count();
             s.run_bang(&json!({ "clientId": format!("b{i}"), "text": "!true" }), "true".into()).unwrap();
-            assert!(wait_until(&rx, || sink.events.lock().unwrap().iter().filter(|e| e["type"] == "tool_result_full").count() > before));
+            assert!(wait_until(&rx, || sink.events.lock().unwrap().iter().filter(|e| e["type"] == "text").count() > before));
             assert!(wait_until(&rx, || !s.bang_running.load(std::sync::atomic::Ordering::SeqCst)));
         }
         s.shutdown();

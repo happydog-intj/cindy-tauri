@@ -114,6 +114,11 @@ impl SessionSink for HostSink {
         if let Some(g) = self.goal.get() {
             g.on_event(session_id, &event);
         }
+        // 独立文本（扩展通知 / `!cmd` 输出）只经落库行通道到达渲染层；再发 maker:event 会被当成活跃助手流，
+        // 盖掉或错放下一条模型回复。与上游 sessionEventPreparation 的 standaloneText 分支一致。
+        if event["standaloneText"] == true {
+            return;
+        }
         let mut arg = json!({ "sessionId": session_id, "event": event });
         if let Some(pid) = persist_id {
             arg["persistId"] = json!(pid);
