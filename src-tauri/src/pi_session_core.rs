@@ -246,9 +246,23 @@ impl SessionCore {
     }
 
     /// 进程退出：回合清零，所有悬挂审批以拒绝收尾。
-    pub fn on_exit(&mut self) -> Vec<Action> {
+    /// `unexpected`：进程不是被我们关掉的，值是退出原因（退出码 / 信号）。回合进行中遇到这种退出，
+    /// 要以终止性 error 收尾，否则界面上只会看到输入没有任何反应。
+    pub fn on_exit(&mut self, unexpected: Option<&str>) -> Vec<Action> {
         let mut out = self.cancel_all("session_closed");
-        if self.queue.on_status_closed() {
+        let token = unexpected.and_then(|_| self.queue.active_token());
+        if let (Some(reason), Some(token)) = (unexpected, token) {
+            let ev = json!({
+                "type": "error",
+                "data": { "message": format!("The agent process exited unexpectedly ({reason}). Send the message again to retry."), "isTerminal": true, "code": "AGENT_EXITED" },
+                "source": "pi",
+                "turnAttemptToken": token,
+            });
+            self.queue.on_event(&ev);
+            self.tools_running = 0;
+            out.push(Action::MakerEvent(ev));
+            out.push(Action::Projection(self.queue.projection(&self.session_id)));
+        } else if self.queue.on_status_closed() {
             out.push(Action::Projection(self.queue.projection(&self.session_id)));
         }
         out
@@ -433,6 +447,30 @@ mod tests {
         c.enqueue(json!({ "clientId": "u1", "text": "hi" })).unwrap();
         let o = origins(&c.on_frame(&delta(), Instant::now()));
         assert!(!o.is_empty() && o.iter().all(|x| x.is_null()), "普通回合不继承 goal 的 origin: {o:?}");
+    }
+
+    #[test]
+    fn unexpected_exit_mid_turn_ends_it_with_a_terminal_error() {
+        let mut c = SessionCore::new("s1", Box::new(|_| {}));
+        c.enqueue(json!({ "clientId": "a", "text": "hi" })).unwrap();
+        let acts = c.on_exit(Some("killed by signal 9"));
+        let Some(Action::MakerEvent(ev)) = acts.iter().find(|a| matches!(a, Action::MakerEvent(_))) else { panic!("缺 error 事件") };
+        assert_eq!(ev["data"]["code"], "AGENT_EXITED");
+        assert_eq!(ev["data"]["isTerminal"], true);
+        assert_eq!(ev["turnAttemptToken"], 1);
+        assert!(ev["data"]["message"].as_str().unwrap().contains("signal 9"));
+        assert!(!c.projection()["turnInProgress"].as_bool().unwrap(), "回合已收尾");
+        assert!(c.projection()["error"].is_string(), "投影带上错误，界面才有提示");
+    }
+
+    #[test]
+    fn expected_exit_or_idle_exit_adds_no_error() {
+        let mut c = SessionCore::new("s1", Box::new(|_| {}));
+        c.enqueue(json!({ "clientId": "a", "text": "hi" })).unwrap();
+        let acts = c.on_exit(None);
+        assert!(!acts.iter().any(|a| matches!(a, Action::MakerEvent(_))), "自己关的不报错");
+        let mut idle = SessionCore::new("s2", Box::new(|_| {}));
+        assert!(!idle.on_exit(Some("exit code 1")).iter().any(|a| matches!(a, Action::MakerEvent(_))), "没有回合时不造 error");
     }
 
     #[test]

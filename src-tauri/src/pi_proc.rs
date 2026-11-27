@@ -44,6 +44,8 @@ pub struct PiSession {
     /// 读线程句柄：shutdown 等它收尾，保证 `sink.exited` 在 shutdown 返回前已跑完（热切重建时旧进程的清理不会误伤新会话）。
     reader: Mutex<Option<std::thread::JoinHandle<()>>>,
     exited: std::sync::atomic::AtomicBool,
+    /// shutdown 已开始：之后的退出是我们自己关的，不报错。
+    closing: std::sync::atomic::AtomicBool,
     /// 回合收尾时一次性触发的重建钩子：设置后，收尾不再派发队列里的下一条，交给钩子把队列迁到重建后的会话。
     rebuild_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// 会话工作目录：`!cmd` 在这里执行。
@@ -52,6 +54,21 @@ pub struct PiSession {
     bang_pending: Mutex<Vec<(String, crate::bang_cmd::Outcome)>>,
     /// 有一条 `!cmd` 正在跑：同一会话一次只跑一条，避免输出事件交错。
     bang_running: std::sync::atomic::AtomicBool,
+}
+
+/// 退出原因的可读描述。被信号杀掉（如 macOS 的签名校验失败 SIGKILL）时没有退出码，要说出信号。
+fn describe_exit(s: std::process::ExitStatus) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = s.signal() {
+            return format!("killed by signal {sig}");
+        }
+    }
+    match s.code() {
+        Some(c) => format!("exit code {c}"),
+        None => "unknown".to_string(),
+    }
 }
 
 fn write_line(stdin: &mut ChildStdin, v: &Value) -> std::io::Result<()> {
@@ -83,7 +100,7 @@ impl PiSession {
         let log_sid = sid.clone();
         let core = SessionCore::new(&sid, Box::new(move |m| eprintln!("[maker:{log_sid}] {m}")));
         let inner = Arc::new(Mutex::new(Inner { core, stdin, runtime_dir: None }));
-        let session = Arc::new(Self { session_id: sid.clone(), inner: inner.clone(), sink: sink.clone(), child: Mutex::new(Some(child)), pid, reader: Mutex::new(None), exited: std::sync::atomic::AtomicBool::new(false), rebuild_hook: Mutex::new(None), cwd: cwd.to_path_buf(), bang_pending: Mutex::new(Vec::new()), bang_running: std::sync::atomic::AtomicBool::new(false) });
+        let session = Arc::new(Self { session_id: sid.clone(), inner: inner.clone(), sink: sink.clone(), child: Mutex::new(Some(child)), pid, reader: Mutex::new(None), exited: std::sync::atomic::AtomicBool::new(false), closing: std::sync::atomic::AtomicBool::new(false), rebuild_hook: Mutex::new(None), cwd: cwd.to_path_buf(), bang_pending: Mutex::new(Vec::new()), bang_running: std::sync::atomic::AtomicBool::new(false) });
 
         let reader_session = session.clone();
         let handle = std::thread::Builder::new().name(format!("pi-reader-{sid}")).spawn(move || {
@@ -98,8 +115,10 @@ impl PiSession {
                 }
             }
             // stdout 关闭 = 进程结束。回收退出码，并让所有悬挂的审批以拒绝收尾。
-            let code = reader_session.child.lock().ok().and_then(|mut g| g.take()).and_then(|mut c| c.wait().ok()).and_then(|s| s.code());
-            reader_session.on_exit();
+            let status = reader_session.child.lock().ok().and_then(|mut g| g.take()).and_then(|mut c| c.wait().ok());
+            let code = status.and_then(|s| s.code());
+            let reason = status.map(describe_exit);
+            reader_session.on_exit(reason.as_deref());
             reader_session.sink.exited(&reader_session.session_id, code);
         })?;
         *session.reader.lock().unwrap() = Some(handle);
@@ -272,9 +291,11 @@ impl PiSession {
         }
     }
 
-    fn on_exit(&self) {
+    fn on_exit(&self, reason: Option<&str>) {
         self.exited.store(true, std::sync::atomic::Ordering::SeqCst);
-        let actions = self.inner.lock().unwrap().core.on_exit();
+        // 我们自己关的（shutdown）不算意外；子进程已被 shutdown 取走时 reason 也是 None。
+        let unexpected = if self.closing.load(std::sync::atomic::Ordering::SeqCst) { None } else { Some(reason.unwrap_or("unknown")) };
+        let actions = self.inner.lock().unwrap().core.on_exit(unexpected);
         self.run(actions);
     }
 
@@ -316,6 +337,7 @@ impl PiSession {
 
     /// 关闭：先拒绝所有待处理审批，再关 stdin，等进程自行退出；超时则杀掉。
     pub fn shutdown(&self) {
+        self.closing.store(true, std::sync::atomic::Ordering::SeqCst);
         self.cancel_all("session_closed");
         self.inner.lock().unwrap().stdin.take();
         let child = self.child.lock().unwrap().take();
