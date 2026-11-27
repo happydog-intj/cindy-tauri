@@ -73,7 +73,6 @@ import { SidebarRailNavigation, SidebarTopNav } from '@/components/sidebar/Sideb
 import { SidebarFilterPopover } from './sidebar/SidebarFilterPopover';
 import { MainListScopeHeader } from './sidebar/MainListScopeHeader';
 import { SharedTasksSection } from '@/features/device-link/SharedTasksSection';
-import { TeammatesSection } from '@/features/bots/TeammatesSection';
 import { TeammateSearchResults, useTeammateSearchMatches } from '@/features/bots/TeammateSearchResults';
 import { useNavigationAttention } from '@/lib/navigationAttentionStore';
 import { useActiveMainView } from '@/hooks/useActiveMainView';
@@ -3770,8 +3769,6 @@ function ExpandedView({
           ) : null}
           {/* 搜索时原列表只隐藏、不卸载:置顶段折叠等本地 state 才能保住。 */}
           <div hidden={searchActive} className="flex flex-col gap-2">
-            {/* 伙伴段:侧栏第一层,固定在置顶上方(2026-10-13 定稿),/bots 与 /cc-agent 共用。 */}
-            <TeammatesSection />
             <SharedTasksSection activeSessionId={activeSessionId} localSessions={sessions}
               runningSessionIds={displayRunningSessionIds} attachedSessionIds={attachedSessionIds} notifications={sidebarNotifications}
               onAction={handleActionClick} onRename={handleRename} onTogglePin={handleTogglePin}
