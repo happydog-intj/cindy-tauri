@@ -15,14 +15,15 @@
 
 ## 本地对上游文件的改动
 
-同步时这些改动会被覆盖，需要手动带回来。下面四处是导入之后对上游文件的全部改动，行数很少。
+同步时这些改动会被覆盖，需要手动带回来。下面五处是导入之后对上游文件的全部改动，行数很少。
 
 | 文件 | 改动 | 本仓库提交 |
 | --- | --- | --- |
 | `frontend/package.json` | `pnpm.supportedArchitectures` 改成只装当前平台（上游列了全部 os/cpu，会装 8 份 claude 二进制）。`scripts/sync-frontend.sh` 已自动重做这一步，不用手动处理。 | `0c9130a` |
 | `frontend/apps/desktop/src/renderer/features/bots/TeammatesSection.tsx` | 去掉侧边栏"添加伙伴"：删除 `BotCreateMenu` 的导入、标题右侧的 `<BotCreateMenu variant="header" />`，以及空状态分支（只剩列表分支）。 | `41ccdc0` |
 | `frontend/apps/desktop/src/renderer/features/bots/BotCreateMenu.tsx` | 整个文件删除。 | `41ccdc0` |
-| `frontend/apps/desktop/src/renderer/features/cc-agent/CCAgentSidebarUpper.tsx` | 侧边栏不再渲染"伙伴"段：删除 `TeammatesSection` 的导入和 `<TeammatesSection />`。`TeammatesSection.tsx` 本身保留，`/bots` 路由不动。 | 本次提交 |
+| `frontend/apps/desktop/src/renderer/features/cc-agent/CCAgentSidebarUpper.tsx` | 侧边栏不再渲染"伙伴"段：删除 `TeammatesSection` 的导入和 `<TeammatesSection />`。`TeammatesSection.tsx` 本身保留，`/bots` 路由不动。 | `54ec05c` |
+| `frontend/apps/desktop/src/renderer/components/sidebar/SidebarTopNav.tsx` | 去掉侧边栏的"更多"：展开态的"更多"行（`customizeRow` 的定义和三处使用）和收起态 rail 里的 `<SidebarNavigationMoreMenu>`。`SidebarNavigationMoreMenu`、`customizing` 状态等现在没有入口，故意没删，以减小和上游的差异。 | 本次提交 |
 
 同步后检查：上游如果又改了 `TeammatesSection.tsx`，用 `git diff` 看冲突，再重做上表的删除。`BotCreateMenu.tsx` 会被同步重新带回来，需要再删一次。
 

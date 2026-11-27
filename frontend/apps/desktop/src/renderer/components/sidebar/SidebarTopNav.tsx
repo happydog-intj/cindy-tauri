@@ -385,32 +385,6 @@ export function SidebarRailNavigation({
           />
         );
       })}
-      <SidebarNavigationMoreMenu
-        hiddenIds={entries.hidden}
-        actions={actions}
-        appFor={entries.appFor}
-        unseen={entries.unseen}
-        onSeen={entries.markSeen}
-        onCloseAutoFocus={handleMoreCloseAutoFocus}
-        trigger={(open) => (
-          // The open menu already names itself; keep the tooltip from covering it.
-          <Tip text={t('sidebar.navigation.more')} side="right" controlledOpen={open ? false : undefined}>
-            <button
-              type="button"
-              className={cn(SIDEBAR_RAIL_ICON_BUTTON_CLASS, 'relative')}
-              aria-label={entries.unseen.size > 0
-                ? `${t('sidebar.navigation.more')} · ${t('sidebar.navigation.new')}`
-                : t('sidebar.navigation.more')}
-            >
-              <Ellipsis size={18} />
-              {/* The rail has no room for the tag; a static dot marks new entries. */}
-              {entries.unseen.size > 0 && (
-                <AttentionDot size={6} className="absolute right-1.5 top-1.5" />
-              )}
-            </button>
-          </Tip>
-        )}
-      />
     </>
   );
 }
@@ -508,34 +482,6 @@ export function SidebarTopNav({
   const renderRows = (ids: readonly SidebarNavigationEntryId[]) => ids
     .map((id) => <Fragment key={id}>{rowFor(id)}</Fragment>);
   const orderedNavigationRows = renderRows(orderedIds);
-  const customizeRow = showScrollable ? (
-    <SidebarNavigationMoreMenu
-      hiddenIds={entries.hidden}
-      actions={actions}
-      appFor={entries.appFor}
-      unseen={entries.unseen}
-      onSeen={entries.markSeen}
-      onCustomize={() => setCustomizing(true)}
-      trigger={() => (
-        <button
-          type="button"
-          // Keep the row lit while the pointer is over its menu.
-          className={cn(ROW_CLASS, 'data-[state=open]:bg-sidebar-item-hover')}
-          aria-label={entries.unseen.size > 0
-            ? `${t('sidebar.navigation.more')} · ${t('sidebar.navigation.new')}`
-            : t('sidebar.navigation.more')}
-        >
-          <Ellipsis
-            size={15}
-            strokeWidth={1.8}
-            className="shrink-0 text-[var(--sidebar-nav-text)]"
-          />
-          <span className="leading-none">{t('sidebar.navigation.more')}</span>
-          {entries.unseen.size > 0 && <NewTag className="ml-auto" />}
-        </button>
-      )}
-    />
-  ) : null;
 
   // 滚动段把搜索行拆成滚动容器的直接子项:sticky 才能钉在结果列表上,
   // 不被短导航父盒的底边提前带走。输入框仍是同一份实例。
@@ -556,7 +502,6 @@ export function SidebarTopNav({
         ) : !showSearch ? (
           <div className="flex flex-col gap-0.5 pr-3 pl-3">
             {orderedNavigationRows}
-            {customizeRow}
           </div>
         ) : (
           <>
@@ -576,7 +521,6 @@ export function SidebarTopNav({
                 results follow them instead of replacing them. */}
             <div className="-mt-1.5 flex flex-col gap-0.5 pr-3 pl-3">
               {rowsAfterSearch}
-                {customizeRow}
             </div>
           </>
         )}
@@ -618,7 +562,6 @@ export function SidebarTopNav({
         ) : (
           orderedNavigationRows
         ))}
-      {showScrollable && !customizing && customizeRow}
     </div>
   );
 }
