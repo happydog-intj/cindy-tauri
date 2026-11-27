@@ -46,6 +46,12 @@ pub struct PiSession {
     exited: std::sync::atomic::AtomicBool,
     /// 回合收尾时一次性触发的重建钩子：设置后，收尾不再派发队列里的下一条，交给钩子把队列迁到重建后的会话。
     rebuild_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// 会话工作目录：`!cmd` 在这里执行。
+    cwd: std::path::PathBuf,
+    /// `!cmd` 的结果，附在下一条发给模型的 prompt 前面（发出后清空）。
+    bang_pending: Mutex<Vec<(String, crate::bang_cmd::Outcome)>>,
+    /// 有一条 `!cmd` 正在跑：同一会话一次只跑一条，避免输出事件交错。
+    bang_running: std::sync::atomic::AtomicBool,
 }
 
 fn write_line(stdin: &mut ChildStdin, v: &Value) -> std::io::Result<()> {
@@ -77,7 +83,7 @@ impl PiSession {
         let log_sid = sid.clone();
         let core = SessionCore::new(&sid, Box::new(move |m| eprintln!("[maker:{log_sid}] {m}")));
         let inner = Arc::new(Mutex::new(Inner { core, stdin, runtime_dir: None }));
-        let session = Arc::new(Self { session_id: sid.clone(), inner: inner.clone(), sink: sink.clone(), child: Mutex::new(Some(child)), pid, reader: Mutex::new(None), exited: std::sync::atomic::AtomicBool::new(false), rebuild_hook: Mutex::new(None) });
+        let session = Arc::new(Self { session_id: sid.clone(), inner: inner.clone(), sink: sink.clone(), child: Mutex::new(Some(child)), pid, reader: Mutex::new(None), exited: std::sync::atomic::AtomicBool::new(false), rebuild_hook: Mutex::new(None), cwd: cwd.to_path_buf(), bang_pending: Mutex::new(Vec::new()), bang_running: std::sync::atomic::AtomicBool::new(false) });
 
         let reader_session = session.clone();
         let handle = std::thread::Builder::new().name(format!("pi-reader-{sid}")).spawn(move || {
@@ -127,7 +133,15 @@ impl PiSession {
                     settled_projection = p["turnInProgress"] == json!(false);
                     self.sink.projection(p);
                 }
-                Action::SendToPi(v) => {
+                Action::SendToPi(mut v) => {
+                    // 把 `!cmd` 的结果带给模型：只在发 prompt 时附上一次。
+                    if v["type"] == "prompt" {
+                        let runs = std::mem::take(&mut *self.bang_pending.lock().unwrap());
+                        if !runs.is_empty() {
+                            let msg = v["message"].as_str().unwrap_or("");
+                            v["message"] = json!(format!("{}{msg}", crate::bang_cmd::context_block(&runs)));
+                        }
+                    }
                     let _ = self.send(&v);
                 }
                 Action::MakerEvent(e) => self.sink.maker_event(&self.session_id, e),
@@ -171,6 +185,37 @@ impl PiSession {
 
     pub fn projection(&self) -> Value {
         self.inner.lock().unwrap().core.projection()
+    }
+
+    /// `!cmd`：不经模型，在工作目录里直接执行。用户消息先落库，再在后台线程跑命令，结果以工具卡片事件推出。
+    /// 回合进行中拒绝：此时插入工具事件会和助手输出交错。
+    pub fn run_bang(self: &Arc<Self>, item: &Value, cmd: String) -> Result<Value, String> {
+        use std::sync::atomic::Ordering;
+        if self.inner.lock().unwrap().core.turn_in_progress() {
+            return Err("[INVALID_PARAMS] 模型正在回答，等它结束后再用 ! 执行命令".to_string());
+        }
+        if self.bang_running.swap(true, Ordering::SeqCst) {
+            return Err("[INVALID_PARAMS] 上一条 ! 命令还在执行".to_string());
+        }
+        let text = item["text"].as_str().unwrap_or("");
+        let content = item["persistedContent"].as_str().unwrap_or(text).to_string();
+        self.sink.user_message(&self.session_id, item["clientId"].as_str().unwrap_or(""), &content);
+        let me = self.clone();
+        let spawned = std::thread::Builder::new().name(format!("bang-{}", self.session_id)).spawn(move || {
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let id = format!("bang-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed));
+            let out = crate::bang_cmd::run(&cmd, &me.cwd, crate::bang_cmd::TIMEOUT);
+            for ev in crate::bang_cmd::events(&id, &cmd, &out) {
+                me.sink.maker_event(&me.session_id, ev);
+            }
+            me.bang_pending.lock().unwrap().push((cmd, out));
+            me.bang_running.store(false, Ordering::SeqCst);
+        });
+        if let Err(e) = spawned {
+            self.bang_running.store(false, Ordering::SeqCst);
+            return Err(format!("[INTERNAL] 无法启动命令线程：{e}"));
+        }
+        Ok(self.projection())
     }
 
     pub fn stop(&self, keep_queue: bool, pause_queue: bool) -> Value {
@@ -577,6 +622,67 @@ printf '%s\n' "{\"type\":\"echo\",\"ack\":$ack,\"answer\":$answer}"
         let _ = std::fs::remove_dir_all(&tmp);
         assert!(text.contains("remember-me-please"), "第一轮历史仍在");
         assert!(text.contains("second-turn"), "第二轮续写进同一个文件");
+    }
+
+    /// `!cmd` 是否被注册表接走由 maker_registry 决定；这里直接测会话层：命令不经模型、结果成事件、下一轮 prompt 带上输出。
+    #[cfg(unix)]
+    #[test]
+    fn bang_command_runs_without_model_and_feeds_next_turn() {
+        let Some((bin, mock, node)) = e2e_env() else { eprintln!("skip: PI_RS_BIN/MOCK_OPENAI not set"); return };
+        let dump = std::env::temp_dir().join(format!("pi-proc-bang-dump-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dump);
+        let mut mock_child = Command::new(&node).arg(&mock).env("MOCK_DUMP", "1").env("MOCK_DUMP_DIR", &dump)
+            .stdout(Stdio::piped()).stderr(Stdio::null()).spawn().expect("spawn mock");
+        let mut line = String::new();
+        BufReader::new(mock_child.stdout.as_mut().unwrap()).read_line(&mut line).unwrap();
+        let port = serde_json::from_str::<Value>(&line).unwrap()["port"].as_u64().unwrap() as u16;
+        let (s, sink, rx, tmp) = e2e_session(&bin, port, "bang");
+
+        let proj = s.run_bang(&json!({ "clientId": "b1", "text": "!echo BANG_OUT_42" }), "echo BANG_OUT_42".to_string()).unwrap();
+        assert_eq!(proj["turnInProgress"], false, "不开模型回合");
+        assert!(wait_until(&rx, || has_event(&sink, "tool_result_full")), "命令结果应以工具卡片事件推出");
+        let evs = sink.events.lock().unwrap().clone();
+        let full = evs.iter().find(|e| e["type"] == "tool_result_full").unwrap();
+        assert!(full["data"]["fullText"].as_str().unwrap().contains("BANG_OUT_42"));
+        assert_eq!(full["data"]["isError"], false);
+        assert!(!has_event(&sink, "done"), "没有模型回合就不会有 done");
+        assert!(std::fs::read_dir(&dump).map(|d| d.count()).unwrap_or(0) == 0, "没有请求到过模型");
+
+        // 下一轮对话：prompt 前面带着刚才的命令与输出，且只带一次。
+        s.enqueue(json!({ "clientId": "c1", "text": "what was that" })).unwrap();
+        assert!(wait_until(&rx, || has_event(&sink, "done")), "正常回合应收尾");
+        let body = std::fs::read_dir(&dump).unwrap().filter_map(|e| e.ok())
+            .map(|e| std::fs::read_to_string(e.path()).unwrap_or_default()).collect::<Vec<_>>().join("\n");
+        assert!(body.contains("$ echo BANG_OUT_42") && body.contains("BANG_OUT_42") && body.contains("what was that"), "模型应看到命令和输出");
+        assert!(s.bang_pending.lock().unwrap().is_empty(), "发出后清空，不重复带");
+
+        s.shutdown();
+        let _ = mock_child.kill();
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&dump);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bang_command_is_refused_during_a_model_turn() {
+        let Some((bin, mock, node)) = e2e_env() else { eprintln!("skip: PI_RS_BIN/MOCK_OPENAI not set"); return };
+        let (mut mock_child, port) = start_mock(&node, &mock);
+        let (s, sink, rx, tmp) = e2e_session(&bin, port, "bang-busy");
+        s.enqueue(json!({ "clientId": "c1", "text": "MOCK_SLOW please" })).unwrap();
+        let err = s.run_bang(&json!({ "clientId": "b1", "text": "!echo x" }), "echo x".into()).unwrap_err();
+        assert!(err.contains("模型正在回答"), "{err}");
+        assert!(!has_event(&sink, "tool_result_full"));
+        assert!(wait_until(&rx, || has_event(&sink, "done")));
+        // 回合结束后可以跑，且 running 标记已复位（可以连着跑第二条）。
+        for i in 0..2 {
+            let before = sink.events.lock().unwrap().iter().filter(|e| e["type"] == "tool_result_full").count();
+            s.run_bang(&json!({ "clientId": format!("b{i}"), "text": "!true" }), "true".into()).unwrap();
+            assert!(wait_until(&rx, || sink.events.lock().unwrap().iter().filter(|e| e["type"] == "tool_result_full").count() > before));
+            assert!(wait_until(&rx, || !s.bang_running.load(std::sync::atomic::Ordering::SeqCst)));
+        }
+        s.shutdown();
+        let _ = mock_child.kill();
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

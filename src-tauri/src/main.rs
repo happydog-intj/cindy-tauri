@@ -37,6 +37,7 @@ mod import_sessions;
 mod shell_policy;
 mod browser;
 mod desktop_import;
+mod bang_cmd;
 mod input_queue;
 mod interactions;
 mod maker_host;

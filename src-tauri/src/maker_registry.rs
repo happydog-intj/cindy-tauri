@@ -357,6 +357,13 @@ impl MakerRegistry {
                     }
                 }
                 let session = self.ensure(&id, Some(&opts))?;
+                // `!cmd`：用户直接在会话目录里执行命令，不经模型。只认 renderer / 手机端的输入框（带附件的消息照常发给模型）。
+                if let Some(cmd) = item["text"].as_str().and_then(crate::bang_cmd::parse) {
+                    let has_attachments = ["images", "files"].iter().any(|k| item[*k].as_array().map(|a| !a.is_empty()).unwrap_or(false));
+                    if !has_attachments && !item["origin"].is_object() {
+                        return session.run_bang(&item, cmd.to_string()).map_err(|e| fail("INVALID_PARAMS", e.trim_start_matches("[INVALID_PARAMS] ")));
+                    }
+                }
                 session.enqueue(item).map_err(|e| fail("INVALID_PARAMS", e))
             }
             "maker:input:stop" => {
@@ -541,6 +548,25 @@ mod tests {
         let err = r.invoke("maker:input:enqueue", &[json!("s1"), it]).unwrap_err();
         assert!(err.starts_with("[MODEL_NOT_CONFIGURED]"), "{err}");
         assert_eq!(r.invoke("maker:list-active", &[]).unwrap(), json!([]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bang_text_is_run_directly_but_attachments_and_goal_turns_go_to_the_model() {
+        let (r, _) = registry();
+        // 纯文本 !cmd：直接执行，不入队（队列里没有它，也没开回合）。
+        let p = r.invoke("maker:input:enqueue", &[json!("s1"), json!({ "clientId": "a", "text": "!true", "createOpts": { "model": "m" } })]).unwrap();
+        assert_eq!(p["turnInProgress"], false);
+        assert!(p["pendingQueue"].as_array().unwrap().is_empty());
+        // 带附件、goal 发起的回合：照常当作发给模型的消息（cat 吞掉 stdin，回合保持进行中）。
+        let p = r.invoke("maker:input:enqueue", &[json!("s2"), json!({ "clientId": "a", "text": "!true", "images": [{ "x": 1 }], "createOpts": { "model": "m" } })]).unwrap();
+        assert_eq!(p["turnInProgress"], true, "带图片的消息不当命令");
+        let p = r.invoke("maker:input:enqueue", &[json!("s3"), json!({ "clientId": "a", "text": "!true", "origin": { "kind": "goal" }, "createOpts": { "model": "m" } })]).unwrap();
+        assert_eq!(p["turnInProgress"], true, "goal 回合不当命令");
+        // 回合进行中再发 !cmd：被拒绝，错误带 [INVALID_PARAMS] 码（只出现一次）。
+        let err = r.invoke("maker:input:enqueue", &[json!("s2"), json!({ "clientId": "b", "text": "!true" })]).unwrap_err();
+        assert!(err.starts_with("[INVALID_PARAMS] ") && !err["[INVALID_PARAMS] ".len()..].starts_with('['), "{err}");
+        assert!(err.contains("模型正在回答"), "{err}");
     }
 
     #[test]
