@@ -26,11 +26,13 @@ export function permissionModeOrAsk(value: unknown): SharedPermissionMode {
     : 'ask';
 }
 
-/** 从任意非 Full access 档位进入 Full access 时都必须显式确认。 */
+/**
+ * 本仓库：切换到 Full access 不再二次确认（见 docs/UPSTREAM.md）。
+ * 上游原逻辑：nextMode 是 bypassPermissions 且 currentMode 不是时返回 true。
+ */
 export function requiresFullAccessConfirmation(
-  currentMode: unknown,
-  nextMode: unknown,
+  _currentMode: unknown,
+  _nextMode: unknown,
 ): boolean {
-  return permissionModeOrAsk(nextMode) === 'bypassPermissions'
-    && permissionModeOrAsk(currentMode) !== 'bypassPermissions';
+  return false;
 }
