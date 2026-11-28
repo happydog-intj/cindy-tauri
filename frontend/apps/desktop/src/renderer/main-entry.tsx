@@ -11,7 +11,7 @@ import '@google/model-viewer';
 
 // 在任何 React 组件渲染前先 import 触发 i18next 同步 init —— 否则首屏 useTranslation
 // 拿到的会是 fallback 英文文案再瞬切到目标语言，造成可见闪烁。
-import '@/i18n';
+import { i18nReady } from '@/i18n';
 import './themes/colors';
 
 import { TopLevelErrorBoundary } from './components/error/TopLevelErrorBoundary';
@@ -149,6 +149,8 @@ if (!rootElement) {
 const root = createRoot(rootElement);
 
 void (async () => {
+  // 语言资源按需加载：渲染前必须就绪，否则首屏先显示 key 再换成翻译。
+  await i18nReady;
   if (isComputerPermissionBackdrop) {
     const { ComputerPermissionBackdrop } = await import(
       './components/settings/ComputerPermissionGuideWindow'

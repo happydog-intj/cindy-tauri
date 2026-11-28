@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client';
 import '@fontsource-variable/inter';
 import 'harmonyos-sans-sc-webfont-splitted';
 
-import '@/i18n';
+import { i18nReady } from '@/i18n';
 import './themes/colors';
 import './styles/globals.css';
 
@@ -24,8 +24,10 @@ const rootElement = document.getElementById('root');
 const bridge = window.regionScreenshotPin;
 if (!rootElement || !bridge) throw new Error('Missing pin root or bridge');
 
+void i18nReady.then(() => {
 createRoot(rootElement).render(
   <ScreenshotErrorBoundary onFailure={() => bridge.command('close')}>
     <PinView bridge={bridge} />
   </ScreenshotErrorBoundary>,
 );
+});

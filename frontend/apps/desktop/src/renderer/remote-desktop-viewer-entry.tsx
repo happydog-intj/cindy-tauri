@@ -1,7 +1,7 @@
 import { createRoot } from 'react-dom/client';
 import '@fontsource-variable/inter';
 import 'harmonyos-sans-sc-webfont-splitted';
-import '@/i18n';
+import { i18nReady } from '@/i18n';
 import './themes/colors';
 import './styles/globals.css';
 import './features/remote-desktop/viewerWindow.css';
@@ -22,6 +22,7 @@ themeService.applyTheme(getInitialThemeVariant().theme);
 applyFontSettings(getInitialFontSettings());
 const root = document.getElementById('root');
 if (!root) throw new Error('Missing viewer root');
+void i18nReady.then(() => {
 createRoot(root).render(
   <TopLevelErrorBoundary>
     <ThemeProvider syncWindowVibrancy={false}>
@@ -31,3 +32,4 @@ createRoot(root).render(
     </ThemeProvider>
   </TopLevelErrorBoundary>,
 );
+});

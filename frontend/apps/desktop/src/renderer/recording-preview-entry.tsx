@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import '@fontsource-variable/inter';
 import 'harmonyos-sans-sc-webfont-splitted';
-import i18n from '@/i18n';
+import i18n, { i18nReady } from '@/i18n';
 import './themes/colors';
 import './styles/globals.css';
 import { RecordingPreview } from './features/region-screenshot/RecordingPreview';
@@ -28,4 +28,6 @@ function App() {
   }, []);
   return clip ? <RecordingPreview key={clip.token} document={clip} bridge={bridge} /> : null;
 }
+void i18nReady.then(() => {
 createRoot(document.getElementById('root')!).render(<ScreenshotErrorBoundary onFailure={() => bridge.failed()}><App /></ScreenshotErrorBoundary>);
+});

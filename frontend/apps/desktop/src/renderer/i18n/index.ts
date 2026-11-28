@@ -9,34 +9,10 @@
  *   'system' 的实际语言由 main 侧读取 OS 首选语言后传入 renderer。
  */
 
-import esCommon from './locales/es/common.json';
-import esAiRename from './locales/es/aiRename.json';
-import frCommon from './locales/fr/common.json';
-import frAiRename from './locales/fr/aiRename.json';
-import deCommon from './locales/de/common.json';
-import deAiRename from './locales/de/aiRename.json';
-import ptPTCommon from './locales/pt-PT/common.json';
-import ptPTAiRename from './locales/pt-PT/aiRename.json';
-import ptBRCommon from './locales/pt-BR/common.json';
-import ptBRAiRename from './locales/pt-BR/aiRename.json';
-import lzhCommon from './locales/zh-Hant-x-lzh/common.json';
-import lzhAiRename from './locales/zh-Hant-x-lzh/aiRename.json';
-import lzhHansCommon from './locales/zh-Hans-x-lzh/common.json';
-import lzhHansAiRename from './locales/zh-Hans-x-lzh/aiRename.json';
 import i18n from 'i18next';
 import { initReactI18next } from 'react-i18next';
 import { BRAND_NAME } from '@cindy/maker-shared/branding';
 
-import enCommon from './locales/en/common.json';
-import enAiRename from './locales/en/aiRename.json';
-import zhCNCommon from './locales/zh-CN/common.json';
-import zhCNAiRename from './locales/zh-CN/aiRename.json';
-import zhTWCommon from './locales/zh-TW/common.json';
-import zhTWAIName from './locales/zh-TW/aiRename.json';
-import jaCommon from './locales/ja/common.json';
-import jaAiRename from './locales/ja/aiRename.json';
-import koCommon from './locales/ko/common.json';
-import koAiRename from './locales/ko/aiRename.json';
 import { GHOST_OFFICIAL_ID_PREFIX } from '../../shared/ghost';
 import { DEFAULT_LOCALE } from '../../shared/locale';
 import { getEffectiveLocale } from '../lib/localePreference';
@@ -51,13 +27,33 @@ export type { LocalePreference, SupportedLocale } from '../../shared/locale';
 
 // 凭证写入逃生口必须在全部语言里共用同一条安全命令；集中覆盖防止某个 locale 又退回
 // “手动设置环境变量”的危险指引。对应跨 locale 契约由 devOAuthWritePolicy.test 锁住。
-const resources = {
-  'es': { common: esCommon, aiRename: esAiRename },
-  'fr': { common: frCommon, aiRename: frAiRename },
-  'de': { common: deCommon, aiRename: deAiRename },
-  'pt-PT': { common: ptPTCommon, aiRename: ptPTAiRename },
-  'pt-BR': { common: ptBRCommon, aiRename: ptBRAiRename },
-  'zh-Hant-x-lzh': {
+// 每种语言一个异步加载器：只在用到时才取对应的 JSON（每种约 1 MB），首屏不再带上全部 12 种语言。
+// 凭证写入逃生口必须在全部语言里共用同一条安全命令；集中覆盖防止某个 locale 又退回
+// “手动设置环境变量”的危险指引。对应跨 locale 契约由 devOAuthWritePolicy.test 锁住。
+const localeLoaders: Record<string, () => Promise<{ common: Record<string, any>; aiRename: Record<string, any> }>> = {
+  'es': async () => {
+    const [{ default: esCommon }, { default: esAiRename }] = await Promise.all([import('./locales/es/common.json'), import('./locales/es/aiRename.json')]);
+    return { common: esCommon, aiRename: esAiRename };
+  },
+  'fr': async () => {
+    const [{ default: frCommon }, { default: frAiRename }] = await Promise.all([import('./locales/fr/common.json'), import('./locales/fr/aiRename.json')]);
+    return { common: frCommon, aiRename: frAiRename };
+  },
+  'de': async () => {
+    const [{ default: deCommon }, { default: deAiRename }] = await Promise.all([import('./locales/de/common.json'), import('./locales/de/aiRename.json')]);
+    return { common: deCommon, aiRename: deAiRename };
+  },
+  'pt-PT': async () => {
+    const [{ default: ptPTCommon }, { default: ptPTAiRename }] = await Promise.all([import('./locales/pt-PT/common.json'), import('./locales/pt-PT/aiRename.json')]);
+    return { common: ptPTCommon, aiRename: ptPTAiRename };
+  },
+  'pt-BR': async () => {
+    const [{ default: ptBRCommon }, { default: ptBRAiRename }] = await Promise.all([import('./locales/pt-BR/common.json'), import('./locales/pt-BR/aiRename.json')]);
+    return { common: ptBRCommon, aiRename: ptBRAiRename };
+  },
+  'zh-Hant-x-lzh': async () => {
+    const [{ default: lzhCommon }, { default: lzhAiRename }] = await Promise.all([import('./locales/zh-Hant-x-lzh/common.json'), import('./locales/zh-Hant-x-lzh/aiRename.json')]);
+    return {
     common: {
       ...lzhCommon,
       chatgptAuthRecovery: {
@@ -66,8 +62,11 @@ const resources = {
       },
     },
     aiRename: lzhAiRename,
+  };
   },
-  'zh-Hans-x-lzh': {
+  'zh-Hans-x-lzh': async () => {
+    const [{ default: lzhHansCommon }, { default: lzhHansAiRename }] = await Promise.all([import('./locales/zh-Hans-x-lzh/common.json'), import('./locales/zh-Hans-x-lzh/aiRename.json')]);
+    return {
     common: {
       ...lzhHansCommon,
       chatgptAuthRecovery: {
@@ -76,8 +75,11 @@ const resources = {
       },
     },
     aiRename: lzhHansAiRename,
+  };
   },
-  en: {
+  en: async () => {
+    const [{ default: enCommon }, { default: enAiRename }] = await Promise.all([import('./locales/en/common.json'), import('./locales/en/aiRename.json')]);
+    return {
     common: {
       ...enCommon,
       chatgptAuthRecovery: {
@@ -86,8 +88,11 @@ const resources = {
       },
     },
     aiRename: enAiRename,
+  };
   },
-  'zh-CN': {
+  'zh-CN': async () => {
+    const [{ default: zhCNCommon }, { default: zhCNAiRename }] = await Promise.all([import('./locales/zh-CN/common.json'), import('./locales/zh-CN/aiRename.json')]);
+    return {
     common: {
       ...zhCNCommon,
       chatgptAuthRecovery: {
@@ -96,8 +101,11 @@ const resources = {
       },
     },
     aiRename: zhCNAiRename,
+  };
   },
-  'zh-TW': {
+  'zh-TW': async () => {
+    const [{ default: zhTWCommon }, { default: zhTWAIName }] = await Promise.all([import('./locales/zh-TW/common.json'), import('./locales/zh-TW/aiRename.json')]);
+    return {
     common: {
       ...zhTWCommon,
       chatgptAuthRecovery: {
@@ -106,8 +114,11 @@ const resources = {
       },
     },
     aiRename: zhTWAIName,
+  };
   },
-  ja: {
+  ja: async () => {
+    const [{ default: jaCommon }, { default: jaAiRename }] = await Promise.all([import('./locales/ja/common.json'), import('./locales/ja/aiRename.json')]);
+    return {
     common: {
       ...jaCommon,
       chatgptAuthRecovery: {
@@ -116,8 +127,11 @@ const resources = {
       },
     },
     aiRename: jaAiRename,
+  };
   },
-  ko: {
+  ko: async () => {
+    const [{ default: koCommon }, { default: koAiRename }] = await Promise.all([import('./locales/ko/common.json'), import('./locales/ko/aiRename.json')]);
+    return {
     common: {
       ...koCommon,
       chatgptAuthRecovery: {
@@ -126,13 +140,57 @@ const resources = {
       },
     },
     aiRename: koAiRename,
+  };
   },
-} as const;
+};
 
-// 同步 init —— 没有 backend / detector / suspense，i18n.init 立即返回。
-// 不 await 也安全：所有 t() 调用之前 init 已经完成 (本文件 import 即 init)。
+// 每种语言的加载状态：同一语言只加载一次，加载失败后允许重试。
+const loading = new Map<string, Promise<void>>();
+
+/** 把某种语言的资源加进 i18next（已加载则直接返回）。未知语言或加载失败都不抛错，由 fallbackLng 兜底。 */
+export function ensureLocaleLoaded(lng: string): Promise<void> {
+  const loader = localeLoaders[lng];
+  if (!loader || i18n.hasResourceBundle(lng, 'common')) return Promise.resolve();
+  let p = loading.get(lng);
+  if (!p) {
+    p = loader()
+      .then((res) => {
+        i18n.addResourceBundle(lng, 'common', res.common, true, true);
+        i18n.addResourceBundle(lng, 'aiRename', res.aiRename, true, true);
+      })
+      .catch((e) => {
+        console.warn(`[i18n] failed to load locale ${lng}`, e);
+      })
+      .finally(() => loading.delete(lng));
+    loading.set(lng, p);
+  }
+  return p;
+}
+
+// 缺 key 时的回退链（与下面 init 的 fallbackLng 保持一致）：先加载这些，再切到目标语言。
+function fallbackChain(lng: string): string[] {
+  if (lng === 'zh-Hant-x-lzh') return ['zh-TW', DEFAULT_LOCALE];
+  if (lng === 'zh-Hans-x-lzh') return ['zh-CN', DEFAULT_LOCALE];
+  return [DEFAULT_LOCALE];
+}
+
+/** 加载某语言及其回退语言。 */
+function loadWithFallbacks(lng: string): Promise<unknown> {
+  return Promise.all([lng, ...fallbackChain(lng)].map(ensureLocaleLoaded));
+}
+
+// 切换语言前先把资源加载好，否则切换瞬间会短暂显示回退语言或 key。
+const originalChangeLanguage = i18n.changeLanguage.bind(i18n);
+i18n.changeLanguage = (async (lng?: string, ...rest: unknown[]) => {
+  if (lng) await loadWithFallbacks(lng);
+  return (originalChangeLanguage as (l?: string, ...r: unknown[]) => unknown)(lng, ...rest);
+}) as typeof i18n.changeLanguage;
+
+// 不带资源初始化（resources 为空），随后由 `i18nReady` 加载当前语言。
+// 入口必须在首次渲染前 await `i18nReady`，否则首屏会先显示 key 再换成翻译。
 void i18n.use(initReactI18next).init({
-  resources,
+  resources: {},
+  partialBundledLanguages: true,
   // 翻译资源热更新会重新执行本模块，不能把用户已选语言重置为默认英文。
   lng: getEffectiveLocale(),
   // 缺 key 回退英文。
@@ -173,6 +231,11 @@ void i18n.use(initReactI18next).init({
   },
   returnNull: false,
 });
+
+/** 当前语言（及回退语言）加载完成。入口在渲染前 await 它。 */
+export const i18nReady: Promise<void> = loadWithFallbacks(getEffectiveLocale()).then(() =>
+  originalChangeLanguage(getEffectiveLocale()).then(() => undefined),
+);
 
 export { i18n };
 export default i18n;

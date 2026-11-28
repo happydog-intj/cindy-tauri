@@ -4,7 +4,7 @@ import '@fontsource-variable/inter';
 import '@fontsource-variable/jetbrains-mono';
 import 'harmonyos-sans-sc-webfont-splitted';
 
-import '@/i18n';
+import { i18nReady } from '@/i18n';
 import './themes/colors';
 import './styles/globals.css';
 
@@ -25,8 +25,10 @@ applyFontSettings(getInitialFontSettings());
 const rootElement = document.getElementById('root');
 if (!rootElement) throw new Error('Missing #root element');
 
+void i18nReady.then(() => {
 createRoot(rootElement).render(
   <TopLevelErrorBoundary>
     <ResourceUsageWindowRoot />
   </TopLevelErrorBoundary>,
 );
+});
