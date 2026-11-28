@@ -217,3 +217,56 @@ fn cold_start_restores_the_session_from_the_stored_refresh_token() {
     let _ = cloud.kill();
     let _ = std::fs::remove_dir_all(&data);
 }
+
+/// 对着真实的 cindy-server 走一遍 request-code → verify-code（验证码取自服务端 stderr）。
+/// 设置 `CINDY_SERVER_BIN` 才跑，默认跳过。
+#[test]
+fn login_against_cindy_server() {
+    let Some(bin) = std::env::var("CINDY_SERVER_BIN").ok() else { eprintln!("skip: CINDY_SERVER_BIN not set"); return };
+    let Some(e) = env() else { eprintln!("skip: PI_RS_BIN/MOCK_OPENAI not set"); return };
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let db = std::env::temp_dir().join(format!("auth-e2e-server-{}-{port}.db", std::process::id()));
+    let _ = std::fs::remove_file(&db);
+    let mut server = std::process::Command::new(bin)
+        .env("CINDY_SERVER_ADDR", format!("127.0.0.1:{port}"))
+        .env("CINDY_SERVER_DB", db)
+        .env("CINDY_SERVER_ALLOWED_EMAILS", "me@example.com")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn cindy-server");
+    let stderr = server.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for l in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
+            let _ = tx.send(l);
+        }
+    });
+    let t0 = std::time::Instant::now();
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(t0.elapsed() < Duration::from_secs(10), "cindy-server 没起来");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let base = format!("http://127.0.0.1:{port}");
+    let data = temp("srv-login");
+    let r = Rig::start_with_env(&e, 9, &data, &[("CINDY_TAURI_AUTH_BASE_URL", base.clone())]);
+    r.ipc("auth:exit-local", json!([])).unwrap();
+    let st = r.ipc("auth:get-login-state", json!([])).unwrap();
+    assert_eq!(st["success"], true, "{st}");
+    let act = |a: Value| r.ipc("auth:dispatch-login-action", json!([a])).unwrap();
+    let d = act(json!({"type":"discover","email":"me@example.com"}));
+    assert_eq!(d["state"]["step"], "method-choice", "{d}");
+    let sent = act(json!({"type":"request-code","kind":"email","identifier":"me@example.com"}));
+    assert_eq!(sent["state"]["step"], "verification-code", "request-code 应进入输码页：{sent}");
+    let code = loop {
+        let l = rx.recv_timeout(Duration::from_secs(5)).expect("服务端日志里没有验证码");
+        if let Some(c) = l.split("登录验证码").nth(1).and_then(|r| r.split(": ").nth(1)).map(|r| r.chars().take(6).collect::<String>()) {
+            break c;
+        }
+    };
+    let done = act(json!({"type":"verify-code","kind":"email","identifier":"me@example.com","code":code}));
+    assert_eq!(done["state"]["step"], "completed", "{done}");
+    r.stop();
+    let _ = server.kill();
+}

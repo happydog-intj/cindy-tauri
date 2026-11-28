@@ -235,6 +235,7 @@ fn boot_script() -> String {
         "smoke": smoke_out().is_some(),
         "sessionSmoke": session_smoke_phase().is_some(),
         "sessionSmokePhase": session_smoke_phase(),
+        "loginSmokeEmail": smoke_out().and(std::env::var("CINDY_TAURI_SMOKE_LOGIN_EMAIL").ok()),
         "settingsSmoke": smoke_out().is_some() && std::env::var("CINDY_TAURI_SMOKE_SETTINGS").as_deref() == Ok("1"),
         // 浏览器面板冒烟用的本地测试页（scripts/smoke.mjs 起的 127.0.0.1 服务）。
         "browserSmokeUrl": smoke_out().and(std::env::var("CINDY_TAURI_SMOKE_BROWSER_URL").ok()),

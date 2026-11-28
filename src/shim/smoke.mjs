@@ -15,6 +15,10 @@ export function installRendererSmoke() {
   const boot = window.__CINDY_BOOT__ ?? {};
   if (!boot.smoke || location.pathname.startsWith('/__smoke/')) return;
   const invoke = (cmd, args) => window.__TAURI_INTERNALS__.invoke(cmd, args);
+  if (boot.loginSmokeEmail) {
+    void runLoginSmoke(boot.loginSmokeEmail, invoke);
+    return;
+  }
   const errors = [];
   window.addEventListener('error', (e) => errors.push(String(e.message ?? e)));
   window.addEventListener('unhandledrejection', (e) => errors.push(String(e.reason?.message ?? e.reason)));
@@ -700,4 +704,73 @@ async function sessionVerify(api, invoke, result) {
   }
   const info = await invoke('smoke_info').catch(() => null);
   if (info?.apiKey) await keyedProviderVerify(api, result);
+}
+
+// ---------- 登录页点击冒烟 ----------
+// CINDY_TAURI_SMOKE_LOGIN_EMAIL 设置时，不跑常规冒烟：在真实登录页填邮箱、点继续，
+// 遇到协议弹窗就同意，最后看是否进了输码页，并把每一步的页面状态写进结果。
+async function runLoginSmoke(email, invoke) {
+  const steps = [];
+  const q = (id) => document.querySelector(`[data-testid="${id}"]`);
+  const panel = () => [...document.querySelectorAll('[data-testid^="login-panel"]')].map((n) => n.dataset.testid).join(',');
+  const note = (what) => steps.push({ t: Date.now() - t0, what, panel: panel(), consent: !!q('login-consent-dialog'), text: (document.getElementById('root')?.innerText ?? '').replace(/\s+/g, ' ').slice(0, 500), errs: (window.__loginSmokeErrs ?? []).slice(-5) });
+  const until = async (fn, ms) => {
+    const end = Date.now() + ms;
+    while (Date.now() < end) {
+      const v = fn();
+      if (v) return v;
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    return null;
+  };
+  window.__loginSmokeErrs = [];
+  // 记录界面发出的每个登录动作及 Rust 的返回，用来对照界面路径和直接调用的差别。
+  const origDispatch = window.electronAPI.authDispatchLoginAction.bind(window.electronAPI);
+  window.electronAPI.authDispatchLoginAction = async (action) => {
+    const r = await origDispatch(action);
+    steps.push({ t: Date.now() - t0, what: `ui dispatch ${action.type}`, panel: '', consent: false, text: `${JSON.stringify(action, (k, v) => (v === undefined ? '__undefined__' : v))} => ${JSON.stringify({ success: r?.success, code: r?.code, step: r?.state?.step })}` });
+    return r;
+  };
+  window.addEventListener('unhandledrejection', (e) => window.__loginSmokeErrs.push(String(e.reason?.message ?? e.reason)));
+  const t0 = Date.now();
+  let ok = false;
+  try {
+    // 本地模式主界面：先点“登录 Cindy”进登录页（没有稳定的 testid，按按钮文字找）。
+    const entry = await until(() => q('login-panel-identifier') || [...document.querySelectorAll('button')].find((b) => b.innerText.trim() === '登录 Cindy'), 60_000);
+    if (entry && !q('login-panel-identifier')) {
+      entry.click();
+      note('clicked 登录 Cindy');
+    }
+    const input = await until(() => q('login-panel-identifier') && document.querySelector('input[type="email"]'), 20_000);
+    note('identifier page');
+    if (!input) throw new Error('没有出现邮箱输入页');
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+    setter.call(input, email);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    const btn = await until(() => { const b = q('login-continue-button'); return b && !b.disabled ? b : null; }, 5000);
+    if (!btn) throw new Error('继续按钮一直不可点');
+    btn.click();
+    note('clicked continue');
+    // 协议弹窗出现就点同意
+    const agree = await until(() => q('login-consent-agree') || q('login-panel-verification'), 5000);
+    note('after continue');
+    if (agree && agree.dataset.testid === 'login-consent-agree') {
+      agree.click();
+      note('clicked agree');
+    }
+    const reached = await until(() => q('login-panel-verification') || q('login-panel-error') || q('login-panel-method-choice'), 15_000);
+    note('final');
+    ok = !!reached && reached.dataset.testid === 'login-panel-verification';
+    if (!ok && reached?.dataset.testid === 'login-panel-method-choice') {
+      q('login-method-personal')?.click();
+      note('clicked personal');
+      const c = await until(() => q('login-consent-agree') || q('login-panel-verification'), 5000);
+      if (c?.dataset.testid === 'login-consent-agree') c.click();
+      ok = !!(await until(() => q('login-panel-verification'), 15_000));
+      note('after personal');
+    }
+  } catch (err) {
+    note(`error: ${err?.message ?? err}`);
+  }
+  await invoke('smoke_finish', { ok, detail: JSON.stringify({ loginSmoke: true, steps }) });
 }
