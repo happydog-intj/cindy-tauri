@@ -277,6 +277,15 @@ pub fn update(db: &LocalDb, conn: &Connection, id: &Value, patch: &Value) -> Res
     }
     let mut sets: Vec<String> = Vec::new();
     let mut vals: Vec<Value> = Vec::new();
+    // 附加目录：字符串数组，库里存 JSON 文本。校验（存在、去重、上限、授权）在调用方做，这里只挡类型错误。
+    for (k, col) in [("extraDirs", "extra_dirs"), ("writableDirs", "writable_dirs")] {
+        let Some(v) = p.get(k) else { continue };
+        if !v.as_array().is_some_and(|a| a.len() <= 64 && a.iter().all(|d| d.as_str().is_some_and(|d| !d.is_empty() && d.len() <= 4096))) {
+            return fail("INVALID_PARAMS", format!("{k} must be a string array"));
+        }
+        sets.push(format!("{col} = ?"));
+        vals.push(json!(v.to_string()));
+    }
     for (k, col) in PATCH_COLUMNS {
         let Some(v) = p.get(k) else { continue };
         let mut v = v.clone();

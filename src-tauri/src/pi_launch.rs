@@ -117,7 +117,31 @@ pub fn prepare(
 
 /// 切换权限档（`maker:set-permission-mode`）：改写文件即可，pi-rs 下次工具调用就按新档位。
 pub fn set_permission_mode(runtime_dir: &Path, mode: &str) -> std::io::Result<()> {
-    std::fs::write(runtime_dir.join("permission.json"), json!({ "mode": mode }).to_string())
+    update_permission_file(runtime_dir, |o| {
+        o.insert("mode".into(), json!(mode));
+    })
+}
+
+/// 附加可写目录：写进权限档的 writableRoots，pi-rs 的权限门每次现读。
+pub fn set_writable_roots(runtime_dir: &Path, roots: &[String]) -> std::io::Result<()> {
+    update_permission_file(runtime_dir, |o| {
+        o.insert("writableRoots".into(), json!(roots));
+    })
+}
+
+/// 读改写权限档，保留其它字段（档位与可写目录各改各的，互不覆盖）。读不到或不是对象时从空对象开始。
+fn update_permission_file(runtime_dir: &Path, f: impl FnOnce(&mut serde_json::Map<String, Value>)) -> std::io::Result<()> {
+    let path = runtime_dir.join("permission.json");
+    let mut cur = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| if let Value::Object(o) = v { Some(o) } else { None })
+        .unwrap_or_default();
+    f(&mut cur);
+    // 先写临时文件再改名：pi-rs 随时在读，不能让它读到半截内容。
+    let tmp = runtime_dir.join("permission.json.tmp");
+    std::fs::write(&tmp, Value::Object(cur).to_string())?;
+    std::fs::rename(&tmp, &path)
 }
 
 /// 会话关闭：删掉运行目录（含 key 文件）。会话历史在 pi-sessions 里，保留。

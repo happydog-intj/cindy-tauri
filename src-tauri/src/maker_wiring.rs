@@ -39,10 +39,15 @@ impl HostBackend for DbBackend {
                 }
                 Ok(Value::Null)
             }
+            // 会话行上的普通字段补丁（附加目录），走 sessions.update 的校验。
+            "host.update-session" => {
+                self.db.update_session(sid, &p["patch"])?;
+                Ok(Value::Null)
+            }
             "host.session-resume-info" => {
                 let s = self.db.get_session(sid);
                 let f = |k: &str| s.as_ref().map(|s| s[k].clone()).unwrap_or(Value::Null);
-                Ok(json!({ "workingDir": f("workingDir"), "sdkSessionId": f("sdkSessionId"), "providerId": f("providerId"), "model": f("model") }))
+                Ok(json!({ "workingDir": f("workingDir"), "sdkSessionId": f("sdkSessionId"), "providerId": f("providerId"), "model": f("model"), "extraDirs": f("extraDirs"), "writableDirs": f("writableDirs") }))
             }
             "host.sync-sdk-session-id" => {
                 if let Some(id) = p["sdkSessionId"].as_str().filter(|s| !s.is_empty()) {

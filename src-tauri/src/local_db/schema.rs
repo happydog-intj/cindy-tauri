@@ -2,7 +2,7 @@
 
 use rusqlite::Connection;
 
-const MIGRATIONS: [&str; 3] = [
+const MIGRATIONS: [&str; 4] = [
     r#"
   CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
@@ -96,7 +96,30 @@ const MIGRATIONS: [&str; 3] = [
     updated_at INTEGER NOT NULL
   );
   "#,
+    // 附加只读目录与附加可写目录（JSON 数组）。
+    r#"
+  ALTER TABLE sessions ADD COLUMN extra_dirs TEXT NOT NULL DEFAULT '[]';
+  ALTER TABLE sessions ADD COLUMN writable_dirs TEXT NOT NULL DEFAULT '[]';
+  "#,
 ];
+
+/// 迁移 4 加的两列：从 Electron 导入来的库可能已经有了，重复 ADD COLUMN 会报错，已有的跳过。
+fn migration_sql(db: &Connection, v: usize) -> String {
+    if v != 3 {
+        return MIGRATIONS[v].to_string();
+    }
+    let has = |col: &str| {
+        db.prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name = ?1")
+            .and_then(|mut s| s.exists([col]))
+            .unwrap_or(false)
+    };
+    ["extra_dirs", "writable_dirs"]
+        .iter()
+        .filter(|c| !has(c))
+        .map(|c| format!("ALTER TABLE sessions ADD COLUMN {c} TEXT NOT NULL DEFAULT '[]';"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
 
@@ -108,7 +131,7 @@ pub fn migrate(db: &Connection) -> Result<(), String> {
     for v in current..SCHEMA_VERSION {
         db.execute_batch("BEGIN").map_err(|e| e.to_string())?;
         let r = db
-            .execute_batch(MIGRATIONS[v as usize])
+            .execute_batch(&migration_sql(db, v as usize))
             .and_then(|_| db.execute_batch(&format!("PRAGMA user_version = {}", v + 1)))
             .and_then(|_| db.execute_batch("COMMIT"));
         if let Err(e) = r {

@@ -226,8 +226,9 @@ pub fn session_to_camel(row: &Row, boot_at: i64) -> Row {
         put(k, Value::Null);
     }
     put("usedProjectContext", json!(false));
-    put("extraDirs", json!([]));
-    put("writableDirs", json!([]));
+    let dirs = |k: &str| row.get(k).and_then(Value::as_str).and_then(|t| serde_json::from_str::<Value>(t).ok()).filter(Value::is_array).unwrap_or(json!([]));
+    put("extraDirs", dirs("extra_dirs"));
+    put("writableDirs", dirs("writable_dirs"));
     put("activeTurnStartedAt", s(row, "active_turn_started_at"));
     put("lastTurnEndedAt", s(row, "last_turn_ended_at"));
     put("createdAt", iso(i(row, "created_at")).map(Value::String).unwrap_or(Value::Null));

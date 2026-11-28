@@ -1043,3 +1043,86 @@ fn rust_sessions_continue_an_imported_desktop_task_from_its_pi_session_file_with
     let _ = mock.kill();
     let _ = std::fs::remove_dir_all(&data);
 }
+
+/// 附加目录：设置落库、可写目录需要选择器授权、提示词带进每轮消息、权限档带 writableRoots，重启后仍然生效。
+#[test]
+fn rust_sessions_extra_and_writable_dirs_are_persisted_prompted_and_granted() {
+    let Some(e) = env() else { eprintln!("skip: PI_RS_BIN/MOCK_OPENAI not set"); return };
+    let (mut mock, port, log) = start_mock_logged(&e, &[]);
+    let data = temp("extradirs");
+    let r = Rig::start(&e, port, &data);
+    let row = r.new_row("Dirs E2E", "smoke");
+    let sid = row["id"].as_str().unwrap().to_string();
+    let opts = json!({ "agentKind": "pi", "id": sid, "model": "mock-model", "providerId": "smoke", "permissionMode": "ask", "workingDir": row["workingDir"], "workspaceKind": "dialogue" });
+    let refs = data.join("refs-dir");
+    let out = data.join("out-dir");
+    std::fs::create_dir_all(&refs).unwrap();
+    std::fs::create_dir_all(&out).unwrap();
+    let (refs_s, out_s) = (refs.to_string_lossy().to_string(), out.to_string_lossy().to_string());
+    let last_user = |mark: usize| -> String { chat_requests(&log, mark).last().and_then(|q| q["lastUser"].as_str().map(String::from)).unwrap_or_default() };
+
+    // 1) 没设目录：消息原样发出。
+    let mark = log.lock().unwrap().len();
+    r.enqueue_text(&sid, "d1", "hello", &opts).unwrap();
+    r.wait("turn 1", 60, || done_count(&r, &sid) >= 1);
+    assert_eq!(last_user(mark), "hello");
+
+    // 2) 只读目录：不需要选择器；运行中的会话下一轮就带上提示，库里已落库。
+    let kept = r.ipc("maker:set-extra-dirs", json!([sid, [refs_s, refs_s, "relative/x", "/no/such/dir-xyz"]])).unwrap();
+    assert_eq!(kept, json!([refs_s]), "去重并丢掉非法项");
+    let db = r.ipc("local-db:sessions:get", json!([sid])).unwrap();
+    assert_eq!(db["extraDirs"], json!([refs_s]), "{db}");
+    let mark = log.lock().unwrap().len();
+    r.enqueue_text(&sid, "d2", "second", &opts).unwrap();
+    r.wait("turn 2", 60, || done_count(&r, &sid) >= 2);
+    let msg = last_user(mark);
+    assert!(msg.contains("<cindy-extra-reference-directories>") && msg.contains("- refs-dir") && msg.ends_with("second"), "{msg}");
+
+    // 3) 可写目录：没经过选择器的一律拒绝，库里不变。
+    let denied = r.ipc("maker:set-writable-dirs", json!([sid, [out_s]])).unwrap_err();
+    assert!(denied.contains("[PRECONDITION_FAILED]") && denied.contains("system picker"), "{denied}");
+    assert_eq!(r.ipc("local-db:sessions:get", json!([sid])).unwrap()["writableDirs"], json!([]));
+
+    // 4) 经选择器选中后放行（选择器本身需要窗口，这里直接登记授权）。授权只能用一次。
+    crate::dir_grants::issue_picker_grant(&sid, &out_s).unwrap();
+    assert_eq!(r.ipc("maker:set-writable-dirs", json!([sid, [out_s]])).unwrap(), json!([out_s]));
+    assert_eq!(r.ipc("local-db:sessions:get", json!([sid])).unwrap()["writableDirs"], json!([out_s]));
+    let perm: Value = serde_json::from_str(&std::fs::read_to_string(data.join("pi-runtime").join(&sid).join("permission.json")).unwrap()).unwrap();
+    assert_eq!(perm["writableRoots"], json!([out_s]), "{perm}");
+    assert_eq!(perm["mode"], "ask", "改可写目录不能冲掉权限档位: {perm}");
+    r.ipc("maker:set-permission-mode", json!([sid, "auto"])).unwrap();
+    let perm: Value = serde_json::from_str(&std::fs::read_to_string(data.join("pi-runtime").join(&sid).join("permission.json")).unwrap()).unwrap();
+    assert!(perm["mode"] == "auto" && perm["writableRoots"] == json!([out_s]), "改档位不能冲掉可写目录: {perm}");
+    let mark = log.lock().unwrap().len();
+    r.enqueue_text(&sid, "d3", "third", &opts).unwrap();
+    r.wait("turn 3", 60, || done_count(&r, &sid) >= 3);
+    let msg = last_user(mark);
+    assert!(msg.contains("<cindy-extra-writable-directories>") && msg.contains(&format!("- {out_s}")), "{msg}");
+
+    // 5) 只读和可写不能指向同一棵树。
+    let none = r.ipc("maker:set-extra-dirs", json!([sid, [refs_s, out_s]])).unwrap();
+    assert_eq!(none, json!([refs_s]), "已是可写目录的不能再当只读: {none}");
+
+    // 6) 重启后按库里的目录重建：权限档与提示词都在。
+    r.stop();
+    let r = Rig::start(&e, port, &data);
+    let mark = log.lock().unwrap().len();
+    r.enqueue_text(&sid, "d4", "after restart", &opts).unwrap();
+    r.wait("turn after restart", 60, || done_count(&r, &sid) >= 1);
+    let msg = last_user(mark);
+    assert!(msg.contains("- refs-dir") && msg.contains(&format!("- {out_s}")) && msg.ends_with("after restart"), "{msg}");
+    let perm: Value = serde_json::from_str(&std::fs::read_to_string(data.join("pi-runtime").join(&sid).join("permission.json")).unwrap()).unwrap();
+    assert_eq!(perm["writableRoots"], json!([out_s]), "{perm}");
+
+    // 7) 撤销：空数组清掉授权，提示消失。
+    assert_eq!(r.ipc("maker:set-writable-dirs", json!([sid, []])).unwrap(), json!([]));
+    assert_eq!(r.ipc("maker:set-extra-dirs", json!([sid, []])).unwrap(), json!([]));
+    let mark = log.lock().unwrap().len();
+    r.enqueue_text(&sid, "d5", "plain", &opts).unwrap();
+    r.wait("turn after revoke", 60, || done_count(&r, &sid) >= 2);
+    assert_eq!(last_user(mark), "plain");
+
+    r.stop();
+    let _ = mock.kill();
+    let _ = std::fs::remove_dir_all(&data);
+}

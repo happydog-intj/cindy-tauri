@@ -54,6 +54,8 @@ pub struct PiSession {
     bang_pending: Mutex<Vec<(String, crate::bang_cmd::Outcome)>>,
     /// 有一条 `!cmd` 正在跑：同一会话一次只跑一条，避免输出事件交错。
     bang_running: std::sync::atomic::AtomicBool,
+    /// 附加目录提示（只读参考目录 + 可写目录），每轮 prompt 前面都带一份；目录变了就换成新的。
+    dirs_prompt: Mutex<String>,
 }
 
 /// 退出原因的可读描述。被信号杀掉（如 macOS 的签名校验失败 SIGKILL）时没有退出码，要说出信号。
@@ -110,7 +112,7 @@ impl PiSession {
         let log_sid = sid.clone();
         let core = SessionCore::new(&sid, Box::new(move |m| eprintln!("[maker:{log_sid}] {m}")));
         let inner = Arc::new(Mutex::new(Inner { core, stdin, runtime_dir: None }));
-        let session = Arc::new(Self { session_id: sid.clone(), inner: inner.clone(), sink: sink.clone(), child: Mutex::new(Some(child)), pid, reader: Mutex::new(None), exited: std::sync::atomic::AtomicBool::new(false), closing: std::sync::atomic::AtomicBool::new(false), rebuild_hook: Mutex::new(None), cwd: cwd.to_path_buf(), bang_pending: Mutex::new(Vec::new()), bang_running: std::sync::atomic::AtomicBool::new(false) });
+        let session = Arc::new(Self { session_id: sid.clone(), inner: inner.clone(), sink: sink.clone(), child: Mutex::new(Some(child)), pid, reader: Mutex::new(None), exited: std::sync::atomic::AtomicBool::new(false), closing: std::sync::atomic::AtomicBool::new(false), rebuild_hook: Mutex::new(None), cwd: cwd.to_path_buf(), bang_pending: Mutex::new(Vec::new()), bang_running: std::sync::atomic::AtomicBool::new(false), dirs_prompt: Mutex::new(String::new()) });
 
         let reader_session = session.clone();
         let handle = std::thread::Builder::new().name(format!("pi-reader-{sid}")).spawn(move || {
@@ -165,6 +167,11 @@ impl PiSession {
                 Action::SendToPi(mut v) => {
                     // 把 `!cmd` 的结果带给模型：只在发 prompt 时附上一次。
                     if v["type"] == "prompt" {
+                        let dirs = self.dirs_prompt.lock().unwrap().clone();
+                        if !dirs.is_empty() {
+                            let msg = v["message"].as_str().unwrap_or("");
+                            v["message"] = json!(format!("{dirs}\n\n{msg}"));
+                        }
                         let runs = std::mem::take(&mut *self.bang_pending.lock().unwrap());
                         if !runs.is_empty() {
                             let msg = v["message"].as_str().unwrap_or("");
@@ -292,6 +299,17 @@ impl PiSession {
     /// 登记运行目录（权限档文件在里面）。工厂在 spawn 之后调用。
     pub fn set_runtime_dir(&self, dir: std::path::PathBuf) {
         self.inner.lock().unwrap().runtime_dir = Some(dir);
+    }
+
+    /// 附加目录变更：可写目录写进权限档（立即对下一次工具调用生效），提示词随之更新（下一轮起带上）。
+    /// 没有运行目录（测试用假进程）时只更新提示词。
+    pub fn set_dirs(&self, extra_dirs: &[String], writable_dirs: &[String]) -> std::io::Result<()> {
+        *self.dirs_prompt.lock().unwrap() = crate::dir_grants::prompt(extra_dirs, writable_dirs);
+        let dir = self.inner.lock().unwrap().runtime_dir.clone();
+        match dir {
+            Some(d) => crate::pi_launch::set_writable_roots(&d, writable_dirs),
+            None => Ok(()),
+        }
     }
 
     /// `maker:set-permission-mode`：改写权限档文件，下一次工具调用就按新档位。没有运行目录（测试用假进程）时为 no-op。

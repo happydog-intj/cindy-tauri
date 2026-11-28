@@ -47,7 +47,15 @@ fn dump(db: &LocalDb) -> Value {
     for (t, order) in [("sessions", "id"), ("messages", "rowid"), ("recent_workdirs", "path"), ("project_aliases", "project_key"), ("right_sidebar_tabs", "id"), ("session_goals", "session_id")] {
         let sel = if t == "messages" { "rowid AS _rowid, *" } else { "*" };
         let rows = sql::all(&g.conn, &format!("SELECT {sel} FROM {t} ORDER BY {order}"), &[]).unwrap();
-        out.insert(t.into(), Value::Array(rows.into_iter().map(Value::Object).collect()));
+        // extra_dirs / writable_dirs 是 Rust 版新增的列（原版 JS 库没有，附加目录原先只在 renderer 侧），不参与与 JS 的逐字对比。
+        let rows = rows.into_iter().map(|mut r| {
+            if t == "sessions" {
+                r.remove("extra_dirs");
+                r.remove("writable_dirs");
+            }
+            r
+        });
+        out.insert(t.into(), Value::Array(rows.map(Value::Object).collect()));
     }
     Value::Object(out)
 }

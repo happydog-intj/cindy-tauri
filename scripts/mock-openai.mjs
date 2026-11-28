@@ -209,6 +209,8 @@ const server = createServer(async (req, res) => {
         n, method: req.method, path: url.pathname, ...(auth ? { auth } : {}), model: body.model, stream: body.stream === true,
         ...(LOG_HEADER_NAMES ? { headers: Object.keys(req.headers).sort() } : {}),
         messages: Array.isArray(body.messages) ? body.messages.map((m) => m?.role).join(',') : null,
+        // 最近一条 user 消息的正文（截断），测宿主有没有往消息前面加内容。
+        lastUser: (() => { const us = (Array.isArray(body.messages) ? body.messages : []).filter((m) => m?.role === 'user'); return us.length ? textOf(us[us.length - 1].content).slice(0, 2000) : null; })(),
         tools: Array.isArray(body.tools) ? body.tools.map((t) => t?.function?.name ?? t?.name) : [],
         reply: reply.kind === 'tool' ? { tool: reply.name, args: reply.args } : { text: reply.text }, reason: reply.reason,
       });

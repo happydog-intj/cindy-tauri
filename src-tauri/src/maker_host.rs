@@ -208,6 +208,10 @@ fn str_opt<'a>(v: &'a Value, k: &str) -> Option<&'a str> {
 }
 
 /// 与 maker-ipc 的 dialogueDir 同规则：没有工作目录的会话落到 dialogues/<日期>/<id>。
+fn dir_list(v: &Value) -> Vec<String> {
+    v.as_array().map(|a| a.iter().filter_map(|d| d.as_str().map(String::from)).collect()).unwrap_or_default()
+}
+
 fn dialogue_dir(data_dir: &Path, session_id: &str, today: &str) -> PathBuf {
     data_dir.join("dialogues").join(today).join(session_id)
 }
@@ -276,6 +280,13 @@ impl SessionFactory for HostFactory {
             })?;
 
         session.set_runtime_dir(plan.runtime_dir.clone());
+        // 附加目录：库里记着的授权要在新进程里重新生效（重启、换模型、切工作目录后重建都走这里）。
+        let (extra, writable) = (dir_list(&resume["extraDirs"]), dir_list(&resume["writableDirs"]));
+        if !extra.is_empty() || !writable.is_empty() {
+            if let Err(e) = session.set_dirs(&extra, &writable) {
+                eprintln!("[maker-host] apply extra dirs failed for {session_id}: {e}");
+            }
+        }
         // 续接历史：进程起来后发 switch_session（pi-rs 已有此命令；命令行没有 --session）。
         // 文件不存在 / 读不了时 pi-rs 会回失败应答，会话仍以空历史可用，不让续接失败拖垮建会话。
         if let Some(file) = resume_file.filter(|f| f != "<pending>") {
@@ -315,6 +326,15 @@ impl SessionFactory for HostFactory {
     fn current_provider(&self, session_id: &str) -> Option<String> {
         let info = self.backend.call("host.session-resume-info", json!({ "sessionId": session_id })).ok()?;
         info["providerId"].as_str().filter(|s| !s.is_empty()).map(String::from)
+    }
+
+    fn session_dirs(&self, session_id: &str) -> Value {
+        let info = self.backend.call("host.session-resume-info", json!({ "sessionId": session_id })).unwrap_or(Value::Null);
+        json!({ "extraDirs": info["extraDirs"], "writableDirs": info["writableDirs"], "workingDir": info["workingDir"] })
+    }
+
+    fn save_dirs(&self, session_id: &str, patch: Value) -> Result<(), String> {
+        self.backend.call("host.update-session", json!({ "sessionId": session_id, "patch": patch })).map(|_| ())
     }
 
     fn persist_patch(&self, session_id: &str, patch: Value) {

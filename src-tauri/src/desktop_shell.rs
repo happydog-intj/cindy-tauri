@@ -464,13 +464,20 @@ impl DesktopShell {
 
     fn show_open_directory(&self, params: &Value) -> Result<Value, String> {
         let body = if params.is_object() { params } else { &Value::Null };
+        let mut scope = None;
         if let Some(g) = body.get("writableGrantScope") {
-            if !g.as_str().is_some_and(|s| !s.is_empty() && s.len() <= 128) {
-                return fail("INVALID_PARAMS", "invalid writable directory grant scope");
+            match g.as_str().filter(|s| !s.is_empty() && s.len() <= 128) {
+                Some(s) => scope = Some(s.to_string()),
+                None => return fail("INVALID_PARAMS", "invalid writable directory grant scope"),
             }
         }
-        // extraDirs 可写授权还没移植（Pi 能力里 extraDirs 为 false），这里只做选择。
         let picked = self.pick_folder(Self::optional_absolute(body.get("defaultPath"), "defaultPath")?)?;
+        // 带 writableGrantScope 的选择：选中的目录登记为该任务的可写授权，之后 set-writable-dirs 才放行。
+        if let (Some(scope), Some(dir)) = (scope, picked.as_str()) {
+            if let Err(e) = crate::dir_grants::issue_picker_grant(&scope, dir) {
+                return Err(e);
+            }
+        }
         Ok(json!({ "success": true, "path": nullable(picked) }))
     }
 

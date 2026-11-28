@@ -44,11 +44,19 @@ pub trait SessionFactory: Send + Sync + 'static {
     }
     /// 把选择写进会话行（下次建会话按库里的模型走）。
     fn persist_patch(&self, _session_id: &str, _patch: Value) {}
+    /// 会话行里记的附加目录与工作目录：`{ extraDirs, writableDirs, workingDir }`。
+    fn session_dirs(&self, _session_id: &str) -> Value {
+        json!({ "extraDirs": [], "writableDirs": [], "workingDir": null })
+    }
+    /// 把附加目录写进会话行。失败要报错：授权没落库就不能当成已生效。
+    fn save_dirs(&self, _session_id: &str, _patch: Value) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 const PERMISSION_MODES: [&str; 6] = ["ask", "default", "acceptEdits", "plan", "auto", "bypassPermissions"];
 
-const OWNED: [&str; 20] = [
+const OWNED: [&str; 22] = [
     "maker:set-fast-mode",
     "maker:set-thinking-enabled",
     "maker:set-model",
@@ -56,6 +64,8 @@ const OWNED: [&str; 20] = [
     "maker:create-session",
     "maker:send",
     "maker:set-permission-mode",
+    "maker:set-extra-dirs",
+    "maker:set-writable-dirs",
     "maker:input:get-projection",
     "maker:input:enqueue",
     "maker:input:stop",
@@ -152,6 +162,33 @@ impl MakerRegistry {
 
     pub fn goal(&self) -> Option<Arc<crate::goal_host::GoalController>> {
         self.goal.get().cloned()
+    }
+
+    /// 设置附加目录（只读参考 / 可写）。与上游 applyDirectoryGrants 同口径：校验 → 去掉与另一类冲突的 →
+    /// 可写目录核对选择器授权 → 先落库再应用到运行中的会话。返回最终保留的目录。
+    fn set_dirs(&self, id: &str, writable: bool, requested: &[Value]) -> Result<Value, String> {
+        let cur = self.factory.session_dirs(id);
+        let list = |k: &str| -> Vec<String> { cur[k].as_array().map(|a| a.iter().filter_map(|d| d.as_str().map(String::from)).collect()).unwrap_or_default() };
+        let (extra, wr) = (list("extraDirs"), list("writableDirs"));
+        let (previous, blocked) = if writable { (&wr, &extra) } else { (&extra, &wr) };
+        let wd = cur["workingDir"].as_str();
+        let (valid, rejected) = crate::dir_grants::validate(requested, wd, (!writable).then_some(crate::dir_grants::EXTRA_DIRS_MAX));
+        for (p, why) in &rejected {
+            eprintln!("[maker-registry] {} 拒绝 {p}: {why}", if writable { "set-writable-dirs" } else { "set-extra-dirs" });
+        }
+        let next = crate::dir_grants::exclude_conflicts(valid, blocked);
+        if writable {
+            crate::dir_grants::consume_picker_grants(id, &next, previous)?;
+        }
+        if &next != previous {
+            let key = if writable { "writableDirs" } else { "extraDirs" };
+            self.factory.save_dirs(id, json!({ key: next }))?;
+        }
+        if let Some(s) = self.get(id) {
+            let (e, w) = if writable { (&extra, &next) } else { (&next, &wr) };
+            s.set_dirs(e, w).map_err(|e| fail("INTERNAL", e.to_string()))?;
+        }
+        Ok(json!(next))
     }
 
     fn get(&self, id: &str) -> Option<Arc<PiSession>> {
@@ -338,6 +375,14 @@ impl MakerRegistry {
                 }
                 // 会话未加载时只需落库，下次创建按库里的档位启动（由 host.upsert-session 在建会话时写入）。
                 Ok(Value::Null)
+            }
+            "maker:set-extra-dirs" | "maker:set-writable-dirs" => {
+                let id = session_id_arg(args)?;
+                let writable = channel == "maker:set-writable-dirs";
+                let Some(requested) = args.get(1).and_then(Value::as_array) else {
+                    return Err(fail("INVALID_PARAMS", "dirs must be string[]"));
+                };
+                self.set_dirs(&id, writable, requested)
             }
             "maker:input:get-projection" => {
                 let id = session_id_arg(args)?;
