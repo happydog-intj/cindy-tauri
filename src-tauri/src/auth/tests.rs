@@ -58,6 +58,19 @@ fn login_action_parsing_matches() {
     }
 }
 
+/// 回归：renderer 把 `captchaToken: undefined` 编码成 {"__cindy_t":"u"}，没有人机验证的服务端不带 token，
+/// 这时 request-code 不能被当成非法动作（否则登录页点“发送验证码”没反应）。
+#[test]
+fn request_code_accepts_encoded_undefined_captcha_token() {
+    let undef = json!({ "__cindy_t": "u" });
+    let got = parse_login_action(&json!({"type":"request-code","kind":"email","identifier":"a@b.co","captchaToken": undef}));
+    assert_eq!(got, Some(json!({"type":"request-code","kind":"email","identifier":"a@b.co"})));
+    // null、数字、空串仍然非法（与上游一致，见 actionCases）。
+    for bad in [json!(null), json!(5), json!("")] {
+        assert!(parse_login_action(&json!({"type":"request-code","kind":"email","identifier":"a@b.co","captchaToken": bad})).is_none(), "{bad}");
+    }
+}
+
 #[test]
 fn session_record_matches() {
     let g = golden();

@@ -166,6 +166,11 @@ const MAX_CODE: usize = 32;
 const MAX_CAPTCHA: usize = 2048;
 const MAX_ORG: usize = 253;
 
+/// IPC 编码里的 undefined。
+fn is_undefined_tag(v: &Value) -> bool {
+    v.as_object().and_then(|o| o.get("__cindy_t")).and_then(Value::as_str) == Some("u")
+}
+
 /// parseDesktopLoginAction：只保留各 action 认识的字段；非法返回 None。
 pub fn parse_login_action(value: &Value) -> Option<Value> {
     let m = value.as_object()?;
@@ -179,7 +184,8 @@ pub fn parse_login_action(value: &Value) -> Option<Value> {
         "request-code" => {
             let kind = kind_ok(g("kind"))?;
             let identifier = bounded(g("identifier"), MAX_IDENT)?;
-            if m.get("captchaToken").is_none() {
+            // renderer 把值为 undefined 的键编码成 {"__cindy_t":"u"}（Electron 的结构化克隆里它就是 undefined），按“没有这个键”处理；null 仍然非法。
+            if m.get("captchaToken").map_or(true, is_undefined_tag) {
                 json!({"type": t, "kind": kind, "identifier": identifier})
             } else {
                 json!({"type": t, "kind": kind, "identifier": identifier,
