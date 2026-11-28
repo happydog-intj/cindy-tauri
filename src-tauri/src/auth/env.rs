@@ -28,20 +28,55 @@ fn env_override(name: &str) -> Option<String> {
     r
 }
 
+/// 自建服务器地址（`cindy-server`）：同一个服务同时提供登录和设备互联。
+/// 只接受 https，或回环地址的 http；带用户名密码、查询、片段的一律拒绝，避免登录凭据被导向意外的位置。
+pub fn parse_server_url(raw: &str) -> Option<String> {
+    let u = url::Url::parse(raw.trim()).ok()?;
+    let loopback = matches!(u.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"));
+    let scheme_ok = u.scheme() == "https" || (u.scheme() == "http" && loopback);
+    let clean = u.username().is_empty() && u.password().is_none() && u.query().is_none() && u.fragment().is_none() && u.host_str().is_some();
+    (scheme_ok && clean).then(|| u.to_string().trim_end_matches('/').to_string())
+}
+
+static SERVER_BASE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// 启动时调用一次：环境变量 `CINDY_SERVER_URL` 优先，其次数据目录下 `server.json` 的 `{"url": "..."}`。
+/// 配置了但不合法时只记日志并退回官方地址，不静默改用别的主机。
+pub fn init_server_base(data_dir: &std::path::Path) {
+    let from_env = std::env::var("CINDY_SERVER_URL").ok().filter(|v| !v.is_empty());
+    let from_file = || {
+        let text = std::fs::read_to_string(data_dir.join("server.json")).ok()?;
+        serde_json::from_str::<Value>(&text).ok()?.get("url")?.as_str().map(String::from)
+    };
+    let raw = from_env.or_else(from_file);
+    let parsed = raw.as_deref().and_then(|r| {
+        let p = parse_server_url(r);
+        if p.is_none() {
+            eprintln!("[cloud-endpoints] ignoring server url: only https, or http on localhost, is allowed");
+        }
+        p
+    });
+    if let Some(u) = &parsed {
+        eprintln!("[cloud-endpoints] using custom server {u}");
+    }
+    let _ = SERVER_BASE.set(parsed);
+}
+
+fn custom_server() -> Option<String> {
+    SERVER_BASE.get().cloned().flatten()
+}
+
 pub fn auth_base_url() -> String {
-    env_override("CINDY_TAURI_AUTH_BASE_URL").unwrap_or_else(|| AUTH_API_BASE.into())
+    env_override("CINDY_TAURI_AUTH_BASE_URL").or_else(custom_server).unwrap_or_else(|| AUTH_API_BASE.into())
 }
 pub fn model_access_base_url() -> String {
-    env_override("CINDY_TAURI_MODEL_ACCESS_BASE_URL").unwrap_or_else(|| MODEL_ACCESS_BASE.into())
+    env_override("CINDY_TAURI_MODEL_ACCESS_BASE_URL").or_else(custom_server).unwrap_or_else(|| MODEL_ACCESS_BASE.into())
 }
 pub fn device_link_base_url() -> String {
-    env_override("CINDY_TAURI_DEVICE_LINK_BASE_URL").unwrap_or_else(|| DEVICE_LINK_BASE.into())
+    env_override("CINDY_TAURI_DEVICE_LINK_BASE_URL").or_else(custom_server).unwrap_or_else(|| DEVICE_LINK_BASE.into())
 }
 pub fn desktop_callback_url() -> String {
-    match env_override("CINDY_TAURI_AUTH_BASE_URL") {
-        Some(o) => format!("{o}/api/auth/desktop/callback"),
-        None => format!("{AUTH_API_BASE}/api/auth/desktop/callback"),
-    }
+    format!("{}/api/auth/desktop/callback", auth_base_url())
 }
 #[allow(dead_code)]
 pub fn website_url() -> &'static str {
@@ -121,6 +156,17 @@ impl Env for AppEnv {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn server_url_accepts_https_or_loopback_http_only() {
+        assert_eq!(super::parse_server_url("https://my.example.com/").as_deref(), Some("https://my.example.com"));
+        assert_eq!(super::parse_server_url(" https://my.example.com:8443 ").as_deref(), Some("https://my.example.com:8443"));
+        assert_eq!(super::parse_server_url("http://127.0.0.1:8787").as_deref(), Some("http://127.0.0.1:8787"));
+        assert_eq!(super::parse_server_url("http://localhost:8787/").as_deref(), Some("http://localhost:8787"));
+        for bad in ["http://my.example.com", "ftp://x.com", "https://u:p@x.com", "https://x.com/?a=1", "https://x.com/#f", "", "not a url", "https://"] {
+            assert_eq!(super::parse_server_url(bad), None, "{bad}");
+        }
+    }
+
     use super::loopback_override;
 
     #[test]

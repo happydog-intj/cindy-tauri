@@ -68,9 +68,33 @@ impl Ports for FakePorts {
     }
 }
 
+/// 默认起 JS mock 中继；设置 `CINDY_SERVER_BIN` 时改起自建的 cindy-server（同一套测试，换一个真实实现）。
 fn spawn_relay(node: &Path, scripts: &Path) -> (Child, u16) {
-    let tokens = json!({ DESKTOP_TOKEN: DESKTOP_ID, PHONE_TOKEN: PHONE_ID }).to_string();
-    let mut child = Command::new(node).arg(scripts.join("mock-device-link-relay.mjs")).env("MOCK_TOKENS", tokens).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().expect("spawn relay");
+    let mut child = if let Ok(bin) = std::env::var("CINDY_SERVER_BIN") {
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let tokens = json!([[DESKTOP_TOKEN, "me@example.com", DESKTOP_ID], [PHONE_TOKEN, "me@example.com", PHONE_ID]]).to_string();
+        let db = std::env::temp_dir().join(format!("dl-e2e-server-{}-{port}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db);
+        let child = Command::new(bin)
+            .env("CINDY_SERVER_ADDR", format!("127.0.0.1:{port}"))
+            .env("CINDY_SERVER_DB", db)
+            .env("CINDY_SERVER_ALLOWED_EMAILS", "me@example.com")
+            .env("CINDY_SERVER_TEST_MODE", "1")
+            .env("CINDY_SERVER_TEST_TOKENS", tokens)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn cindy-server");
+        let t0 = Instant::now();
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(t0.elapsed() < Duration::from_secs(10), "cindy-server 没起来");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        return (child, port);
+    } else {
+        let tokens = json!({ DESKTOP_TOKEN: DESKTOP_ID, PHONE_TOKEN: PHONE_ID }).to_string();
+        Command::new(node).arg(scripts.join("mock-device-link-relay.mjs")).env("MOCK_TOKENS", tokens).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().expect("spawn relay")
+    };
     let mut line = String::new();
     BufReader::new(child.stdout.as_mut().unwrap()).read_line(&mut line).unwrap();
     let port = serde_json::from_str::<Value>(&line).unwrap()["port"].as_u64().unwrap() as u16;

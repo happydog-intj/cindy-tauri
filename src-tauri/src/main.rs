@@ -880,6 +880,7 @@ fn main() {
             });
             let _ = std::fs::create_dir_all(&data_dir);
             applog::init(&data_dir.join("logs"));
+            auth::env::init_server_base(&data_dir);
             fallback::init(&app.package_info().version.to_string());
             updater::init(&data_dir);
             let _ = browser::PARTITION_ROOT.set(data_dir.join("webview-partitions"));

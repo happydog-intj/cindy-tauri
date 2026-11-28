@@ -1,6 +1,7 @@
 node_modules/
 .cache/
 src-tauri/target/
+server/target/
 src-tauri/gen/
 resources/pi-rs/
 .DS_Store
