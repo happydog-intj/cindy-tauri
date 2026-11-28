@@ -23,5 +23,13 @@ pub fn app(cfg: Config) -> Result<Router, String> {
     }
     let hub = Arc::new(relay::Hub::new(db.clone()));
     let auth = Arc::new(auth::AuthState::new(db, cfg.allowed_emails, cfg.fixed_code));
-    Ok(auth::routes(auth).merge(relay::routes(hub)))
+    Ok(auth::routes(auth).merge(relay::routes(hub)).layer(axum::middleware::from_fn(access_log)))
+}
+
+/// 访问日志：只记方法、路径和状态码，不记查询串、请求头和请求体（里面有令牌和验证码）。
+async fn access_log(req: axum::extract::Request, next: axum::middleware::Next) -> axum::response::Response {
+    let (method, path) = (req.method().clone(), req.uri().path().to_string());
+    let res = next.run(req).await;
+    eprintln!("[cindy-server] {method} {path} -> {}", res.status().as_u16());
+    res
 }
