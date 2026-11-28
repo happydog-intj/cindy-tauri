@@ -88,7 +88,7 @@ impl PiSession {
         sink: Arc<dyn SessionSink>,
     ) -> std::io::Result<Arc<Self>> {
         let mut cmd = Command::new(binary);
-        cmd.args(args).current_dir(cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
+        cmd.args(args).current_dir(cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -97,6 +97,16 @@ impl PiSession {
         let stdin = child.stdin.take();
         let stdout = child.stdout.take().ok_or_else(|| std::io::Error::other("no stdout"))?;
         let sid = session_id.to_string();
+        // pi-rs 的 stderr 转进应用日志（以前直接继承终端，退出原因查不到）。
+        if let Some(stderr) = child.stderr.take() {
+            let tag = sid.clone();
+            let _ = std::thread::Builder::new().name(format!("pi-stderr-{sid}")).spawn(move || {
+                for line in BufReader::new(stderr).lines() {
+                    let Ok(line) = line else { break };
+                    eprintln!("[pi:{tag}] {line}");
+                }
+            });
+        }
         let log_sid = sid.clone();
         let core = SessionCore::new(&sid, Box::new(move |m| eprintln!("[maker:{log_sid}] {m}")));
         let inner = Arc::new(Mutex::new(Inner { core, stdin, runtime_dir: None }));

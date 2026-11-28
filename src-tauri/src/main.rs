@@ -852,6 +852,9 @@ fn update_timing() -> update_machine::Timing {
     t
 }
 
+#[allow(dead_code)]
+struct InstanceLock(std::fs::File);
+
 fn main() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -880,6 +883,21 @@ fn main() {
             });
             let _ = std::fs::create_dir_all(&data_dir);
             applog::init(&data_dir.join("logs"));
+            // 同一数据目录只允许一个实例：两个实例会互相删对方会话的运行目录、各自拉起 pi 进程。
+            // 锁随进程退出自动释放；文件句柄放进 managed state 保持到退出。
+            match std::fs::OpenOptions::new().create(true).write(true).open(data_dir.join("app.lock")) {
+                Ok(f) => match f.try_lock() {
+                    Ok(()) => {
+                        app.manage(InstanceLock(f));
+                    }
+                    Err(std::fs::TryLockError::WouldBlock) => {
+                        eprintln!("[app] another instance already uses {}; exiting", data_dir.display());
+                        std::process::exit(0);
+                    }
+                    Err(e) => eprintln!("[app] instance lock unavailable ({e}); continuing without it"),
+                },
+                Err(e) => eprintln!("[app] cannot open instance lock file ({e}); continuing without it"),
+            }
             auth::env::init_server_base(&data_dir);
             fallback::init(&app.package_info().version.to_string());
             updater::init(&data_dir);
