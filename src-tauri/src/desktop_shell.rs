@@ -236,6 +236,7 @@ impl DesktopShell {
             "shell:open-chatgpt-app" => Ok(bool_result(self.ports.call("open.url", json!({ "url": CHATGPT_APP_URL }), false))),
             "shell:open-file-in-browser" => Ok(self.open_file_in_browser(a0)),
             "shell:show-item-in-folder" => Ok(self.show_item_in_folder(a0)),
+            "shell:open-path" => Ok(self.open_path(a0)),
             "app:open-logs-dir" => Ok(self.open_logs_dir()),
             "show-open-directory-dialog" => self.pick_folder(None).map(|picked| match picked {
                 Value::String(_) => json!({ "canceled": false, "path": picked }),
@@ -410,6 +411,23 @@ impl DesktopShell {
             return json!({ "success": false, "error": "文件不存在" });
         }
         match self.ports.call("reveal", json!({ "path": p }), false) {
+            Ok(_) => json!({ "success": true }),
+            Err(e) => json!({ "success": false, "error": e }),
+        }
+    }
+
+    /// 用系统默认应用打开本机文件或目录。cindy-media:// 缓存还没移植，只接受绝对路径。
+    fn open_path(&self, v: &Value) -> Value {
+        let Some(p) = v.as_str().filter(|p| Path::new(p).is_absolute()) else {
+            return json!({ "success": false, "error": "Path must be absolute" });
+        };
+        if !policy::is_path_allowed(p, self.windows) {
+            return json!({ "success": false, "error": "不允许访问该路径" });
+        }
+        if !Path::new(p).exists() {
+            return json!({ "success": false, "error": "文件不存在" });
+        }
+        match self.ports.call("open.path", json!({ "path": p }), false) {
             Ok(_) => json!({ "success": true }),
             Err(e) => json!({ "success": false, "error": e }),
         }
@@ -620,7 +638,7 @@ impl DesktopShell {
 }
 
 /// 归这里的 invoke 通道。send 通道（*-shown）走 `send`。
-const CHANNELS: [&str; 20] = [
+const CHANNELS: [&str; 21] = [
     "app-menu:set-locale",
     "notification:set-app-attention-count",
     "notification:mark-session-attention",
@@ -631,6 +649,7 @@ const CHANNELS: [&str; 20] = [
     "shell:open-chatgpt-app",
     "shell:open-file-in-browser",
     "shell:show-item-in-folder",
+    "shell:open-path",
     "app:open-logs-dir",
     "show-open-directory-dialog",
     "dialog:show-open-directory",

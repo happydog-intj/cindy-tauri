@@ -213,6 +213,14 @@ fn opening_links_and_files_is_checked_before_it_reaches_the_os() {
     assert_eq!(call(&s, "shell:show-item-in-folder", json!([{ "filePath": "/etc/passwd" }])).unwrap()["error"], "不允许访问该路径");
     assert_eq!(call(&s, "shell:show-item-in-folder", json!([{ "url": "xdt-image://x" }])).unwrap()["success"], false);
 
+    p.replies.lock().unwrap().clear();
+    assert_eq!(call(&s, "shell:open-path", json!([html.to_str().unwrap()])).unwrap()["success"], true);
+    assert_eq!(p.last_call("open.path").unwrap()["path"], html.to_str().unwrap());
+    assert_eq!(call(&s, "shell:open-path", json!([dir.to_str().unwrap()])).unwrap()["success"], true);
+    assert_eq!(call(&s, "shell:open-path", json!(["rel.txt"])).unwrap()["error"], "Path must be absolute");
+    assert_eq!(call(&s, "shell:open-path", json!([""])).unwrap()["success"], false);
+    assert_eq!(call(&s, "shell:open-path", json!(["/etc/passwd"])).unwrap()["error"], "不允许访问该路径");
+    assert_eq!(call(&s, "shell:open-path", json!([dir.join("nope").to_str().unwrap()])).unwrap()["error"], "文件不存在");
     assert_eq!(call(&s, "app:open-logs-dir", json!([])).unwrap()["success"], true);
     assert_eq!(p.last_call("open.path").unwrap()["path"], dir.join("logs").to_str().unwrap());
     assert!(dir.join("logs").is_dir());
