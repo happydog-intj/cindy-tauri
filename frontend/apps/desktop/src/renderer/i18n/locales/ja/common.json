@@ -16914,6 +16914,7 @@
     "sectionTitle": "ディレクトリ",
     "empty": "参照ディレクトリはまだありません",
     "add": "ディレクトリを追加…",
+    "setWorkingDir": "作業ディレクトリを追加…",
     "addReadOnly": "読み取り専用ディレクトリを追加…",
     "atLimit": "上限 {{max}} 件に達しました",
     "remove": "{{name}} を削除",

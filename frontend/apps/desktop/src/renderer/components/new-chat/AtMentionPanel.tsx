@@ -47,6 +47,7 @@ import {
   Check,
   ClipboardList,
   Folder as FolderIcon,
+  FolderInput,
   FolderPlus,
   Globe2,
   History,
@@ -140,6 +141,7 @@ const ACTION_ICONS: Record<ComposerSuggestionAction['id'], typeof Paperclip> = {
   'new-goal': Target,
   'plan-mode': ClipboardList,
   collaboration: UsersRound,
+  'set-working-dir': FolderInput,
   'add-extra-dir': FolderPlus,
 };
 

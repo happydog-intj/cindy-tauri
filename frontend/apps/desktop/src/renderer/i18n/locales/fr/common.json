@@ -17142,6 +17142,7 @@
     "sectionTitle": "Répertoires",
     "empty": "Aucun répertoire de référence pour l'instant",
     "add": "Ajouter un répertoire…",
+    "setWorkingDir": "Ajouter un répertoire de travail…",
     "addReadOnly": "Ajouter un répertoire en lecture seule…",
     "atLimit": "Limite atteinte ({{max}})",
     "remove": "Retirer {{name}}",

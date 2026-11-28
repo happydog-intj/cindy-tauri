@@ -16914,6 +16914,7 @@
     "sectionTitle": "目录",
     "empty": "尚无引用之目录",
     "add": "增目录…",
+    "setWorkingDir": "增工作目录…",
     "addReadOnly": "增唯读目录…",
     "atLimit": "已满 {{max}} 之限",
     "remove": "除 {{name}}",

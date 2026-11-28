@@ -24,6 +24,7 @@ export type ComposerSuggestionActionId =
   | 'new-goal'
   | 'plan-mode'
   | 'collaboration'
+  | 'set-working-dir'
   | 'add-extra-dir';
 
 export interface ComposerSuggestionAction {

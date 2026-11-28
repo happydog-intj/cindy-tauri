@@ -2110,6 +2110,8 @@ export function ChatInput({
   const activePermissionModeRef = useRef(activePermissionMode);
   activePermissionModeRef.current = activePermissionMode;
   // handlePermissionModeChange 定义在 useEditor 之后, ref 桥接 (同 dispatchSendRef)。
+  // 「添加工作目录…」菜单项要在 handleFolderSelect 定义之前引用它，用 ref 转发。
+  const handleFolderSelectRef = useRef<(folderPath: string) => Promise<void>>(async () => undefined);
   const handlePermissionModeChangeRef = useRef<(mode: PermissionMode) => void | Promise<void>>(
     () => {},
   );
@@ -5013,6 +5015,27 @@ export function ChatInput({
         },
       });
     }
+    // 切换工作目录：把当前任务（含对话型）转成该目录下的项目任务。仅本地会话态；
+    // 回合进行中 Main 会拒绝，这里直接禁用。远程 / 设备互联的执行目录不在本机，不能用本地选择器。
+    if (sessionId && !remoteHostId && deviceLinkDeviceId === null) {
+      actions.push({
+        id: 'set-working-dir',
+        label: t('extraDirs.setWorkingDir'),
+        disabled: composerMutationLocked || isStreaming,
+        run: () => {
+          void (async () => {
+            try {
+              const r = await window.electronAPI.showOpenDirectoryDialog();
+              if (r.canceled || !r.path) return;
+              await handleFolderSelectRef.current(r.path);
+            } catch (err) {
+              log.warn('set working dir failed', err);
+              toast.error(t('ccAgent.sidebar.sessionMenu.moveToProjectFailed'));
+            }
+          })();
+        },
+      });
+    }
     // A new directory uses the existing Main-issued writable grant. The local
     // picker cannot authorize paths on an SSH or device-link execution host.
     if (onWritableDirsChange && writableGrantScope && !remoteHostId && deviceLinkDeviceId === null) {
@@ -5070,6 +5093,8 @@ export function ChatInput({
     remoteComposerGhosts.reload,
     t,
     deviceLinkDeviceId,
+    isStreaming,
+    sessionId,
     writableDirs,
     writableGrantScope,
     workingDir,
@@ -9151,12 +9176,19 @@ export function ChatInput({
         if (sessionId) dismissPromptRecommendation(sessionId);
         setWorkingDir(folderPath);
         onWorkingDirChange?.(folderPath);
-      } catch {
-        // Server failed → UI stays unchanged
+      } catch (err) {
+        // Server failed → UI stays unchanged。会话态下要告诉用户（例如回合进行中被拒绝）。
+        if (sessionId) {
+          log.warn('switch working dir failed', err);
+          toast.error(t('ccAgent.sidebar.sessionMenu.moveToProjectFailed'));
+        }
       }
     },
-    [sessionId, onWorkingDirChange],
+    [sessionId, onWorkingDirChange, t],
   );
+  useEffect(() => {
+    handleFolderSelectRef.current = handleFolderSelect;
+  }, [handleFolderSelect]);
 
   const hasMessage = !isEditorEmpty(editor);
   renderSnapshotRef.current = composerRenderSnapshot(trigger, hasMessage);

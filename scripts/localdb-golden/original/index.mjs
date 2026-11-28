@@ -5,7 +5,11 @@
 // 导入、分享、worktree、远程主机、置顶摘要生成等不在本里程碑内。
 
 import { createDatabase } from './engine.mjs';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, statSync } from 'node:fs';
+
+function isDirectory(p) {
+  try { return statSync(p).isDirectory(); } catch { return false; }
+}
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { projectHistoryView } from '@cindy/maker-shared/message-window';
@@ -183,8 +187,15 @@ export function openLocalDb({ dataDir, ownerId }) {
   const DATE_KEYS = new Set(['pinnedAt', 'hiddenAt', 'clearedAt']);
   function updateSession(id, patch) {
     if (!getRow(id)) fail('NOT_FOUND', 'Session 不存在');
-    if (patch.workingDir !== undefined || patch.agentKind !== undefined) {
-      fail('NOT_IMPLEMENTED', 'moving or switching agent is not available in the Tauri build yet');
+    if (patch.agentKind !== undefined) {
+      fail('NOT_IMPLEMENTED', 'switching agent is not available in the Tauri build yet');
+    }
+    // 切换工作目录：要求已存在的绝对路径（与 Rust 实现一致）。
+    if (patch.workingDir !== undefined) {
+      const wd = typeof patch.workingDir === 'string' ? patch.workingDir.trim() : '';
+      if (!wd) fail('INVALID_PARAMS', 'workingDir must be a non-empty string');
+      if (!wd.startsWith('/')) fail('INVALID_PARAMS', 'workingDir must be an absolute path');
+      if (!isDirectory(wd)) fail('INVALID_PARAMS', `workingDir is not a directory: ${wd}`);
     }
     if (patch.title !== undefined && (typeof patch.title !== 'string' || patch.title.length > 200)) fail('INVALID_PARAMS', 'invalid title');
     if (patch.notificationsMuted !== undefined && typeof patch.notificationsMuted !== 'boolean') {

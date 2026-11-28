@@ -309,11 +309,25 @@ pub(crate) async fn ipc_invoke_core(app: &tauri::AppHandle, webview: Option<&Web
     // 本地库（会话 / 消息 / 页签 / 最近目录 / 别名，含 maker:auto-title）。messages:view 见下。
     if local_db::LocalDb::owns(&channel) {
         let Some(db) = native::LOCAL_DB.get().cloned() else { return Err("[PRECONDITION_FAILED] local database is not ready".into()) };
+        let registry = maker_state.0.clone();
         return tauri::async_runtime::spawn_blocking(move || {
             let decoded = serde_json::from_str::<Value>(&payload).unwrap_or(Value::Null);
             let empty = Vec::new();
             let args = decoded.get("v").and_then(Value::as_array).unwrap_or(&empty);
-            db.invoke(&channel, args)
+            // 切换工作目录：回合进行中拒绝（旧进程还在往旧目录写）；成功后关掉旧 pi-rs，下次发送按新目录重建并续上历史。
+            let switching = (channel == "local-db:sessions:update" && args.get(1).map(|p| p.get("workingDir").is_some()).unwrap_or(false))
+                .then(|| args.first().and_then(Value::as_str).map(String::from))
+                .flatten();
+            if let (Some(sid), Some(reg)) = (&switching, &registry) {
+                if reg.invoke("maker:session-in-turn", &[json!(sid)]).ok().and_then(|v| v.as_bool()).unwrap_or(false) {
+                    return Err("[INVALID_PARAMS] 模型正在回答，等它结束后再切换工作目录".to_string());
+                }
+            }
+            let out = db.invoke(&channel, args)?;
+            if let (Some(sid), Some(reg)) = (&switching, &registry) {
+                let _ = reg.invoke("maker:close-session", &[json!(sid)]);
+            }
+            Ok(out)
         })
         .await
         .map_err(|e| e.to_string())?

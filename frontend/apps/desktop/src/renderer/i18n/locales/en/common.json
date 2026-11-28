@@ -16982,6 +16982,7 @@
     "sectionTitle": "Directories",
     "empty": "No reference directories yet",
     "add": "Add directory…",
+    "setWorkingDir": "Add working directory…",
     "addReadOnly": "Add read-only directory…",
     "atLimit": "Limit reached ({{max}})",
     "remove": "Remove {{name}}",

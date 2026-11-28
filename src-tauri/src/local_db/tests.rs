@@ -153,3 +153,33 @@ fn create_ignores_undefined_remote_fields_but_rejects_real_ones() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 切换工作目录：对话型任务转成项目任务；非法目录被拒绝且不改库；agentKind 仍不支持。
+#[test]
+fn update_working_dir_turns_dialogue_into_project_and_validates() {
+    let dir = std::env::temp_dir().join(format!("local-db-wd-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let proj = dir.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let env = Arc::new(TestEnv { now: AtomicI64::new(1_700_000_000_000), uuids: AtomicUsize::new(0), bytes: AtomicUsize::new(0) });
+    let db = LocalDb::open(&dir, "local-v1", env, Arc::new(Sink::default())).unwrap();
+    db.invoke("local-db:sessions:create", &[json!({ "id": "w1", "agentKind": "pi", "model": "m", "workspaceKind": "dialogue" })]).unwrap();
+    let before = db.invoke("local-db:sessions:get", &[json!("w1")]).unwrap();
+    assert_eq!(before["workspaceKind"], "dialogue");
+
+    let target = format!("{}/", proj.to_string_lossy());
+    let updated = db.invoke("local-db:sessions:update", &[json!("w1"), json!({ "workingDir": target })]).unwrap();
+    assert_eq!(updated["workingDir"], proj.to_string_lossy().as_ref());
+    assert_eq!(updated["workspaceKind"], "project");
+
+    for (bad, why) in [(json!("relative/dir"), "相对路径"), (json!(dir.join("nope").to_string_lossy()), "不存在"), (json!(""), "空串"), (json!(7), "非字符串")] {
+        let err = db.invoke("local-db:sessions:update", &[json!("w1"), json!({ "workingDir": bad })]).unwrap_err();
+        assert!(err.starts_with("[INVALID_PARAMS]"), "{why}: {err}");
+    }
+    let after = db.invoke("local-db:sessions:get", &[json!("w1")]).unwrap();
+    assert_eq!(after["workingDir"], proj.to_string_lossy().as_ref(), "非法请求不改库");
+
+    let err = db.invoke("local-db:sessions:update", &[json!("w1"), json!({ "agentKind": "claude" })]).unwrap_err();
+    assert!(err.starts_with("[NOT_IMPLEMENTED]"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

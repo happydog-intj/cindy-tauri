@@ -2011,7 +2011,7 @@
     }
    ],
    "result": null,
-   "error": "[NOT_IMPLEMENTED] moving or switching agent is not available in the Tauri build yet",
+   "error": "[INVALID_PARAMS] workingDir is not a directory: /x",
    "events": []
   },
   {
@@ -2025,7 +2025,7 @@
     }
    ],
    "result": null,
-   "error": "[NOT_IMPLEMENTED] moving or switching agent is not available in the Tauri build yet",
+   "error": "[NOT_IMPLEMENTED] switching agent is not available in the Tauri build yet",
    "events": []
   },
   {

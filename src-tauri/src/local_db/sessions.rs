@@ -244,11 +244,26 @@ pub fn update(db: &LocalDb, conn: &Connection, id: &Value, patch: &Value) -> Res
         return fail("NOT_FOUND", "Session 不存在");
     }
     let p = patch.as_object().ok_or_else(|| "[INVALID_PARAMS] patch must be an object".to_string())?;
-    for k in ["workingDir", "agentKind"] {
-        if p.contains_key(k) {
-            return fail("NOT_IMPLEMENTED", "moving or switching agent is not available in the Tauri build yet");
-        }
+    if p.contains_key("agentKind") {
+        return fail("NOT_IMPLEMENTED", "switching agent is not available in the Tauri build yet");
     }
+    // 切换工作目录：任务转成项目任务。目录必须是已存在的绝对路径；下次发送时 pi-rs 按新目录重建（调用方负责关掉旧进程）。
+    let new_working_dir = match p.get("workingDir") {
+        None => None,
+        Some(v) => {
+            let s = v.as_str().map(str::trim).filter(|s| !s.is_empty());
+            let Some(s) = s else { return fail("INVALID_PARAMS", "workingDir must be a non-empty string") };
+            let path = std::path::Path::new(s);
+            if !path.is_absolute() {
+                return fail("INVALID_PARAMS", "workingDir must be an absolute path");
+            }
+            if !path.is_dir() {
+                return fail("INVALID_PARAMS", format!("workingDir is not a directory: {s}"));
+            }
+            let trimmed = s.trim_end_matches('/');
+            Some(if trimmed.is_empty() { "/".to_string() } else { trimmed.to_string() })
+        }
+    };
     if let Some(t) = p.get("title") {
         let len = t.as_str().map(utf16_len).unwrap_or(usize::MAX);
         if !t.is_string() || len > 200 {
@@ -280,12 +295,22 @@ pub fn update(db: &LocalDb, conn: &Connection, id: &Value, patch: &Value) -> Res
         sets.push(format!("{col} = ?"));
         vals.push(v);
     }
+    if let Some(wd) = &new_working_dir {
+        sets.push("working_dir = ?".into());
+        vals.push(json!(wd));
+        sets.push("workspace_kind = ?".into());
+        vals.push(json!("project"));
+    }
     sets.push("updated_at = ?".into());
     vals.push(json!(db.env.now_ms()));
     vals.push(json!(id));
     sql::run(conn, &format!("UPDATE sessions SET {} WHERE id = ?", sets.join(", ")), &vals)?;
     let updated = to_session(&get_row(conn, &id)?.unwrap(), db.boot_at);
     let mut echoed = p.clone();
+    if let Some(wd) = &new_working_dir {
+        echoed.insert("workingDir".into(), json!(wd));
+        echoed.insert("workspaceKind".into(), json!("project"));
+    }
     echoed.insert("updatedAt".into(), updated["updatedAt"].clone());
     db.out.push("local-db:sessions:patched", json!({ "sessionId": id, "patch": Value::Object(echoed) }));
     Ok(updated)

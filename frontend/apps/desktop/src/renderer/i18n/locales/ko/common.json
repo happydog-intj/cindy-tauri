@@ -16914,6 +16914,7 @@
     "sectionTitle": "디렉터리",
     "empty": "아직 참조 디렉터리가 없습니다",
     "add": "디렉터리 추가…",
+    "setWorkingDir": "작업 디렉터리 추가…",
     "addReadOnly": "읽기 전용 디렉터리 추가…",
     "atLimit": "최대 {{max}}개 도달",
     "remove": "{{name}} 제거",

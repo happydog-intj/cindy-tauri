@@ -16982,6 +16982,7 @@
     "sectionTitle": "Verzeichnisse",
     "empty": "Noch keine Referenzverzeichnisse",
     "add": "Verzeichnis hinzufügen…",
+    "setWorkingDir": "Arbeitsverzeichnis hinzufügen…",
     "addReadOnly": "Schreibgeschütztes Verzeichnis hinzufügen…",
     "atLimit": "Limit erreicht ({{max}})",
     "remove": "{{name}} entfernen",

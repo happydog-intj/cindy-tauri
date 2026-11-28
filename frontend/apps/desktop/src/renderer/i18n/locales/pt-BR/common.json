@@ -17142,6 +17142,7 @@
     "sectionTitle": "Diretórios",
     "empty": "Nenhum diretório de referência ainda",
     "add": "Adicionar diretório…",
+    "setWorkingDir": "Adicionar diretório de trabalho…",
     "addReadOnly": "Adicionar diretório somente leitura…",
     "atLimit": "Limite atingido ({{max}})",
     "remove": "Remover {{name}}",

@@ -16914,6 +16914,7 @@
     "sectionTitle": "目錄",
     "empty": "還沒有引用目錄",
     "add": "新增目錄…",
+    "setWorkingDir": "新增工作目錄…",
     "addReadOnly": "新增唯讀目錄…",
     "atLimit": "已達上限 {{max}} 個",
     "remove": "移除 {{name}}",
