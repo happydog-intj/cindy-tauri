@@ -15,7 +15,7 @@
 
 ## 本地对上游文件的改动
 
-同步时这些改动会被覆盖，需要手动带回来。下面六处是导入之后对上游文件的全部改动，行数很少。
+同步时这些改动会被覆盖，需要手动带回来。下面七处是导入之后对上游文件的全部改动，行数很少。
 
 | 文件 | 改动 | 本仓库提交 |
 | --- | --- | --- |
@@ -24,6 +24,7 @@
 | `frontend/apps/desktop/src/renderer/features/bots/BotCreateMenu.tsx` | 整个文件删除。 | `41ccdc0` |
 | `frontend/apps/desktop/src/renderer/features/cc-agent/CCAgentSidebarUpper.tsx` | 侧边栏不再渲染"伙伴"段：删除 `TeammatesSection` 的导入和 `<TeammatesSection />`。`TeammatesSection.tsx` 本身保留，`/bots` 路由不动。 | `54ec05c` |
 | `frontend/apps/desktop/src/renderer/components/sidebar/SidebarTopNav.tsx` | 去掉侧边栏的"更多"：展开态的"更多"行（`customizeRow` 的定义和三处使用）和收起态 rail 里的 `<SidebarNavigationMoreMenu>`。`SidebarNavigationMoreMenu`、`customizing` 状态等现在没有入口，故意没删，以减小和上游的差异。 | `092982a` |
+| `frontend/apps/desktop/src/renderer/features/cc-agent/sidebar/MainListScopeHeader.tsx` | 去掉任务列表段头的"全部任务 ▾"下拉：删除 `MachineSwitcherMenu` 的导入和渲染（左侧留一个空的 flex 容器，右侧的折叠 / 显示设置按钮不动）。`MachineSwitcherMenu.tsx` 文件保留，只是没人引用；去掉后侧边栏无法再切换"本机 / 远程设备"范围，保持默认的全部范围。 | 本次提交 |
 | `frontend/apps/desktop/src/renderer/i18n/index.ts`、`main-entry.tsx`、`recording-preview-entry.tsx`、`region-screenshot-entry.tsx`、`region-screenshot-pin-entry.tsx`、`remote-desktop-viewer-entry.tsx`、`resource-usage-entry.tsx`、`sidebar-window-entry.tsx`、`lib/deviceName.ts` | 翻译按需加载：上游把 12 种语言的 JSON（共约 13 MB）静态导入，首屏要先解析约 11 MB 的 JS。改成每种语言一个动态 `import()` 加载器（`localeLoaders`），`init` 时不带资源，新增导出 `ensureLocaleLoaded` 和 `i18nReady`（当前语言及其回退语言加载完成），并包装 `i18n.changeLanguage` 使其先加载再切换。各入口在首次渲染前 await `i18nReady`（`main-entry.tsx` 在 async 入口开头，其余入口把 `render` 包进 `i18nReady.then`，没有重排缩进）。`deviceName.ts` 不再导入整份 `en/common.json`，改用内联常量 `UNKNOWN_DEVICE_EN`（值与 `bots.cloud.unknownDevice` 一致）。同步上游后要重做；上游若新增入口文件或新增静态导入 locale JSON 的地方，也要同样处理。 | 本次提交 |
 
 同步后检查：上游如果又改了 `TeammatesSection.tsx`，用 `git diff` 看冲突，再重做上表的删除。`BotCreateMenu.tsx` 会被同步重新带回来，需要再删一次。

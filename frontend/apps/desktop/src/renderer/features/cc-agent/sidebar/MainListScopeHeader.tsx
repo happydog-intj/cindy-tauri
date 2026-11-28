@@ -11,7 +11,6 @@ import type { LucideIcon } from 'lucide-react';
 
 import { cn } from '@/lib/utils';
 import { Tip } from '@/components/ui/tooltip';
-import { MachineSwitcherMenu } from './MachineSwitcherMenu';
 import { SidebarFilterPopover } from './SidebarFilterPopover';
 import type { ProjectNode as ProjectNodeData } from '../lib/projectGrouping';
 import type { UseSidebarFilterReturn } from '../hooks/useSidebarFilter';
@@ -49,7 +48,6 @@ export function MainListScopeHeader({
   return (
     <div className="group/sidebar-header flex h-6 items-center justify-between pr-0 pl-6">
       <div className="flex min-w-0 items-center gap-1">
-        <MachineSwitcherMenu onOpenDisplaySettings={() => setDisplaySettingsOpen(true)} />
       </div>
       <div className="flex items-center gap-0.5 -mt-px">
         <div className="flex items-center gap-0.5 -mt-px">
