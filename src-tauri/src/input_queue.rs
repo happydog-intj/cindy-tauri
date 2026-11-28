@@ -53,6 +53,8 @@ pub struct InputQueue {
     active_origin: Option<Value>,
     turn_seq: i64,
     paused: bool,
+    /// 正在被用户编辑的排队消息（`maker:input:set-edit-lock`）。队首被锁时不派发，保持顺序。
+    edit_locks: Vec<String>,
     error: Option<String>,
 }
 
@@ -87,7 +89,7 @@ impl InputQueue {
             "queuePaused": self.paused,
             "queueExpanded": false,
             "queueInteractionLocks": [],
-            "queueEditLocks": [],
+            "queueEditLocks": self.edit_locks,
             "queueAbortPending": false,
             "error": self.error,
             "recovery": null,
@@ -113,6 +115,9 @@ impl InputQueue {
     /// 取下一条待派发项。回合进行中、暂停或队列为空时返回 None。
     pub fn next(&mut self) -> Option<Dispatch> {
         if self.active.is_some() || self.paused || self.pending.is_empty() {
+            return None;
+        }
+        if self.pending[0]["clientId"].as_str().is_some_and(|c| self.edit_locks.iter().any(|l| l == c)) {
             return None;
         }
         let item = self.pending.remove(0);
@@ -184,6 +189,26 @@ impl InputQueue {
 
     pub fn remove(&mut self, client_id: &str) {
         self.pending.retain(|q| q["clientId"].as_str() != Some(client_id));
+        self.edit_locks.retain(|l| l != client_id);
+    }
+
+    /// 编辑锁：加锁只对仍在队列里的消息生效；解锁总是放行。
+    pub fn set_edit_lock(&mut self, client_id: &str, locked: bool) {
+        self.edit_locks.retain(|l| l != client_id);
+        if locked && self.pending.iter().any(|q| q["clientId"].as_str() == Some(client_id)) {
+            self.edit_locks.push(client_id.to_string());
+        }
+    }
+
+    /// 用编辑后的内容替换排队中的同 clientId 消息（保持位置）。已派发或不存在则不动，由调用方对照 projection 判断。
+    pub fn update_content(&mut self, client_id: &str, item: Value) -> Result<(), String> {
+        if item["clientId"].as_str() != Some(client_id) || !item["text"].is_string() {
+            return Err("replacement requires the same clientId and text".into());
+        }
+        if let Some(slot) = self.pending.iter_mut().find(|q| q["clientId"].as_str() == Some(client_id)) {
+            *slot = item;
+        }
+        Ok(())
     }
 
     /// 会话关闭：回合与队列一并清零。
@@ -314,5 +339,35 @@ mod tests {
         assert_eq!(q.projection("s")["pendingQueue"].as_array().unwrap().len(), 1, "status closed 只清回合");
         assert!(!q.on_closed());
         assert!(q.projection("s")["pendingQueue"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn edit_lock_holds_the_head_and_unlock_releases_it() {
+        let mut q = InputQueue::new();
+        q.enqueue(item("a")).unwrap();
+        q.enqueue(item("b")).unwrap();
+        q.set_edit_lock("a", true);
+        assert_eq!(q.projection("s")["queueEditLocks"], json!(["a"]));
+        assert!(q.next().is_none(), "队首被锁时不派发，也不能越过它发后面的");
+        q.set_edit_lock("a", false);
+        assert_eq!(q.next().unwrap().item["clientId"], "a");
+        q.set_edit_lock("zzz", true);
+        assert_eq!(q.projection("s")["queueEditLocks"], json!([]), "不在队列里的消息不能加锁");
+    }
+
+    #[test]
+    fn update_content_replaces_in_place_and_ignores_dispatched_items() {
+        let mut q = InputQueue::new();
+        q.enqueue(item("a")).unwrap();
+        q.enqueue(item("b")).unwrap();
+        q.update_content("b", json!({ "clientId": "b", "text": "edited" })).unwrap();
+        let p = q.projection("s");
+        assert_eq!(p["pendingQueue"][1]["text"], "edited");
+        assert_eq!(p["pendingQueue"][0]["text"], "msg a");
+        assert!(q.update_content("b", json!({ "clientId": "other", "text": "x" })).is_err());
+        let d = q.next().unwrap();
+        q.update_content("a", json!({ "clientId": "a", "text": "late" })).unwrap();
+        assert_eq!(d.item["text"], "msg a");
+        assert_eq!(q.projection("s")["pendingQueue"].as_array().unwrap().len(), 1);
     }
 }

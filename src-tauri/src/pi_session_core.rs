@@ -236,6 +236,18 @@ impl SessionCore {
         vec![Action::Projection(self.queue.projection(&self.session_id))]
     }
 
+    pub fn set_edit_lock(&mut self, client_id: &str, locked: bool) -> Vec<Action> {
+        self.queue.set_edit_lock(client_id, locked);
+        let mut out = vec![Action::Projection(self.queue.projection(&self.session_id))];
+        out.extend(self.pump());
+        out
+    }
+
+    pub fn update_content(&mut self, client_id: &str, item: Value) -> Result<Vec<Action>, String> {
+        self.queue.update_content(client_id, item)?;
+        Ok(vec![Action::Projection(self.queue.projection(&self.session_id))])
+    }
+
     pub fn clear_error(&mut self) -> Vec<Action> {
         self.queue.clear_error();
         vec![Action::Projection(self.queue.projection(&self.session_id))]

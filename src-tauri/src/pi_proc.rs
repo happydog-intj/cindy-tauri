@@ -253,6 +253,18 @@ impl PiSession {
         self.projection()
     }
 
+    pub fn set_edit_lock(&self, client_id: &str, locked: bool) -> Value {
+        let actions = self.inner.lock().unwrap().core.set_edit_lock(client_id, locked);
+        self.run(actions);
+        self.projection()
+    }
+
+    pub fn update_content(&self, client_id: &str, item: Value) -> Result<Value, String> {
+        let actions = self.inner.lock().unwrap().core.update_content(client_id, item)?;
+        self.run(actions);
+        Ok(self.projection())
+    }
+
     pub fn clear_error(&self) -> Value {
         let actions = self.inner.lock().unwrap().core.clear_error();
         self.run(actions);

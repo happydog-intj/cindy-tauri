@@ -48,7 +48,7 @@ pub trait SessionFactory: Send + Sync + 'static {
 
 const PERMISSION_MODES: [&str; 6] = ["ask", "default", "acceptEdits", "plan", "auto", "bypassPermissions"];
 
-const OWNED: [&str; 18] = [
+const OWNED: [&str; 20] = [
     "maker:set-fast-mode",
     "maker:set-thinking-enabled",
     "maker:set-model",
@@ -62,6 +62,8 @@ const OWNED: [&str; 18] = [
     "maker:input:resume",
     "maker:input:clear-error",
     "maker:input:remove",
+    "maker:input:set-edit-lock",
+    "maker:input:update-content",
     "maker:get-pending-interactions",
     "maker:resolve-interaction",
     "maker:abort-session",
@@ -385,6 +387,21 @@ impl MakerRegistry {
                 let id = session_id_arg(args)?;
                 let cid = args.get(1).and_then(Value::as_str).unwrap_or("");
                 Ok(self.get(&id).map(|s| s.remove_queued(cid)).unwrap_or_else(|| empty_projection(&id)))
+            }
+            "maker:input:set-edit-lock" => {
+                let id = session_id_arg(args)?;
+                let cid = args.get(1).and_then(Value::as_str).unwrap_or("");
+                let locked = args.get(2).and_then(Value::as_bool).unwrap_or(false);
+                Ok(self.get(&id).map(|s| s.set_edit_lock(cid, locked)).unwrap_or_else(|| empty_projection(&id)))
+            }
+            "maker:input:update-content" => {
+                let id = session_id_arg(args)?;
+                let cid = args.get(1).and_then(Value::as_str).unwrap_or("");
+                let item = args.get(2).cloned().unwrap_or(Value::Null);
+                match self.get(&id) {
+                    Some(s) => s.update_content(cid, item).map_err(|e| fail("INVALID_PARAMS", e)),
+                    None => Ok(empty_projection(&id)),
+                }
             }
             "maker:get-pending-interactions" => {
                 let Some(id) = args.first().and_then(Value::as_str).filter(|s| !s.is_empty()) else { return Ok(json!([])) };
