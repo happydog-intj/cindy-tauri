@@ -1126,3 +1126,37 @@ fn rust_sessions_extra_and_writable_dirs_are_persisted_prompted_and_granted() {
     let _ = mock.kill();
     let _ = std::fs::remove_dir_all(&data);
 }
+
+/// 排队中的消息可以编辑：加锁、替换内容，下一轮用的是编辑后的内容；已经派发的消息不受影响。
+#[test]
+fn rust_sessions_queued_message_can_be_edited() {
+    let Some(e) = env() else { eprintln!("skip: PI_RS_BIN/MOCK_OPENAI not set"); return };
+    let (mut mock, port, log) = start_mock_logged(&e, &[]);
+    let data = temp("queue-edit");
+    let r = Rig::start(&e, port, &data);
+    let sid = r.new_session("queue edit");
+    let opts = json!({ "agentKind": "pi", "id": sid, "model": "mock-model", "providerId": "smoke", "permissionMode": "bypassPermissions", "workspaceKind": "dialogue" });
+    let item = |cid: &str, text: &str| json!({ "clientId": cid, "text": text, "persistedContent": text, "createOpts": opts });
+
+    r.ipc("maker:input:enqueue", json!([sid, item("q1", "MOCK_SLOW first")])).unwrap();
+    r.wait("turn is running", 20, || r.ipc("maker:session-in-turn", json!([sid])).map(|v| v == json!(true)).unwrap_or(false));
+    let p = r.ipc("maker:input:enqueue", json!([sid, item("q2", "original")])).unwrap();
+    assert_eq!(p["pendingQueue"].as_array().map(|a| a.len()), Some(1), "{p}");
+
+    // 编辑：加锁 → 替换 → 解锁，每一步都不报错，队列里的文本变了。
+    let locked = r.ipc("maker:input:set-edit-lock", json!([sid, "q2", true])).unwrap();
+    assert_eq!(locked["pendingQueue"][0]["clientId"], "q2", "{locked}");
+    let upd = r.ipc("maker:input:update-content", json!([sid, "q2", item("q2", "edited")])).unwrap();
+    assert!(!upd.is_null(), "update-content 要返回投影: {upd}");
+    assert_eq!(upd["pendingQueue"][0]["text"], "edited", "{upd}");
+    r.ipc("maker:input:set-edit-lock", json!([sid, "q2", false])).unwrap();
+
+    let mark = log.lock().unwrap().len();
+    r.wait("both turns done", 60, || done_count(&r, &sid) >= 2);
+    let last = chat_requests(&log, mark).last().and_then(|q| q["lastUser"].as_str().map(String::from)).unwrap_or_default();
+    assert_eq!(last, "edited", "第二轮发的是编辑后的内容");
+
+    r.stop();
+    let _ = mock.kill();
+    let _ = std::fs::remove_dir_all(&data);
+}
