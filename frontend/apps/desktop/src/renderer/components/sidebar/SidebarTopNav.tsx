@@ -187,8 +187,9 @@ function useSidebarNavigationEntries(): {
   const unseenGhostIds = useSidebarUnseenApps(dataOwnerId);
   const apps = new Map(sidebarVisible.map((item) => [item.instanceId, item]));
   const order = resolveSidebarNavigationOrder(prefs.order, sidebarVisible.map((item) => item.instanceId));
+  // 本仓库不显示"搜索"和"插件"两个内置入口（见 docs/UPSTREAM.md）；定义保留，只是恒不可见。
   const isVisible = (id: SidebarNavigationEntryId) => ghostIdOfEntry(id) === null
-    ? prefs.visible.includes(id as SidebarNavigationItemId)
+    ? id !== 'search' && id !== 'plugins' && prefs.visible.includes(id as SidebarNavigationItemId)
     : prefs.appsAtTop.includes(id as SidebarNavigationAppEntryId);
   const appFor = (id: SidebarNavigationEntryId) => {
     const ghostId = ghostIdOfEntry(id);
